@@ -1,0 +1,13 @@
+digraph G {
+"lbr_link_7" -> "lbr_link_ee"[label="Broadcaster: /lbr/robot_state_publisher\nAverage rate: 10000.000 Hz\nMost recent transform: 0.000 ( 1730941852.246 sec old)\nBuffer length: 0.000 sec\n"];
+"world" -> "lbr_link_0"[label="Broadcaster: /lbr/robot_state_publisher\nAverage rate: 10000.000 Hz\nMost recent transform: 0.000 ( 1730941852.246 sec old)\nBuffer length: 0.000 sec\n"];
+"world" -> "RigidBody03"[label="Broadcaster: /vrpn_client_node\nAverage rate: 120.197 Hz\nMost recent transform: 1730941852.238 ( 0.008 sec old)\nBuffer length: 4.950 sec\n"];
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1730941852.246"[ shape=plaintext ] ;
+ }->"lbr_link_7";
+edge [style=invis];
+ subgraph cluster_legend { style=bold; color=black; label ="view_frames Result";
+"Recorded at time: 1730941852.246"[ shape=plaintext ] ;
+ }->"world";
+}

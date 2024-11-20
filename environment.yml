@@ -1,0 +1,13 @@
+name: ee206
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.8  # Specify your preferred Python version here
+  - mujoco=3.2.3
+  - mujoco-python-viewer=0.1.4
+  - numpy=1.24.3
+  - scipy=1.10.1
+  - stable-baselines=2.10.2
+  - stable_baselines3=2.3.2
+  - pytorch=1.13.0
