@@ -1,6 +1,9 @@
-# EE206 class project
+# Robots that learn class project
 
-Control Kuka iiwa R820 arm to play ping pong
+Reference for game theory:-
+[1] https://arxiv.org/pdf/2305.12553
+[2] https://arxiv.org/pdf/2205.14590
+Control Kuka iiwa R820 arm to play ping pong competitively
 
 <p float="left">
   <img src="iiwa_14.png" width="400">

@@ -14,7 +14,7 @@ xml = """
 <mujoco model="table_tennis">
     <include file="iiwa14_gantry.xml"/>
     <compiler angle="radian" />
-    <option timestep="0.0167" gravity="0 0 -9.81" />
+    <option timestep="0.01" gravity="0 0 -9.81" />
     <worldbody>
         <!-- Ground -->
         <geom name="floor" type="plane" size="10 10 0.1" rgba="0.8 0.8 0.8 1"/>
@@ -37,7 +37,7 @@ class KukaTennisEnv(gym.Env):
 
         
         # Define action and observation spaces
-        self.action_space = spaces.Box(low=-0.15, high=0.15, shape=(9,), dtype=np.float32)  # Adjust based on your actuator count
+        self.action_space = spaces.Box(low=-1., high=1., shape=(9,), dtype=np.float32)  # Adjust based on your actuator count
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.model.nq + self.model.nv + 7 + 7 + 9*history,), dtype=np.float32)
 
         # Simulation time step
@@ -71,14 +71,14 @@ class KukaTennisEnv(gym.Env):
     
     def step(self, action):
         self.prev_actions[:-1,:] = self.prev_actions[1:,:]
-        self.prev_actions[-1,:] = action
+        self.prev_actions[-1,:] = action/20.
         self.current_step += 1
         self.total_steps += 1
         # Apply action to actuators
-        self.data.ctrl[:] = np.array(action[2:]) + np.array(self.data.qpos[2:])
-        self.data.qpos[0] += 7*action[0]/60.
-        self.data.qpos[1] += 7*action[1]/60.
-        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.,0.)
+        self.data.ctrl[:] = np.array(action[2:])/20. + np.array(self.data.qpos[2:])
+        self.data.qpos[0] += 5*action[0]/1000.
+        self.data.qpos[1] += 5*action[1]/1000.
+        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.,-0.5)
         self.data.qpos[1] = np.clip(self.data.qpos[1],-1.,1.)
         # self.data.ctrl[0] = -1.0
         # self.data.ctrl[1] = 1.0
@@ -129,11 +129,11 @@ class KukaTennisEnv(gym.Env):
 
     def reset_target(self):
         self.curr_target = np.array([0.,0.,0.,0.,0.,0.,0.])
-        self.curr_target[0] = np.random.uniform(-0.2,0.2)
+        self.curr_target[0] = np.random.uniform(-0.5,0.3)
         self.curr_target[1] = np.random.uniform(-1.1,1.1)
         self.curr_target[2] = np.random.uniform(0.75,1.05)
         xr,yr,zr = np.random.uniform(-1,1,3)*0.5
-        z_axis = np.array([1.,yr,zr])
+        z_axis = np.array([1.,yr,zr*0.1])
         z_axis = z_axis/np.linalg.norm(z_axis)
         theta_z = np.arctan2(self.curr_target[2],self.curr_target[1])+xr*0.5
         x_axis = np.array([0.,np.cos(theta_z),np.sin(theta_z)])
@@ -161,7 +161,6 @@ class KukaTennisEnv(gym.Env):
         # print(self.data.geom_xpos[target_geom_id])
         self.prev_reward = self._calculate_reward()
         end_effector_pos = self.data.body('tennis_racket').xpos
-        # print(end_effector_pos)
         end_effector_quat = self.data.body('tennis_racket').xquat[[1,2,3,0]]
         diff_pos = self.curr_target[:3] - end_effector_pos
         r_current = R.from_quat(end_effector_quat)

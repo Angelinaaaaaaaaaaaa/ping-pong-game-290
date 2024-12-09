@@ -1,4 +1,4 @@
-from mujoco_env_only_kuka import KukaTennisEnv
+from mujoco_env_kuka_with_gantry import KukaTennisEnv
 from gym.wrappers import FrameStack
 from stable_baselines3.common.env_util import SubprocVecEnv, DummyVecEnv
 from stable_baselines3 import PPO
@@ -32,7 +32,7 @@ if __name__ == '__main__':
     eval_env = DummyVecEnv([make_test_env])
     # Set up evaluation callback
     eval_callback = EvalCallback(eval_env, 
-                                best_model_save_path='./logs/best_model/',
+                                best_model_save_path='./logs/best_model_tracker_vslow/',
                                 log_path='./logs/',
                                 eval_freq=300,  # Evaluate every 10,000 steps
                                 n_eval_episodes=10,  # Evaluate for 5 episodes
@@ -45,7 +45,7 @@ if __name__ == '__main__':
             n_epochs=5,                # Number of epochs
             learning_rate=5e-4,         # Learning rate for PPO
             gamma=0.99,                 # Discount factor
-            tensorboard_log="./ppo_kuka_parallel_tensorboard/",
+            tensorboard_log="./ppo_kuka_parallel_tensorboard_ik/",
             device="cuda"
            )
 
