@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 from model_arch import SimpleModel
 
-STRATEGY1 = 'nash' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
-STRATEGY2 = 'nash' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
+STRATEGY1 = 'random' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
+STRATEGY2 = 'random' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
 
 model1 = SimpleModel(116, [64, 32, 16], 1)
 model2 = SimpleModel(116, [64, 32, 16], 1)
@@ -22,7 +22,7 @@ model_p = SimpleModel(116, [64, 32, 16], 1)
 model_p.load_state_dict(torch.load("models/model_p.pth"))
 
 env = KukaTennisEnv(proc_id=1)
-model = PPO.load("logs/best_model_tracker_slow/best_model")
+model = PPO.load("logs/best_model_tracker1/best_model")
 history = 4
 obs, info = env.reset()
 prev_ball_x = obs[36]
@@ -57,7 +57,8 @@ for i in range(2000000):
     # print(action+[0.]*9)
     obs, reward, done, _, info = env.step(action_combined)
     
-    # env.render()
+    env.render()
+    time.sleep(0.01)
 
     curr_ball_x = obs[36]
     # Whenever the ball crosses the net, we consider it a new rally state
