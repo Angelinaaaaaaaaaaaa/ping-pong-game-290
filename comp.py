@@ -7,19 +7,19 @@ import torch
 import torch.nn as nn
 from model_arch import SimpleModel
 
-STRATEGY1 = 'random' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
+STRATEGY1 = 'nash-p' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
 STRATEGY2 = 'random' # Choose from 'left', 'right', 'random', 'nash', 'nash-ibr', 'nash-p'
 
 model1 = SimpleModel(116, [64, 32, 16], 1)
 model2 = SimpleModel(116, [64, 32, 16], 1)
 
 # Load model1 weights from logs/model1.pt and model2 weights from logs/model2.pt
-model1.load_state_dict(torch.load("models/model1.pth"))
-model2.load_state_dict(torch.load("models/model2.pth"))
+model1.load_state_dict(torch.load("models/model1.pth", weights_only=True))
+model2.load_state_dict(torch.load("models/model2.pth", weights_only=True))
 
 # Load model_p weights from logs/model_p.pt
 model_p = SimpleModel(116, [64, 32, 16], 1)
-model_p.load_state_dict(torch.load("models/model_p.pth"))
+model_p.load_state_dict(torch.load("models/model_p.pth", weights_only=True))
 
 env = KukaTennisEnv(proc_id=1)
 model = PPO.load("logs/best_model_tracker1/best_model")

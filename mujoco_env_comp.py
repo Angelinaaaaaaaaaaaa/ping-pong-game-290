@@ -17,7 +17,12 @@ xml = """
     <include file="iiwa14_comp.xml"/>
     <compiler angle="radian" />
     <option timestep="0.01" gravity="0 0 -9.81" />
+    <visual>
+        <global fovy="45" azimuth="180" elevation="-30"/>
+    </visual>
     <worldbody>
+        <!-- Overview camera: positioned to see both arms and the full table -->
+        <camera name="overview" pos="1.5 -4.5 3.0" xyaxes="1 0 0 0 0.6 0.8"/>
         <!-- Ground -->
         <geom name="floor" type="plane" size="10 10 0.1" rgba="0.8 0.8 0.8 1"/>
         <body name="vis" pos="0 0 1.26" quat="0 0.7068252 0 0.7073883">
@@ -501,6 +506,11 @@ class KukaTennisEnv(gym.Env):
         if not hasattr(self, 'viewer') or self.viewer is None:
             import mujoco.viewer
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            # Set default camera to the overview camera defined in the XML
+            cam_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_CAMERA, "overview")
+            if cam_id >= 0:
+                self.viewer.cam.type = mj.mjtCamera.mjCAMERA_FIXED
+                self.viewer.cam.fixedcamid = cam_id
         self.viewer.sync()
 
     def close(self):
