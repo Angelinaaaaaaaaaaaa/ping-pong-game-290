@@ -48,7 +48,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 # Default discount factor — use gamma=0.9 for shorter-horizon strategy learning
-GAMMA: float = 0.9
+GAMMA: float = 0.7
 
 # Index into each raw 116-dim state where ball velocity x is stored
 _BALL_VEL_X_IDX = 39
