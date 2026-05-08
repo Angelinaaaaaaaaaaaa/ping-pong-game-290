@@ -15,7 +15,7 @@ Key fixes vs. the earlier version:
 Run from the project root:
     MUJOCO_GL=cgl venv/bin/python nash_skills/eval_matchup_2skill.py
     MUJOCO_GL=cgl venv/bin/python nash_skills/eval_matchup_2skill.py \
-        --episodes 60 --steps 600 \
+        --episodes 100 --steps 600 \
         --output-csv  skill_eval/baseline_2skill.csv \
         --output-json skill_eval/baseline_2skill.json
 """
@@ -105,6 +105,27 @@ class MatchupResult:
         return self.ego_wins / self.done_episodes
 
 
+@dataclasses.dataclass
+class AggregateMatchupResult:
+    strategy1: str
+    strategy2: str
+    seeds: List[int]
+    win_rate_mean: Optional[float]
+    win_rate_std: Optional[float]
+    trunc_mean: Optional[float]
+    trunc_std: Optional[float]
+    avg_rally_mean: Optional[float]
+    avg_rally_std: Optional[float]
+    left_usage_total: int
+    right_usage_total: int
+    left_fraction_mean: Optional[float]
+    left_fraction_std: Optional[float]
+    right_fraction_mean: Optional[float]
+    right_fraction_std: Optional[float]
+    dominant_skill: Optional[str]
+    dominant_fraction_total: Optional[float]
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # PPO observation builders (self-contained copy)                              #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -160,6 +181,78 @@ def save_csv(results: List[MatchupResult], path: str):
             "ego_success_rate":     round(r.ego_success_rate, 4) if r.ego_success_rate is not None else "",
             "opp_success_rate":     round(r.opp_success_rate, 4) if r.opp_success_rate is not None else "",
             "avg_rally_length":     round(r.avg_rally_length, 2) if r.avg_rally_length is not None else "",
+            "most_used_skill":      most_used_skill(r) or "",
+            "dominant_fraction":    round(dominant_skill_fraction(r), 4) if dominant_skill_fraction(r) is not None else "",
+        }
+        for skill_name in _SKILLS_2:
+            row[f"usage_{skill_name}"] = r.skill_usage.get(skill_name, 0)
+        rows.append(row)
+
+    if not rows:
+        return
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_aggregate_csv(results: List[AggregateMatchupResult], path: str):
+    rows = []
+    for r in results:
+        row = {
+            "strategy1": r.strategy1,
+            "strategy2": r.strategy2,
+            "n_seeds": len(r.seeds),
+            "seeds": ",".join(str(s) for s in r.seeds),
+            "win_rate_mean": round(r.win_rate_mean, 4) if r.win_rate_mean is not None else "",
+            "win_rate_std": round(r.win_rate_std, 4) if r.win_rate_std is not None else "",
+            "trunc_mean": round(r.trunc_mean, 4) if r.trunc_mean is not None else "",
+            "trunc_std": round(r.trunc_std, 4) if r.trunc_std is not None else "",
+            "avg_rally_mean": round(r.avg_rally_mean, 4) if r.avg_rally_mean is not None else "",
+            "avg_rally_std": round(r.avg_rally_std, 4) if r.avg_rally_std is not None else "",
+            "left_usage_total": r.left_usage_total,
+            "right_usage_total": r.right_usage_total,
+            "left_fraction_mean": round(r.left_fraction_mean, 4) if r.left_fraction_mean is not None else "",
+            "left_fraction_std": round(r.left_fraction_std, 4) if r.left_fraction_std is not None else "",
+            "right_fraction_mean": round(r.right_fraction_mean, 4) if r.right_fraction_mean is not None else "",
+            "right_fraction_std": round(r.right_fraction_std, 4) if r.right_fraction_std is not None else "",
+            "dominant_skill": r.dominant_skill or "",
+            "dominant_fraction_total": round(r.dominant_fraction_total, 4) if r.dominant_fraction_total is not None else "",
+        }
+        rows.append(row)
+
+    if not rows:
+        return
+
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_per_seed_csv(results: List[dict], path: str):
+    rows = []
+    for item in results:
+        r = item["result"]
+        row = {
+            "seed": item["seed"],
+            "matchup_seed": item["matchup_seed"],
+            "strategy1": r.strategy1,
+            "strategy2": r.strategy2,
+            "episodes": r.episodes,
+            "truncated_episodes": r.truncated_episodes,
+            "done_episodes": r.done_episodes,
+            "ego_wins": r.ego_wins,
+            "opp_wins": r.opp_wins,
+            "win_rate": round(r.win_rate, 4) if r.win_rate is not None else "",
+            "win_rate_clean": round(r.win_rate_clean, 4) if r.win_rate_clean is not None else "",
+            "avg_rally_length": round(r.avg_rally_length, 4) if r.avg_rally_length is not None else "",
+            "avg_steps_per_episode": round(r.avg_steps_per_episode, 4) if r.avg_steps_per_episode is not None else "",
+            "most_used_skill": most_used_skill(r) or "",
+            "dominant_fraction": round(dominant_skill_fraction(r), 4) if dominant_skill_fraction(r) is not None else "",
         }
         for skill_name in _SKILLS_2:
             row[f"usage_{skill_name}"] = r.skill_usage.get(skill_name, 0)
@@ -224,6 +317,185 @@ def print_summary(results: List[MatchupResult], file=None,
         print(f"Worst matchup: {worst[1].strategy1} vs {worst[1].strategy2} — {worst[0]:.0%}", file=file)
 
 
+def print_aggregate_summary(results: List[AggregateMatchupResult], file=None,
+                            title: str = "2-SKILL MULTI-SEED SUMMARY"):
+    if file is None:
+        file = sys.stdout
+
+    header = (
+        f"{'Matchup':<30} "
+        f"{'Seeds':>5} "
+        f"{'WR mean±std':>14} "
+        f"{'Trunc mean±std':>16} "
+        f"{'Rally mean±std':>16}"
+    )
+    sep = "-" * len(header)
+
+    print(f"\n{title:^{len(header)}}", file=file)
+    print(sep, file=file)
+    print(header, file=file)
+    print(sep, file=file)
+
+    for r in results:
+        matchup = f"{r.strategy1} vs {r.strategy2}"
+        wr = (
+            f"{r.win_rate_mean:.0%}±{r.win_rate_std:.0%}"
+            if r.win_rate_mean is not None and r.win_rate_std is not None
+            else "---"
+        )
+        trunc = (
+            f"{r.trunc_mean:.1f}±{r.trunc_std:.1f}"
+            if r.trunc_mean is not None and r.trunc_std is not None
+            else "---"
+        )
+        rally = (
+            f"{r.avg_rally_mean:.1f}±{r.avg_rally_std:.1f}"
+            if r.avg_rally_mean is not None and r.avg_rally_std is not None
+            else "---"
+        )
+        print(
+            f"{matchup:<30} "
+            f"{len(r.seeds):>5} "
+            f"{wr:>14} "
+            f"{trunc:>16} "
+            f"{rally:>16}",
+            file=file,
+        )
+
+    print(sep, file=file)
+
+
+# ─────────────────────────────────────────────────────────────────────────── #
+# Skill usage helpers                                                         #
+# ─────────────────────────────────────────────────────────────────────────── #
+
+def most_used_skill(result: MatchupResult) -> Optional[str]:
+    if not result.skill_usage:
+        return None
+
+    total = sum(result.skill_usage.values())
+    if total == 0:
+        return None
+
+    return max(result.skill_usage, key=result.skill_usage.get)
+
+
+def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
+    if not result.skill_usage:
+        return None
+
+    total = sum(result.skill_usage.values())
+    if total == 0:
+        return None
+
+    return max(result.skill_usage.values()) / total
+
+
+def _safe_mean_std(values: List[Optional[float]]) -> tuple[Optional[float], Optional[float]]:
+    usable = [float(v) for v in values if v is not None]
+    if not usable:
+        return None, None
+    arr = np.array(usable, dtype=np.float64)
+    return float(arr.mean()), float(arr.std(ddof=0))
+
+
+def _usage_fraction(result: MatchupResult, skill_name: str) -> Optional[float]:
+    total = sum(result.skill_usage.values())
+    if total == 0:
+        return None
+    return result.skill_usage.get(skill_name, 0) / total
+
+
+def aggregate_results_by_matchup(results: List[dict]) -> List[AggregateMatchupResult]:
+    grouped: Dict[tuple[str, str], List[dict]] = {}
+    for item in results:
+        key = (item["result"].strategy1, item["result"].strategy2)
+        grouped.setdefault(key, []).append(item)
+
+    aggregate_rows: List[AggregateMatchupResult] = []
+    for (strategy1, strategy2), entries in grouped.items():
+        seed_values = [entry["seed"] for entry in entries]
+        run_results = [entry["result"] for entry in entries]
+
+        win_rate_mean, win_rate_std = _safe_mean_std([r.win_rate for r in run_results])
+        trunc_mean, trunc_std = _safe_mean_std([r.truncated_episodes for r in run_results])
+        avg_rally_mean, avg_rally_std = _safe_mean_std([r.avg_rally_length for r in run_results])
+        left_fraction_mean, left_fraction_std = _safe_mean_std([
+            _usage_fraction(r, "left") for r in run_results
+        ])
+        right_fraction_mean, right_fraction_std = _safe_mean_std([
+            _usage_fraction(r, "right") for r in run_results
+        ])
+
+        left_usage_total = sum(r.skill_usage.get("left", 0) for r in run_results)
+        right_usage_total = sum(r.skill_usage.get("right", 0) for r in run_results)
+        total_usage = left_usage_total + right_usage_total
+        if total_usage > 0:
+            dominant_skill = "left" if left_usage_total >= right_usage_total else "right"
+            dominant_fraction_total = max(left_usage_total, right_usage_total) / total_usage
+        else:
+            dominant_skill = None
+            dominant_fraction_total = None
+
+        aggregate_rows.append(
+            AggregateMatchupResult(
+                strategy1=strategy1,
+                strategy2=strategy2,
+                seeds=seed_values,
+                win_rate_mean=win_rate_mean,
+                win_rate_std=win_rate_std,
+                trunc_mean=trunc_mean,
+                trunc_std=trunc_std,
+                avg_rally_mean=avg_rally_mean,
+                avg_rally_std=avg_rally_std,
+                left_usage_total=left_usage_total,
+                right_usage_total=right_usage_total,
+                left_fraction_mean=left_fraction_mean,
+                left_fraction_std=left_fraction_std,
+                right_fraction_mean=right_fraction_mean,
+                right_fraction_std=right_fraction_std,
+                dominant_skill=dominant_skill,
+                dominant_fraction_total=dominant_fraction_total,
+            )
+        )
+
+    return aggregate_rows
+
+
+def print_skill_selection_analysis(results: List[AggregateMatchupResult], file=None):
+    if file is None:
+        file = sys.stdout
+
+    print("\n=== FINAL SKILL SELECTION ANALYSIS ===", file=file)
+    for r in results:
+        total_usage = r.left_usage_total + r.right_usage_total
+        if total_usage == 0:
+            print(f"{r.strategy1} vs {r.strategy2}: no skill switches recorded", file=file)
+            continue
+
+        left_total_pct = r.left_usage_total / total_usage
+        right_total_pct = r.right_usage_total / total_usage
+        left_mean = f"{r.left_fraction_mean:.0%}" if r.left_fraction_mean is not None else "---"
+        left_std = f"{r.left_fraction_std:.0%}" if r.left_fraction_std is not None else "---"
+        right_mean = f"{r.right_fraction_mean:.0%}" if r.right_fraction_mean is not None else "---"
+        right_std = f"{r.right_fraction_std:.0%}" if r.right_fraction_std is not None else "---"
+        dominant = r.dominant_skill or "none"
+        dominant_pct = (
+            f"{r.dominant_fraction_total:.0%}"
+            if r.dominant_fraction_total is not None else "---"
+        )
+
+        print(
+            f"{r.strategy1} vs {r.strategy2}: "
+            f"left total={r.left_usage_total}({left_total_pct:.0%})  "
+            f"right total={r.right_usage_total}({right_total_pct:.0%})  "
+            f"left mean±std={left_mean}±{left_std}  "
+            f"right mean±std={right_mean}±{right_std}  "
+            f"dominant={dominant}({dominant_pct})",
+            file=file,
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # 2-skill constants                                                           #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -251,8 +523,10 @@ _SKILLS_2 = ["left", "right"]
 N_SKILLS_2 = 2
 
 VALID_STRATEGIES_2SKILL = [
-    "nash-p-2skill",
-    "nash-p-adaptive-2skill",
+    "nash-p-hard",
+    "nash-p-minimax",
+    "nash-p-adaptive",
+    "nash-p-br",
     "ibr",
     "random",
     "left",
@@ -260,20 +534,29 @@ VALID_STRATEGIES_2SKILL = [
 ]
 
 DEFAULT_MATCHUPS_2SKILL = [
-    ("nash-p-2skill", "random"),
-    ("nash-p-adaptive-2skill", "random"),
+    ('nash-p-br','random'),
+    ('nash-p-br','left'),
+    ('nash-p-br','right'),
+    ("nash-p-hard", "random"),
+    ("nash-p-minimax", "random"),
+    ("nash-p-adaptive", "random"),
     ("ibr", "random"),
-    ("nash-p-2skill", "left"),
-    ("nash-p-adaptive-2skill", "left"),
+    ("nash-p-hard", "left"),
+    ("nash-p-minimax", "left"),
+    ("nash-p-adaptive", "left"),
     ("ibr", "left"),
-    ("nash-p-2skill", "right"),
-    ("nash-p-adaptive-2skill", "right"),
+    ("nash-p-hard", "right"),
+    ("nash-p-minimax", "right"),
+    ("nash-p-adaptive", "right"),
     ("ibr", "right"),
-    ("nash-p-2skill", "ibr"),
-    ("nash-p-adaptive-2skill", "ibr"),
-    ("ibr", "nash-p-2skill"),
-    ("ibr", "nash-p-adaptive-2skill"),
-    ("nash-p-2skill", "nash-p-adaptive-2skill")
+    ("nash-p-hard", "ibr"),
+    ("ibr", "nash-p-hard"),
+    ("nash-p-minimax", "ibr"),
+    ("ibr", "nash-p-minimax"),
+    ("nash-p-adaptive", "ibr"),
+    ("ibr", "nash-p-adaptive"),
+    ("nash-p-hard", "nash-p-minimax"),
+    ("nash-p-hard", "nash-p-adaptive")
 ]
 
 # skill index -> side_target
@@ -372,8 +655,16 @@ def make_picker_2skill(
                 base_np = obs_vec.copy()
 
             base = torch.tensor(base_np, dtype=torch.float32)
-            curr_idx1 = 1
-            curr_idx2 = 1
+            other_idx = int(other_idx)
+            if other_idx not in range(N_SKILLS_2):
+                other_idx = 1
+            if player == 1:
+                curr_idx1 = 1
+                curr_idx2 = other_idx
+            else:
+                curr_idx1 = other_idx
+                curr_idx2 = 1
+
 
             with torch.no_grad():
                 for _ in range(4):
@@ -399,13 +690,13 @@ def make_picker_2skill(
 
         return pick_ibr
 
-    if strategy == "nash-p-2skill":
+    if strategy == "nash-p-hard":
         # Map skill index to the ±1 encoding the model was trained on
         # left=0 -> -1.0,  right=1 -> +1.0
         _sk_enc = {0: -1.0, 1: 1.0}
         _use_76 = (model_state_dim == _STATE_DIM_76)
 
-        def pick_nash(player, obs_vec, info, other_idx):
+        def pick_nash_hard(player, obs_vec, info, other_idx):
             # Build base feature vector: raw 116-dim or encoded 76-dim
             if _use_76:
                 base_np = encode_ego(obs_vec, info)   # 76-dim
@@ -431,9 +722,87 @@ def make_picker_2skill(
 
             return ego_best if player == 1 else opp_best
 
-        return pick_nash
+        return pick_nash_hard
+    
+    if strategy == "nash-p-br":
+        # Map skill index to the ±1 encoding the model was trained on
+        # left=0 -> -1.0,  right=1 -> +1.0
+        _sk_enc = {0: -1.0, 1: 1.0}
+        _use_76 = (model_state_dim == _STATE_DIM_76)
 
-    if strategy == "nash-p-adaptive-2skill":
+        def pick_nash_br(player, obs_vec, info, other_idx):
+            # Build base feature vector: raw 116-dim or encoded 76-dim
+            if _use_76:
+                base_np = encode_ego(obs_vec, info)   # 76-dim
+            else:
+                base_np = obs_vec.copy()              # 116-dim
+
+            base = torch.tensor(base_np, dtype=torch.float32)
+            rows = []
+            combos = []
+            for ego_s in range(N_SKILLS_2):
+                for opp_s in range(N_SKILLS_2):
+                    row = base.clone()
+                    row[-2] = _sk_enc[ego_s]
+                    row[-1] = _sk_enc[opp_s]
+                    rows.append(row)
+                    combos.append((ego_s, opp_s))
+
+            batch = torch.stack(rows)        # (4, state_dim)
+            with torch.no_grad():
+                vals = model_p(batch)[:, 0]  # (4,)
+            # BR-style selection: ego picks best response to opp's worst-case, and vice versa
+            phi = vals.reshape(2, 2)  # (ego_skill, opp_skill)
+            if player == 1:
+                return int(torch.argmax(phi[:,other_idx]).item())
+            else:
+                return int(torch.argmax(phi[other_idx,:]).item())
+
+        return pick_nash_br
+
+    if strategy == "nash-p-minimax":
+        # Map skill index to the ±1 encoding the model was trained on
+        # left=0 -> -1.0,  right=1 -> +1.0
+        _sk_enc = {0: -1.0, 1: 1.0}
+        _use_76 = (model_state_dim == _STATE_DIM_76)
+
+        def pick_nash_minimax(player, obs_vec, info, other_idx):
+            # Build base feature vector: raw 116-dim or encoded 76-dim
+            if _use_76:
+                base_np = encode_ego(obs_vec, info)   # 76-dim
+            else:
+                base_np = obs_vec.copy()              # 116-dim
+
+            base = torch.tensor(base_np, dtype=torch.float32)
+            rows = []
+            combos = []
+            for ego_s in range(N_SKILLS_2):
+                for opp_s in range(N_SKILLS_2):
+                    row = base.clone()
+                    row[-2] = _sk_enc[ego_s]
+                    row[-1] = _sk_enc[opp_s]
+                    rows.append(row)
+                    combos.append((ego_s, opp_s))
+
+            batch = torch.stack(rows)        # (4, state_dim)
+            with torch.no_grad():
+                vals = model_p(batch)[:, 0]  # (4,)
+            
+            # Symmetric robust selection on the learned potential surface:
+            # each player picks the action whose worst-case potential is best
+            # for that player. Player 2 should optimize its own column scores,
+            # not minimize player 1's row scores.
+            phi = vals.reshape(2, 2)  # (ego_skill, opp_skill)
+            if player == 1:
+                action_scores = phi.min(dim=1).values
+                return int(torch.argmax(action_scores).item())
+            else:
+                action_scores = phi.min(dim=0).values
+                return int(torch.argmax(action_scores).item())
+
+        return pick_nash_minimax
+
+    if strategy == "nash-p-adaptive":
         _sk_enc = {0: -1.0, 1: 1.0}
         _use_76 = (model_state_dim == _STATE_DIM_76)
 
@@ -460,7 +829,10 @@ def make_picker_2skill(
             if player == 1:
                 action_scores = phi.min(dim=1).values
             else:
-                action_scores = -phi.max(dim=0).values
+                # Same player-2 logic as minimax above: score each opponent
+                # action by its worst-case potential over ego responses, then
+                # choose the best such action for player 2.
+                action_scores = phi.min(dim=0).values
 
             gap = torch.abs(action_scores[0] - action_scores[1]).item()
             if gap >= confidence_margin:
@@ -785,6 +1157,13 @@ def print_summary_2skill(results, file=None):
     print_summary(results, file=file, title="2-SKILL STRATEGY COMPARISON RESULTS")
 
 
+def _raw_output_path(path: str) -> str:
+    root, ext = os.path.splitext(path)
+    if not ext:
+        ext = ".csv"
+    return f"{root}_per_seed{ext}"
+
+
 # ─────────────────────────────────────────────────────────────────────────── #
 # Main                                                                        #
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -857,22 +1236,29 @@ def main():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Base random seed for matchup reproducibility (default: 42)",
+        default=0,
+        help="Starting seed for multi-seed evaluation (default: 0)",
+    )
+    parser.add_argument(
+        "--num-seeds",
+        type=int,
+        default=3,
+        help="Number of consecutive seeds to evaluate, starting at --seed (default: 3, so seeds 0..2)",
     )
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
     from model_arch import SimpleModel
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    seeds = list(range(args.seed, args.seed + args.num_seeds))
+    random.seed(seeds[0])
+    np.random.seed(seeds[0])
+    torch.manual_seed(seeds[0])
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(seeds[0])
 
     print("Loading models...")
-    print(f"Evaluation seed: {args.seed}")
+    print(f"Evaluation seeds: {seeds}")
     print(f"Adaptive Nash-p tau: {args.tau}")
     print(f"Adaptive Nash-p confidence_margin: {args.confidence_margin}")
     ppo = PPO.load(PPO_MODEL_PATH)
@@ -909,49 +1295,68 @@ def main():
     print(
         f"\nRunning {len(DEFAULT_MATCHUPS_2SKILL)} matchups "
         f"to {args.episodes} completed episodes each "
+        f"across {len(seeds)} seeds "
         f"(warmup={args.warmup}, max_steps_per_episode={args.steps}) ...\n"
     )
 
-    results = []
-    for idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS_2SKILL):
-        matchup_seed = args.seed + idx * 1000
-        random.seed(matchup_seed)
-        np.random.seed(matchup_seed)
-        torch.manual_seed(matchup_seed)
+    seed_results: List[dict] = []
+    for seed in seeds:
+        print(f"\n=== Seed {seed} ===")
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(matchup_seed)
-        print(f"  [{s1} vs {s2}] ...")
-        r = run_matchup_2skill(
-            strategy1=s1,
-            strategy2=s2,
-            ppo=ppo,
-            model_p=model_p,
-            model1=model1,
-            model2=model2,
-            n_episodes=args.episodes,
-            max_steps_per_episode=args.steps,
-            warmup_steps=args.warmup,
-            max_total_steps=args.max_total_steps,
-            debug_contacts=args.debug_contacts,
-            model_state_dim=state_dim,
-            tau=args.tau,
-            confidence_margin=args.confidence_margin,
-        )
-        results.append(r)
+            torch.cuda.manual_seed_all(seed)
 
-        wr      = f"{r.win_rate:.0%}"       if r.win_rate       is not None else "---"
-        wr_c    = f"{r.win_rate_clean:.0%}" if r.win_rate_clean is not None else "N/A"
-        arl     = f"{r.avg_rally_length:.1f}" if r.avg_rally_length is not None else "---"
-        print(
-            f"    eps={r.episodes}  done={r.done_episodes}  trunc={r.truncated_episodes}  "
-            f"win_rate(all)={wr}  win_rate(done)={wr_c}  "
-            f"ego_contacts={r.ego_contacts}  avg_rally={arl}"
-        )
+        current_results = []
+        for idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS_2SKILL):
+            matchup_seed = seed * 1000 + idx
+            random.seed(matchup_seed)
+            np.random.seed(matchup_seed)
+            torch.manual_seed(matchup_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(matchup_seed)
 
-    print_summary_2skill(results)
+            print(f"  [{s1} vs {s2}] ...")
+            r = run_matchup_2skill(
+                strategy1=s1,
+                strategy2=s2,
+                ppo=ppo,
+                model_p=model_p,
+                model1=model1,
+                model2=model2,
+                n_episodes=args.episodes,
+                max_steps_per_episode=args.steps,
+                warmup_steps=args.warmup,
+                max_total_steps=args.max_total_steps,
+                debug_contacts=args.debug_contacts,
+                model_state_dim=state_dim,
+                tau=args.tau,
+                confidence_margin=args.confidence_margin,
+            )
+            current_results.append(r)
+            seed_results.append({"seed": seed, "matchup_seed": matchup_seed, "result": r})
 
-    save_csv_2skill(results, args.output_csv)
-    print(f"\n  CSV saved to: {args.output_csv}")
+            wr = f"{r.win_rate:.0%}" if r.win_rate is not None else "---"
+            wr_c = f"{r.win_rate_clean:.0%}" if r.win_rate_clean is not None else "N/A"
+            arl = f"{r.avg_rally_length:.1f}" if r.avg_rally_length is not None else "---"
+            print(
+                f"    eps={r.episodes}  done={r.done_episodes}  trunc={r.truncated_episodes}  "
+                f"win_rate(all)={wr}  win_rate(done)={wr_c}  "
+                f"ego_contacts={r.ego_contacts}  avg_rally={arl}"
+            )
+
+        print_summary_2skill(current_results)
+
+    aggregate_results = aggregate_results_by_matchup(seed_results)
+    print_aggregate_summary(aggregate_results)
+    print_skill_selection_analysis(aggregate_results)
+
+    raw_csv_path = _raw_output_path(args.output_csv)
+    save_per_seed_csv(seed_results, raw_csv_path)
+    save_aggregate_csv(aggregate_results, args.output_csv)
+    print(f"\n  Aggregate CSV saved to: {args.output_csv}")
+    print(f"  Per-seed CSV saved to:   {raw_csv_path}")
 
     os.makedirs(
         os.path.dirname(args.output_json)
@@ -959,20 +1364,43 @@ def main():
         exist_ok=True,
     )
 
-    json_data = [dataclasses.asdict(r) for r in results]
-    for i, r in enumerate(results):
-        json_data[i]["win_rate"] = r.win_rate
-        json_data[i]["win_rate_clean"] = r.win_rate_clean
-        json_data[i]["done_episodes"] = r.done_episodes
-        json_data[i]["avg_rally_length"] = r.avg_rally_length
-        json_data[i]["ego_success_rate"] = r.ego_success_rate
-        json_data[i]["opp_success_rate"] = r.opp_success_rate
-        json_data[i]["seed"] = args.seed
-        json_data[i]["tau"] = args.tau
-        json_data[i]["confidence_margin"] = args.confidence_margin
+    json_data = []
+    for item in seed_results:
+        r = item["result"]
+        payload = dataclasses.asdict(r)
+        payload["win_rate"] = r.win_rate
+        payload["win_rate_clean"] = r.win_rate_clean
+        payload["done_episodes"] = r.done_episodes
+        payload["avg_rally_length"] = r.avg_rally_length
+        payload["ego_success_rate"] = r.ego_success_rate
+        payload["opp_success_rate"] = r.opp_success_rate
+        payload["most_used_skill"] = most_used_skill(r)
+        payload["dominant_fraction"] = dominant_skill_fraction(r)
+        payload["seed"] = item["seed"]
+        payload["matchup_seed"] = item["matchup_seed"]
+        payload["tau"] = args.tau
+        payload["confidence_margin"] = args.confidence_margin
+        json_data.append(payload)
 
     with open(args.output_json, "w") as f:
-        json.dump(json_data, f, indent=2)
+        json.dump(
+            {
+                "config": {
+                    "seeds": seeds,
+                    "episodes": args.episodes,
+                    "steps": args.steps,
+                    "warmup": args.warmup,
+                    "max_total_steps": args.max_total_steps,
+                    "model": args.model,
+                    "tau": args.tau,
+                    "confidence_margin": args.confidence_margin,
+                },
+                "per_seed_results": json_data,
+                "aggregate_results": [dataclasses.asdict(r) for r in aggregate_results],
+            },
+            f,
+            indent=2,
+        )
 
     print(f"  JSON saved to: {args.output_json}")
 
