@@ -1,0 +1,202 @@
+{
+  "aggregated": [
+    {
+      "strategy1": "ibr",
+      "strategy2": "center_safe",
+      "n_seeds": 5,
+      "win_rate_mean": 0.6867,
+      "win_rate_std": 0.1554,
+      "avg_steps_mean": 1884.7,
+      "avg_steps_std": 902.73,
+      "avg_rally_mean": 31.1,
+      "avg_rally_std": 15.2
+    },
+    {
+      "strategy1": "ibr",
+      "strategy2": "left",
+      "n_seeds": 5,
+      "win_rate_mean": 0.5133,
+      "win_rate_std": 0.3364,
+      "avg_steps_mean": 496.27,
+      "avg_steps_std": 263.31,
+      "avg_rally_mean": 6.88,
+      "avg_rally_std": 4.19
+    },
+    {
+      "strategy1": "ibr",
+      "strategy2": "left_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.4433,
+      "win_rate_std": 0.2482,
+      "avg_steps_mean": 1049.74,
+      "avg_steps_std": 535.82,
+      "avg_rally_mean": 16.36,
+      "avg_rally_std": 8.6
+    },
+    {
+      "strategy1": "ibr",
+      "strategy2": "random",
+      "n_seeds": 5,
+      "win_rate_mean": 0.2567,
+      "win_rate_std": 0.091,
+      "avg_steps_mean": 1067.45,
+      "avg_steps_std": 366.16,
+      "avg_rally_mean": 16.71,
+      "avg_rally_std": 5.93
+    },
+    {
+      "strategy1": "ibr",
+      "strategy2": "right",
+      "n_seeds": 5,
+      "win_rate_mean": 0.7733,
+      "win_rate_std": 0.0309,
+      "avg_steps_mean": 3090.26,
+      "avg_steps_std": 284.57,
+      "avg_rally_mean": 56.41,
+      "avg_rally_std": 5.66
+    },
+    {
+      "strategy1": "ibr",
+      "strategy2": "right_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.7033,
+      "win_rate_std": 0.0662,
+      "avg_steps_mean": 2627.49,
+      "avg_steps_std": 346.23,
+      "avg_rally_mean": 45.8,
+      "avg_rally_std": 6.24
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "center_safe",
+      "n_seeds": 5,
+      "win_rate_mean": 0.6733,
+      "win_rate_std": 0.1191,
+      "avg_steps_mean": 2214.97,
+      "avg_steps_std": 207.35,
+      "avg_rally_mean": 36.63,
+      "avg_rally_std": 3.55
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "left",
+      "n_seeds": 5,
+      "win_rate_mean": 0.5567,
+      "win_rate_std": 0.3527,
+      "avg_steps_mean": 528.33,
+      "avg_steps_std": 56.12,
+      "avg_rally_mean": 7.46,
+      "avg_rally_std": 0.97
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "left_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.17,
+      "win_rate_std": 0.1067,
+      "avg_steps_mean": 491.79,
+      "avg_steps_std": 249.19,
+      "avg_rally_mean": 7.39,
+      "avg_rally_std": 3.91
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "random",
+      "n_seeds": 5,
+      "win_rate_mean": 0.2833,
+      "win_rate_std": 0.0577,
+      "avg_steps_mean": 1097.24,
+      "avg_steps_std": 118.98,
+      "avg_rally_mean": 17.32,
+      "avg_rally_std": 1.91
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "right",
+      "n_seeds": 5,
+      "win_rate_mean": 0.7933,
+      "win_rate_std": 0.0271,
+      "avg_steps_mean": 3221.07,
+      "avg_steps_std": 205.04,
+      "avg_rally_mean": 58.68,
+      "avg_rally_std": 4.0
+    },
+    {
+      "strategy1": "nash-p",
+      "strategy2": "right_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.6933,
+      "win_rate_std": 0.1167,
+      "avg_steps_mean": 2179.55,
+      "avg_steps_std": 674.61,
+      "avg_rally_mean": 37.76,
+      "avg_rally_std": 11.9
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "center_safe",
+      "n_seeds": 5,
+      "win_rate_mean": 0.87,
+      "win_rate_std": 0.0323,
+      "avg_steps_mean": 3010.21,
+      "avg_steps_std": 147.81,
+      "avg_rally_mean": 51.11,
+      "avg_rally_std": 2.6
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "left",
+      "n_seeds": 5,
+      "win_rate_mean": 0.6867,
+      "win_rate_std": 0.0636,
+      "avg_steps_mean": 1380.06,
+      "avg_steps_std": 83.93,
+      "avg_rally_mean": 21.58,
+      "avg_rally_std": 1.35
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "left_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.4967,
+      "win_rate_std": 0.2606,
+      "avg_steps_mean": 1075.94,
+      "avg_steps_std": 569.01,
+      "avg_rally_mean": 17.19,
+      "avg_rally_std": 9.38
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "random",
+      "n_seeds": 5,
+      "win_rate_mean": 0.49,
+      "win_rate_std": 0.0898,
+      "avg_steps_mean": 853.86,
+      "avg_steps_std": 31.85,
+      "avg_rally_mean": 13.42,
+      "avg_rally_std": 0.52
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "right",
+      "n_seeds": 5,
+      "win_rate_mean": 0.7867,
+      "win_rate_std": 0.0531,
+      "avg_steps_mean": 2067.13,
+      "avg_steps_std": 166.81,
+      "avg_rally_mean": 34.21,
+      "avg_rally_std": 2.86
+    },
+    {
+      "strategy1": "nash-p-adaptive",
+      "strategy2": "right_short",
+      "n_seeds": 5,
+      "win_rate_mean": 0.7066,
+      "win_rate_std": 0.1421,
+      "avg_steps_mean": 551.98,
+      "avg_steps_std": 225.8,
+      "avg_rally_mean": 8.57,
+      "avg_rally_std": 3.67
+    }
+  ]
+}

@@ -39,10 +39,12 @@ from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_in
 # Constants
 # --------------------------------------------------------------------------- #
 
-PPO_MODEL_PATH = "logs/best_model_tracker1/best_model"
-MODEL_P_5SK_PATH = "models/model_p_5skill.pth"
-# v2 pipeline — new model trained with discounted returns and 76-dim state
-MODEL_P_V2_PATH  = "models/model_p_v2.pth"
+PPO_MODEL_PATH        = "logs/best_model_tracker1/best_model"
+MODEL_P_5SK_PATH      = "models/model_p_5skill.pth"
+# v2 4-skill pipeline — discounted returns, 76-dim state
+MODEL_P_V2_PATH       = "models/model_p_v2.pth"
+# v2 5-skill pipeline — discounted returns, 76-dim state, all 5 skills
+MODEL_P_5SK_V2_PATH   = "models/model_p_5skill_v2.pth"
 
 HISTORY = 4
 
@@ -63,9 +65,15 @@ DEFAULT_MATCHUPS = [
     ("nash-p", "right_short"),
     ("nash-p", "center_safe"),
     ("nash-p-adaptive", "random"),
+    ("nash-p-adaptive", "left"),
+    ("nash-p-adaptive", "left_short"),
+    ("nash-p-adaptive", "center_safe"),
     ("nash-p-adaptive", "right_short"),
     ("nash-p-adaptive", "right"),
     ("ibr", "random"),
+    ("ibr", "left"),
+    ("ibr", "left_short"),
+    ("ibr", "center_safe"),
     ("ibr", "right_short"),
     ("ibr", "right"),
 ]
@@ -851,8 +859,19 @@ def main():
         action="store_true",
         default=False,
         help=(
-            "Use the v2 pipeline: load model_p_v2.pth (76-dim state encoder, "
+            "Use the 4-skill v2 pipeline: load model_p_v2.pth (76-dim state encoder, "
             "discounted-return training). Default: v1 5-skill pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--v2-5skill",
+        action="store_true",
+        default=False,
+        dest="v2_5skill",
+        help=(
+            "Use the 5-skill v2 pipeline: load model_p_5skill_v2.pth (76-dim state "
+            "encoder, discounted-return labels, all 5 skills). Trained by "
+            "train_q_model_5skill_v2.py."
         ),
     )
     parser.add_argument(
@@ -876,21 +895,29 @@ def main():
     print("Loading models...")
     ppo = PPO.load(PPO_MODEL_PATH)
 
-    if args.v2:
-        # v2: model trained on 76-dim encoded states
+    if args.v2_5skill:
+        # 5-skill v2: 76-dim encoded states, all 5 skills, discounted-return training
+        from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+        model_p_path = MODEL_P_5SK_V2_PATH
+        model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+        pipeline_tag = "v2-5skill"
+    elif args.v2:
+        # 4-skill v2: 76-dim encoded states (original v2 diagnostic)
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = MODEL_P_V2_PATH
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+        pipeline_tag = "v2-4skill"
     else:
         # v1: original 116-dim raw obs
         model_p_path = MODEL_P_5SK_PATH
         model_p = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
+        pipeline_tag = "v1-5skill"
 
     model_p.load_state_dict(_safe_load_state_dict(model_p_path))
     model_p.eval()
 
     # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it
-    if args.v2:
+    if args.v2_5skill or args.v2:
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
 
         def _v2_state_encoder(obs, info, player):
@@ -904,7 +931,7 @@ def main():
         state_encoder_fn = None
 
     print(f"  Loaded PPO:         {PPO_MODEL_PATH}")
-    print(f"  Loaded potential:   {model_p_path}  ({'v2' if args.v2 else 'v1'})")
+    print(f"  Loaded potential:   {model_p_path}  ({pipeline_tag})")
     print(
         f"\nRunning {len(DEFAULT_MATCHUPS)} matchups "
         f"to {args.episodes} completed episodes each "
