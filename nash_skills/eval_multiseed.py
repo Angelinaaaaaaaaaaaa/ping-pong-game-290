@@ -1,8 +1,9 @@
 """
 Multi-seed evaluation for the 5-skill Nash pipeline.
 
-Runs all three learned strategies (nash-p, nash-p-adaptive, ibr) against all six
-fixed-skill opponents across seeds 0..4, then aggregates mean/std win rates.
+Runs all five learned strategies (nash-p-hard, nash-p-br, nash-p-minimax,
+nash-p-adaptive, ibr) against all six fixed-skill opponents across seeds 0..4,
+then aggregates mean/std win rates.  30 matchups × n_seeds total runs.
 
 DO NOT retrain models.  Only evaluation — no weight updates.
 
@@ -43,11 +44,11 @@ from nash_skills.eval_matchup import (
 # Fixed evaluation spec — symmetric across all three strategies               #
 # --------------------------------------------------------------------------- #
 
-STRATEGIES = ["nash-p", "nash-p-adaptive", "ibr"]
+STRATEGIES = ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr"]
 
 OPPONENTS = ["random", "left", "right", "left_short", "right_short", "center_safe"]
 
-# All 18 matchups: 3 strategies × 6 opponents
+# All 30 matchups: 5 strategies × 6 opponents
 MULTISEED_MATCHUPS = [
     (strategy, opp)
     for strategy in STRATEGIES
@@ -265,6 +266,35 @@ def main() -> None:
         state_encoder_fn = None
 
     model_p.eval()
+
+    # Q-value models — required for ibr strategy
+    needs_q = any(s == "ibr" for s, _ in MULTISEED_MATCHUPS) or any(
+        s == "ibr" for _, s in MULTISEED_MATCHUPS
+    )
+    model1 = model2 = None
+    if needs_q:
+        if args.v2_5skill:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path, _q2_path = "models/model1_5skill_v2.pth", "models/model2_5skill_v2.pth"
+        elif args.v2:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path, _q2_path = "models/model1_v2.pth", "models/model2_v2.pth"
+        else:
+            _sdim = 116
+            _q1_path, _q2_path = "models/model1_5skill.pth", "models/model2_5skill.pth"
+        model1 = SimpleModel(_sdim, [64, 32, 16], 1)
+        model2 = SimpleModel(_sdim, [64, 32, 16], 1)
+        for _m, _path in [(model1, _q1_path), (model2, _q2_path)]:
+            try:
+                _m.load_state_dict(torch.load(_path, weights_only=True))
+            except TypeError:
+                _m.load_state_dict(torch.load(_path))
+        model1.eval()
+        model2.eval()
+        print(f"  Q-models:  {_q1_path}, {_q2_path}")
+
     print(f"  PPO:       {PPO_MODEL_PATH}")
     print(f"  Potential: {model_p_path}")
     print()
@@ -298,6 +328,8 @@ def main() -> None:
                 state_encoder_fn=state_encoder_fn,
                 tau=args.tau,
                 confidence_margin=args.confidence_margin,
+                model1=model1,
+                model2=model2,
             )
 
             wr  = f"{result.win_rate:.0%}" if result.win_rate is not None else "---"
