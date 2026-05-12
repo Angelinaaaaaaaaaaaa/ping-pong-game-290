@@ -513,6 +513,12 @@ MODEL_P_76DIM_PATH  = "models/model_p_76dim.pth"       # 76-dim encoded model (p
 # NOTE: models/model_p_v2.pth is written by nash_skills/v2/train_models.py with
 # a 76-dim state encoder and CANNOT be loaded here; use MODEL_P_76DIM_PATH instead.
 
+# §3.6 ablation: FactoredModel weights for the 2-skill v2 pipeline (76-dim).
+# Trained by train_q_model_factored.py.
+MODEL1_FACTORED_PATH  = "models/model1_factored.pth"
+MODEL2_FACTORED_PATH  = "models/model2_factored.pth"
+MODEL_P_FACTORED_PATH = "models/model_p_factored.pth"
+
 HISTORY = 4
 TABLE_SHIFT = 1.5
 TABLE_X_MIN = 0.0
@@ -1222,6 +1228,18 @@ def main():
         ),
     )
     parser.add_argument(
+        "--arch",
+        choices=["simple", "factored"],
+        default="simple",
+        help=(
+            "Estimator architecture (ablation):\n"
+            "  simple   — SimpleModel (flat-concat MLP; default; uses --model paths)\n"
+            "  factored — FactoredModel (separate state/skill encoders + fusion);\n"
+            "             ignores --model and loads model{1,2,p}_factored.pth\n"
+            "             (76-dim, trained by train_q_model_factored.py)."
+        ),
+    )
+    parser.add_argument(
         "--tau",
         type=float,
         default=0.2,
@@ -1248,7 +1266,7 @@ def main():
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
-    from model_arch import SimpleModel
+    from model_arch import SimpleModel, FactoredModel
 
     seeds = list(range(args.seed, args.seed + args.num_seeds))
     random.seed(seeds[0])
@@ -1263,7 +1281,18 @@ def main():
     print(f"Adaptive Nash-p confidence_margin: {args.confidence_margin}")
     ppo = PPO.load(PPO_MODEL_PATH)
 
-    if args.model == "76dim":
+    if args.arch == "factored":
+        # FactoredModel trained on 76-dim encoded state by
+        # train_q_model_factored.py. --model is ignored under --arch factored
+        # because the factored weights are only saved at one (76-dim) variant.
+        model1_path  = MODEL1_FACTORED_PATH
+        model2_path  = MODEL2_FACTORED_PATH
+        model_p_path = MODEL_P_FACTORED_PATH
+        state_dim    = 76
+        if args.model != "76dim":
+            print(f"  NOTE: --arch factored ignores --model={args.model}; "
+                  f"using 76-dim factored weights.")
+    elif args.model == "76dim":
         model1_path = MODEL1_76DIM_PATH
         model2_path = MODEL2_76DIM_PATH
         model_p_path = MODEL_P_76DIM_PATH
@@ -1279,17 +1308,26 @@ def main():
         model_p_path = MODEL_P_2SK_PATH
         state_dim = 116
 
-    model1 = SimpleModel(state_dim, [64, 32, 16], 1)
-    model2 = SimpleModel(state_dim, [64, 32, 16], 1)
-    model_p = SimpleModel(state_dim, [64, 32, 16], 1, last_layer_activation=None)
+    if args.arch == "factored":
+        # state_dim above is the total input width (state + skill);
+        # FactoredModel needs the split, so subtract the 2 skill dims.
+        model1  = FactoredModel(state_dim=state_dim - 2, skill_dim=2)
+        model2  = FactoredModel(state_dim=state_dim - 2, skill_dim=2)
+        model_p = FactoredModel(state_dim=state_dim - 2, skill_dim=2,
+                                last_layer_activation=None)
+    else:
+        model1  = SimpleModel(state_dim, [64, 32, 16], 1)
+        model2  = SimpleModel(state_dim, [64, 32, 16], 1)
+        model_p = SimpleModel(state_dim, [64, 32, 16], 1, last_layer_activation=None)
     model1.load_state_dict(torch.load(model1_path, weights_only=True))
     model2.load_state_dict(torch.load(model2_path, weights_only=True))
     model_p.load_state_dict(torch.load(model_p_path, weights_only=True))
     model1.eval()
     model2.eval()
     model_p.eval()
-    print(f"  Loaded 2-skill Q1: {model1_path}  (state_dim={state_dim})")
-    print(f"  Loaded 2-skill Q2: {model2_path}  (state_dim={state_dim})")
+    print(f"  Loaded 2-skill arch:      {args.arch}")
+    print(f"  Loaded 2-skill Q1:        {model1_path}  (state_dim={state_dim})")
+    print(f"  Loaded 2-skill Q2:        {model2_path}  (state_dim={state_dim})")
     print(f"  Loaded 2-skill potential: {model_p_path}  (state_dim={state_dim})")
 
     print(
