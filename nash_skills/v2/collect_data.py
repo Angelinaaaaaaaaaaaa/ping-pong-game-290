@@ -143,7 +143,8 @@ def collect(
 
             # Episode ended (done) or step-capped (truncated)
             if done or steps_in_ep >= MAX_STEPS_PER_EPISODE:
-                winner = detect_winner(curr_raw, done=done)
+                terminal_raw = curr_raw + [obs.copy()] if done else curr_raw
+                winner = detect_winner(terminal_raw, done=done, info=info)
                 if len(curr_states) > 0:
                     all_rallies.append({
                         "skill1":  skill1,

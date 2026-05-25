@@ -47,14 +47,13 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
+from nash_skills.winner_inference import infer_terminal_winner, winner_to_label
+
 # Default discount factor — use gamma=0.9 for shorter-horizon strategy learning
 GAMMA: float = 0.7
 
-# Index into each raw 116-dim state where ball velocity x is stored
-_BALL_VEL_X_IDX = 39
 
-
-def detect_winner(rally: list, done: bool) -> int:
+def detect_winner(rally: list, done: bool, info: dict | None = None) -> int:
     """
     Infer which player won this rally from the terminal state.
 
@@ -66,6 +65,9 @@ def detect_winner(rally: list, done: bool) -> int:
     done  : bool
         True if the episode terminated with a real done signal
         (ball exited past a racket by >0.3m).
+    info  : dict or None
+        Optional terminal env info. When available, explicit winner fields or
+        racket-boundary reconstruction are used before velocity fallback.
 
     Returns
     -------
@@ -77,16 +79,8 @@ def detect_winner(rally: list, done: bool) -> int:
     if not done or len(rally) == 0:
         return 0
 
-    # The terminal ball velocity x-component tells us who missed:
-    #   ball_vel[0] > 0  → ball moving toward opponent's side → opp missed → ego wins
-    #   ball_vel[0] < 0  → ball moving toward ego's side      → ego missed → opp wins
-    last_state = rally[-1]
-    ball_vel_x = float(last_state[_BALL_VEL_X_IDX])
-
-    if ball_vel_x > 0:
-        return 1   # ego wins
-    else:
-        return 2   # opp wins
+    winner = infer_terminal_winner(rally[-1], info, fallback=None)
+    return winner_to_label(winner)
 
 
 def compute_returns(

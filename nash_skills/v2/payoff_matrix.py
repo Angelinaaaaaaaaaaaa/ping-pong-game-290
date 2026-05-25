@@ -24,6 +24,7 @@ import json
 from typing import List, Optional
 
 from nash_skills.skills import SKILL_NAMES
+from nash_skills.winner_inference import infer_terminal_winner
 
 
 def parse_skills(raw: str | None) -> list:
@@ -144,7 +145,7 @@ def run_payoff_matrix(
     from nash_skills.skills import skill_from_index, skill_index
 
     HISTORY = 4
-    TABLE_SHIFT = 1.5  # net x-position; ball_x > 1.5 → opp's side
+    TABLE_SHIFT = 1.5
 
     def _build_obs1(obs, info):
         o = np.zeros(9 + 9 + 7 + 7 + 9 * HISTORY, dtype=np.float32)
@@ -167,12 +168,7 @@ def run_payoff_matrix(
         return o
 
     def _infer_winner(obs, info):
-        # obs layout: qpos[:18], qvel[:18], ball.xpos[36:39], ...
-        # done fires when ball goes out of reach of one player.
-        # ball_x > TABLE_SHIFT (1.5) → ball past net on opp side → opp missed → ego wins
-        # ball_x < TABLE_SHIFT       → ball on ego side           → ego missed → opp wins
-        ball_x = float(obs[36])
-        return "ego" if ball_x > TABLE_SHIFT else "opp"
+        return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
     active_matchups = build_payoff_matchups(skills_subset)
     entries: List[PayoffEntry] = []

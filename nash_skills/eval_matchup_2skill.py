@@ -38,6 +38,7 @@ import numpy as np
 import torch
 
 from nash_skills.v2.state_encoder import encode_ego, STATE_DIM as _STATE_DIM_76
+from nash_skills.winner_inference import infer_terminal_winner
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -915,11 +916,13 @@ def _infer_winner(obs, info):
     Infer which player won this episode from the terminal observation.
 
     Preference:
-    1. Use common winner keys if present in info.
-    2. Fall back to ball VELOCITY x-component (obs[39]):
+    1. Use explicit winner keys if present in info.
+    2. Reconstruct the env's terminal racket-boundary condition from info.
+    3. Fall back to ball VELOCITY x-component (obs[39]):
          ball_vel_x > 0  → ball moving toward opponent's side → opp missed → EGO wins
          ball_vel_x < 0  → ball moving toward ego's side      → ego missed → OPP wins
-         ball_vel_x == 0 → inconclusive; default to 'opp' (conservative)
+    4. Last resort: ball position relative to the net only when the previous
+       signals are unavailable or exactly ambiguous.
 
     WHY velocity and not position (old bug):
     The env fires done when the ball goes >0.3m past a racket, which can happen
@@ -931,23 +934,7 @@ def _infer_winner(obs, info):
     Returns:
         'ego' or 'opp'
     """
-    if isinstance(info, dict):
-        for key in ["winner", "point_winner", "episode_winner"]:
-            if key in info:
-                val = info[key]
-                if val in ("ego", 0, "player0", "p0", "left"):
-                    return "ego"
-                if val in ("opp", 1, "player1", "p1", "right"):
-                    return "opp"
-
-    # Velocity-based fallback: obs[39] = ball velocity x-component
-    ball_vel_x = float(obs[39])
-    if ball_vel_x > 0:
-        return "ego"   # ball heading to opp side → opp missed
-    elif ball_vel_x < 0:
-        return "opp"   # ball heading to ego side → ego missed
-    else:
-        return "opp"   # stationary / ambiguous — conservative default
+    return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
