@@ -5,7 +5,7 @@ import numpy as np
 import pickle as pkl
 
 env = KukaTennisEnv(proc_id=1)
-model = PPO.load("logs/best_model_tracker/best_model")
+model = PPO.load("logs/best_model_tracker1/best_model")
 history = 4
 obs, info = env.reset()
 prev_ball_x = obs[36]
@@ -60,7 +60,7 @@ for i in range(2000000):
         print("Reset requested", len(curr_rally))
         curr_rally = []
         obs, _ = env.reset()
-        pkl.dump(rallies, open("data/rallies2.pkl", "wb"))
+        pkl.dump(rallies, open("data/rallies.pkl", "wb"))
 
     
 env.close()

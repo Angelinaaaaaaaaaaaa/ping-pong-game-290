@@ -88,20 +88,22 @@ model_p.batch_norm.running_var = model1.batch_norm.running_var
 model_p.batch_norm.momentum = 0.
 print(model_p.batch_norm.running_mean)
 print(model_p.batch_norm.running_var)
-optimizer_p = torch.optim.Adam(model_p.parameters(), lr=0.1)
+optimizer_p = torch.optim.Adam(model_p.parameters(), lr=0.001)
 
+# Use {-1, +1} encoding matching the environment's side_target convention
+# and the inference code in comp.py — NOT {0, 1} which caused sign-flip errors.
 X11 = X.clone()
 X11[:,-2] = 1.
 X11[:,-1] = 1.
 X01 = X.clone()
-X01[:,-2] = 0.
+X01[:,-2] = -1.   # left ego  (was 0., now -1. to match side_target)
 X01[:,-1] = 1.
 X10 = X.clone()
 X10[:,-2] = 1.
-X10[:,-1] = 0.
+X10[:,-1] = -1.   # left opp  (was 0., now -1. to match side_target)
 X00 = X.clone()
-X00[:,-2] = 0.
-X00[:,-1] = 0.
+X00[:,-2] = -1.   # left ego  (was 0., now -1.)
+X00[:,-1] = -1.   # left opp  (was 0., now -1.)
 model_p.eval()
 min_loss = 0.1
 for i in range(n_epochs):
