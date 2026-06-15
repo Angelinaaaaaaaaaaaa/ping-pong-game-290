@@ -1,0 +1,4 @@
+skill,done_episodes,truncated_episodes,attempted_episodes,done_fraction,avg_rally_length,is_feasible
+left_short,30,41,71,0.4225,7.54,True
+right_short,30,10,40,0.75,3.75,True
+right,30,34,64,0.4688,5.92,True
