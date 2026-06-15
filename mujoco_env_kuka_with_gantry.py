@@ -46,8 +46,9 @@ class KukaTennisEnv(gym.Env):
         self.viewer = None
 
         self.max_episode_steps = 1000
-        self.current_step = 0
+        self.current_step = np.random.randint(0,self.max_episode_steps)
         self.orientation_K = 10.0
+        self.n_episode = 0
         self.dist_k = 10.0
         self.prev_reward = 0.
         self.tolerance_range = [2.5,1.0]
@@ -70,15 +71,16 @@ class KukaTennisEnv(gym.Env):
     
     
     def step(self, action):
+        # import pdb; pdb.set_trace()
         self.prev_actions[:-1,:] = self.prev_actions[1:,:]
-        self.prev_actions[-1,:] = action/20.
+        self.prev_actions[-1,:] = action/10.
         self.current_step += 1
         self.total_steps += 1
         # Apply action to actuators
-        self.data.ctrl[:] = np.array(action[2:])/20. + np.array(self.data.qpos[2:])
-        self.data.qpos[0] += 5*action[0]/1000.
-        self.data.qpos[1] += 5*action[1]/1000.
-        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.,-0.5)
+        self.data.ctrl[:] = np.array(action[2:])/10. + np.array(self.data.qpos[2:])
+        self.data.qpos[0] += 10*action[0]/1000.
+        self.data.qpos[1] += 10*action[1]/1000.
+        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.2,-0.3)
         self.data.qpos[1] = np.clip(self.data.qpos[1],-1.,1.)
         # self.data.ctrl[0] = -1.0
         # self.data.ctrl[1] = 1.0
@@ -123,13 +125,16 @@ class KukaTennisEnv(gym.Env):
         #     print("Wtf!!", self.current_step, reward)
         if self.current_step >= self.max_episode_steps:
             self.current_step = 0
+            if self.n_episode < 2 :
+                self.current_step = np.random.randint(0,self.max_episode_steps)
+            self.n_episode += 1
             done = True
         # print("Len: ",len(obs))
         return obs, curr_reward, done, False, {}
 
     def reset_target(self):
         self.curr_target = np.array([0.,0.,0.,0.,0.,0.,0.])
-        self.curr_target[0] = np.random.uniform(-0.5,0.3)
+        self.curr_target[0] = np.random.uniform(-0.5,0.2)
         self.curr_target[1] = np.random.uniform(-1.1,1.1)
         self.curr_target[2] = np.random.uniform(0.75,1.05)
         xr,yr,zr = np.random.uniform(-1,1,3)*0.5
@@ -149,7 +154,10 @@ class KukaTennisEnv(gym.Env):
         
 
     def reset(self,seed=None):
-        self.current_step = 0
+        if self.n_episode < 2 :
+            self.current_step = np.random.randint(0,self.max_episode_steps)
+        else:
+            self.current_step = 0
         self.prev_actions = np.zeros((self.history,9))
         mj.mj_resetData(self.model, self.data)
         self.reset_target()
@@ -177,11 +185,10 @@ class KukaTennisEnv(gym.Env):
 
     def render(self, mode="human"):
         # return
-        if not hasattr(self, 'viewer'):
-            self.viewer = mj.MjViewer(self.model)
-        if self.viewer is None:
-            self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
-        self.viewer.render()
+        if not hasattr(self, 'viewer') or self.viewer is None:
+            import mujoco.viewer
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        self.viewer.sync()
 
     def close(self):
         if self.viewer is not None:

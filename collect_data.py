@@ -5,7 +5,7 @@ import numpy as np
 import pickle as pkl
 
 env = KukaTennisEnv(proc_id=1)
-model = PPO.load("logs/best_model_tracker_slow/best_model")
+model = PPO.load("logs/best_model_tracker/best_model")
 history = 4
 obs, info = env.reset()
 prev_ball_x = obs[36]
@@ -40,18 +40,19 @@ for i in range(2000000):
     # print(action+[0.]*9)
     obs, reward, done, _, info = env.step(action_combined)
     
-    # env.render()
+    env.render()
+    time.sleep(0.01)
 
     curr_ball_x = obs[36]
     # Whenever the ball crosses the net, we consider it a new rally state
     if (prev_ball_x-1.5)*(curr_ball_x-1.5) < 0:
         curr_rally.append(obs)
-        if curr_ball_x-prev_ball_x > 0. :
-            env.side_target_opp = -env.side_target_opp
-        else:
-            env.side_target = -env.side_target
-        # env.side_target = np.random.choice([-1., 1.])
-        # env.side_target_opp = np.random.choice([-1., 1.])
+        # if curr_ball_x-prev_ball_x > 0. :
+        #     env.side_target_opp = -env.side_target_opp
+        # else:
+        #     env.side_target = -env.side_target
+        env.side_target = np.random.choice([-1., 1.])
+        env.side_target_opp = np.random.choice([-1., 1.])
         
     prev_ball_x = curr_ball_x
     if done:
@@ -59,7 +60,7 @@ for i in range(2000000):
         print("Reset requested", len(curr_rally))
         curr_rally = []
         obs, _ = env.reset()
-        pkl.dump(rallies, open("data/rallies_nash.pkl", "wb"))
+        pkl.dump(rallies, open("data/rallies2.pkl", "wb"))
 
     
 env.close()

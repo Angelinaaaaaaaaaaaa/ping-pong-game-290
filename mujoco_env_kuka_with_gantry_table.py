@@ -432,11 +432,10 @@ class KukaTennisEnv(gym.Env):
 
     def render(self, mode="human"):
         # return
-        if not hasattr(self, 'viewer'):
-            self.viewer = mj.MjViewer(self.model)
-        if self.viewer is None:
-            self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
-        self.viewer.render()
+        if not hasattr(self, 'viewer') or self.viewer is None:
+            import mujoco.viewer
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        self.viewer.sync()
 
     def close(self):
         if self.viewer is not None:

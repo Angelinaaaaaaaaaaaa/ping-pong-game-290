@@ -32,7 +32,7 @@ if __name__ == '__main__':
     eval_env = DummyVecEnv([make_test_env])
     # Set up evaluation callback
     eval_callback = EvalCallback(eval_env, 
-                                best_model_save_path='./logs/best_model_tracker_vslow/',
+                                best_model_save_path='./logs/best_model_tracker1/',
                                 log_path='./logs/',
                                 eval_freq=300,  # Evaluate every 10,000 steps
                                 n_eval_episodes=10,  # Evaluate for 5 episodes

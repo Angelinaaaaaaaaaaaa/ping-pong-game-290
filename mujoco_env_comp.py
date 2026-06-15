@@ -5,7 +5,6 @@ import math
 from gymnasium import spaces
 # from gym.utils import seeding
 import gymnasium as gym
-import mujoco_viewer
 from scipy.spatial.transform import Rotation as R
 
 TABLE_SHIFT = 1.5
@@ -499,12 +498,10 @@ class KukaTennisEnv(gym.Env):
         return obs, info
 
     def render(self, mode="human"):
-        # return
-        if not hasattr(self, 'viewer'):
-            self.viewer = mj.MjViewer(self.model)
-        if self.viewer is None:
-            self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
-        self.viewer.render()
+        if not hasattr(self, 'viewer') or self.viewer is None:
+            import mujoco.viewer
+            self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+        self.viewer.sync()
 
     def close(self):
         if self.viewer is not None:

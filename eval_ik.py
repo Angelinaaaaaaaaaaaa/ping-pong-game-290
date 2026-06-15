@@ -25,7 +25,7 @@ for i in range(20000):
     if done:
         print("Reset requested")
         obs, _ = env.reset()
-    # time.sleep(0.1)
+    time.sleep(0.1)
     # if done:
     #     obs, _  = env.reset()
 

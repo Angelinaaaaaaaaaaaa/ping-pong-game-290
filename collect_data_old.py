@@ -40,7 +40,8 @@ for i in range(20000):
     action_combined[9:] = action2[:9]
     # print(action+[0.]*9)
     obs, reward, done, _, info = env.step(action_combined)
-    # env.render()
+    env.render()
+    time.sleep(0.01)
 
     # Whenever the ball crosses the net, we consider it a new rally state
     if (prev_ball_x-1.5)*(curr_ball_x-1.5) < 0:

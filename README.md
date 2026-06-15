@@ -1,130 +1,100 @@
-# Robots that learn class project
+# 2-player Ping Pong game with Kuka iiwa R820 arm + gantry
 
-Reference for game theory:-
-[1] https://arxiv.org/pdf/2305.12553
-[2] https://arxiv.org/pdf/2205.14590
-Control Kuka iiwa R820 arm to play ping pong competitively
+## Requirements
 
-<p float="left">
-  <img src="iiwa_14.png" width="400">
-</p>
+- Python 3.12
+- macOS (Apple Silicon or Intel) or Ubuntu 20.04+
 
-## SSH into 337 cory lab machine
+## Installation
 
-```bash 
-ssh dvij@10.41.45.23
+### 1. Create and activate an environment
+
+**macOS:**
+```bash
+python3.12 -m venv venv
+source venv/bin/activate
 ```
 
-passwd: dvij123
+**Ubuntu (conda):**
 
-## Installation on local machine
+Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) if not already installed, then:
+```bash
+conda create -n sim2real python=3.12 -y
+conda activate sim2real
+```
 
-1. Clone the repo
+### 2. Install MuJoCo
 
-    ```bash
-   git clone https://github.com/dvij542/ee206-project
-    ```
+```bash
+pip install mujoco
+```
 
-3. Install dependencies
+MuJoCo 3.x is installed as a Python package — no separate binary installation needed.
 
-    ```bash
-   pip install -r requirements.txt
-    ```
+### 3. Install remaining dependencies
 
-    OR 
-    
-    With conda:-
-    
-    ```bash
-   conda env create --name ee206 --file=environment.yml
-    ``` 
+```bash
+pip install stable-baselines3 torch gymnasium scipy numpy
+```
 
-5. Install ROS Noetic for ubuntu 20.04/ compatible ROS1 version based on your system: [Link](https://wiki.ros.org/noetic/Installation/Ubuntu)
+**Ubuntu only** — install OpenGL/GLFW system libraries required by MuJoCo's renderer:
+
+```bash
+sudo apt install -y libgl1-mesa-dev libglfw3 libglew-dev
+```
+
+### 4. (macOS only) Set up mjpython
+
+MuJoCo's passive viewer requires the `mjpython` launcher on macOS to ensure the window is created on the main thread. It ships with the `mujoco` package:
+
+```bash
+# Find mjpython
+python -c "import mujoco, os; print(os.path.join(os.path.dirname(mujoco.__file__), 'mjpython'))"
+```
+
+Add the printed directory to your PATH permanently:
+
+```bash
+# Add to ~/.zshrc
+export PATH="$(python -c "import mujoco, os; print(os.path.dirname(mujoco.__file__))")":$PATH
+```
 
 ## Running
 
-1. (optional) To run training on any environment, specify the environment in train.py and run:-
+**macOS** — use `mjpython` instead of `python`, otherwise the viewer crashes with `NSWindow should only be instantiated on the main thread`:
 
-    ```bash
-   python3 train.py
-    ```
-    
-    NOTE: This is not required as the trained models for each environemnt is already present under logs/
+```bash
+mjpython comp.py
+```
 
-3. To launch any environment and check it's performance, run:-
+**Ubuntu** — plain `python` works:
 
-    ```bash
-   python3 eval.py [--gantry] [--table] [--render] [--ik_rl]
-    ```
-  
-    **a.** Enabling 'gantry' option will enable XY movement of the base. Note that we do not have a gantry for the robot yet (It has been ordered and may arrive in a month but should be fine without that)
-    
-    **b.** Enabling 'table' option will add the ping pong table to the environment with random generated ball throws towards the robot. It will also generate a target pose for the robot if able to be achieved in time, it will be able to return the ball to the center of the other side of the table. It woukd be in most cases
-    
-    **c.** Enabling 'render' option will render the environment
-    
-    **d.** Enabling 'ik_rl' option will use a more stable controller based on RL based IK solving to generate target robot pose. This is available for only without gantry for now
-    
-    To launch environment with gantry and table, run:-
-    
-    ```bash
-   python3 eval.py --gantry --table --render
-    ```
-    
-    To launch environment without gantry and with table, run:-
-    
-    ```bash
-   python3 eval.py --table --render
-    ```
-    
-    To launch environment without gantry and with table and with a more stable RL based IK solver, run:-
-    
-    ```bash
-   python3 eval.py --table --ik_rl --render
-    ```
+```bash
+python comp.py
+```
 
-5. To launch gazebo environment provided by Kuka iiwa and control the robot with our solvers, open 2 new terminals and follow these steps:-
+## SB3 deserialization warnings
 
-    **a.** On terminal 1, source ROS1 noetic OR the distro installed on your system and then launch gazebo sim
-    
-    ```bash 
-    source /opt/ros/noetic/setup.bash
-    source lbr_fri_ros_ws/devel/setup.bash
-    roslaunch lbr_moveit moveit_planning_execution.launch model:=iiwa14 sim:=true 
-    ```
-    
-    **b.** On terminal 2, source ROS1 noetic OR the distro installed on your system and then run eval_ros.py
-    
-    ```bash 
-    source /opt/ros/noetic/setup.bash
-    source lbr_fri_ros_ws/devel/setup.bash
-    python3 eval_ros.py [--ik_rl] [--ik] 
-    ```
+When loading the PPO model you may see:
 
-    Before running with ik option, you need to chamnge the namespace as follows:-
+```
+UserWarning: Could not deserialize object clip_range / lr_schedule.
+Exception: code() argument 13 must be str, not int
+```
 
-    ```
-    export ROS_NAMESPACE=lbr
-    ```
-    
-    For running with mocap enabled for tele-oping, add --mocap option. Also, need to run the following to talk to both the real robot and the mocap
+These are harmless. They occur because the model was saved on Python ≤3.10 and the `code()` constructor signature changed in Python 3.12. Policy inference is unaffected.
 
-    ```
-    sudo ip addr add 172.31.1.148/16 dev enp3s0
-    ```
+## File structure
 
-    No options enabled will run the basic trained RL environment which may not run very well due to sim-to-real transfer. 'ik_rl' option will enable using RL based IK solver which will be more stable. 'ik' will enable traditional IK based solver. To read pose from mocap, run :-
-
-    ```
-    roslaunch vrpn_client_ros sample.launch
-    ```
-
-## TODO:-
-
-1. (Setup ROS1 based twin simulator in mujoco)
-
-    **a.** Subscribe to '\ball_pose' topic containing ball position and velocity. Write a separate node to predict the ball trajectory and target pose for the robot (Refer to moujoco_env_kuka_with_table.py.
-    
-    **b.** Control the robot through '/lbr/PositionJointInterface_trajectory_controller/command' topic. Write a separate node which subscribes to '/lbr/PositionJointInterface_trajectory_controller/command' topic and passes the commands to mujoco sim and it also publishes the joint angle and joint velocities as robot state to '/lbr/PositionJointInterface_trajectory_controller/state'. It should also publish to '/ball_pose' to get the ground truth ball pose. This piece will be replaced by the node that Emily and Max are working on. 
-    
-    **c.** Something like eval_ros.py can be used to communicate with (b) to control the robot through '/lbr/PositionJointInterface_trajectory_controller/command' topic
+```
+lfr-project/
+├── comp.py                  # Main competition script
+├── mujoco_env_comp.py       # MuJoCo Gymnasium environment
+├── model_arch.py            # SimpleModel neural network definition
+├── models/
+│   ├── model1.pth           # Learned Q-value model for player 1 (This is pretty old, may be wrong, please consider training new one)
+│   ├── model2.pth           # Learned Q-value model for player 2 (This is pretty old, may be wrong, please consider training new one)
+│   └── model_p.pth          # Nash-p joint strategy model (This is pretty old, may be wrong, please consider training new one)
+└── logs/
+    └── best_model_tracker_slow/best_model   # PPO policy checkpoint (I just trained this, so should be good to run comp.py wiht random strategy)
+```
