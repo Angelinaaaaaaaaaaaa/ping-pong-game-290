@@ -20,6 +20,7 @@ import csv
 import io
 import unittest
 import tempfile
+from unittest.mock import patch
 
 
 # =========================================================================== #
@@ -75,6 +76,18 @@ class TestMatchupResult(unittest.TestCase):
             rally_lengths=[2, 3, 2],
         )
         self.assertAlmostEqual(r.win_rate, 0.5)
+
+    def test_done_episodes_not_reduced_by_truncation_counter(self):
+        r = self.MatchupResult(
+            strategy1='nash-p', strategy2='center_safe',
+            episodes=5, truncated_episodes=20,
+            ego_wins=3, opp_wins=2,
+            ego_contacts=0, opp_contacts=0,
+            ego_successes=0, opp_successes=0,
+            rally_lengths=[],
+        )
+        self.assertEqual(r.done_episodes, 5)
+        self.assertAlmostEqual(r.win_rate_clean, 0.6)
 
     def test_avg_rally_length_empty(self):
         r = self.MatchupResult(
@@ -474,6 +487,34 @@ class TestMakePickerNoLeftBias(unittest.TestCase):
         chosen = pick(1, obs, 2)
         self.assertGreaterEqual(chosen, 0)
         self.assertLess(chosen, self.N_SKILLS)
+
+    def test_nash_p_br_flat_surface_uses_softmax_fallback(self):
+        model = self._make_flat_model()
+        pick = self.make_picker("nash-p-br", model, tau=1.0, confidence_margin=0.05)
+        obs = self.torch.zeros(116).numpy()
+
+        with patch(
+            "nash_skills.eval_matchup.torch.multinomial",
+            return_value=self.torch.tensor([self.N_SKILLS - 1]),
+        ) as mock_multinomial:
+            chosen = pick(1, obs, 0)
+
+        self.assertEqual(chosen, self.N_SKILLS - 1)
+        mock_multinomial.assert_called_once()
+
+    def test_nash_p_hard_flat_surface_uses_softmax_fallback(self):
+        model = self._make_flat_model()
+        pick = self.make_picker("nash-p-hard", model, tau=1.0, confidence_margin=0.05)
+        obs = self.torch.zeros(116).numpy()
+
+        with patch(
+            "nash_skills.eval_matchup.torch.multinomial",
+            return_value=self.torch.tensor([self.N_SKILLS - 1]),
+        ) as mock_multinomial:
+            chosen = pick(1, obs, 0)
+
+        self.assertEqual(chosen, self.N_SKILLS - 1)
+        mock_multinomial.assert_called_once()
 
     def test_picker_player2_also_correct(self):
         """

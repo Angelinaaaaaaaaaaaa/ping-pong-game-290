@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_index
+from nash_skills.winner_inference import infer_terminal_winner
 
 
 # --------------------------------------------------------------------------- #
@@ -171,19 +172,23 @@ class MatchupResult:
 
     @property
     def done_episodes(self) -> int:
-        """Episodes that ended with a real done signal (not truncated by step cap)."""
-        return self.episodes - self.truncated_episodes
+        """
+        Episodes that ended with a real done signal.
+
+        After the done-only evaluation fix, ``episodes`` already counts only
+        non-truncated terminal episodes. ``truncated_episodes`` is tracked
+        separately as a diagnostic counter and must not be subtracted here.
+        """
+        return self.episodes
 
     @property
     def win_rate_clean(self) -> Optional[float]:
         """
         Win rate over done-only episodes.
 
-        Use this instead of win_rate when many episodes are truncated by the
-        per-episode step cap, because truncated episodes have no winner and
-        including them in the denominator artificially deflates the win rate.
-
-        Returns None when done_episodes == 0 (all episodes were truncated).
+        This is currently identical to ``win_rate`` because truncated episodes
+        are not included in ``episodes``. The property is kept for compatibility
+        with the 2-skill evaluator and older analysis scripts.
         """
         if self.done_episodes == 0:
             return None
@@ -283,31 +288,31 @@ def _infer_winner(obs, info):
     Infer which player won from the terminal observation.
 
     Preference:
-    1. Use common winner keys in info if present.
-    2. Fall back to ball VELOCITY x-component (obs[39]):
+    1. Use explicit winner keys in info if present.
+    2. Reconstruct the env's terminal racket-boundary condition from info.
+    3. Fall back to ball VELOCITY x-component (obs[39]):
          ball_vel_x > 0  → ball heading toward opp side → opp missed → EGO wins
          ball_vel_x < 0  → ball heading toward ego side → ego missed → OPP wins
-         ball_vel_x == 0 → ambiguous; conservative default to 'opp'
-
-    Using ball position (obs[36] > TABLE_SHIFT) was wrong: done fires when the
-    ball passes >0.3m past a racket, which can happen at any x-position.
+    4. Last resort: ball position relative to the net only when the previous
+       signals are unavailable or exactly ambiguous.
     """
-    if isinstance(info, dict):
-        for key in ["winner", "point_winner", "episode_winner"]:
-            if key in info:
-                val = info[key]
-                if val in ("ego", 0, "player0", "p0", "left"):
-                    return "ego"
-                if val in ("opp", 1, "player1", "p1", "right"):
-                    return "opp"
+    #if isinstance(info, dict):
+    #    for key in ["winner", "point_winner", "episode_winner"]:
+    #        if key in info:
+    #            val = info[key]
+    #            if val in ("ego", 0, "player0", "p0", "left"):
+    #                return "ego"
+    #            if val in ("opp", 1, "player1", "p1", "right"):
+    #                return "opp"
 
-    ball_vel_x = float(obs[39])
-    if ball_vel_x > 0:
-        return "ego"
-    elif ball_vel_x < 0:
-        return "opp"
-    else:
-        return "opp"
+    #ball_vel_x = float(obs[39])
+    #if ball_vel_x > 0:
+    #    return "ego"
+    #elif ball_vel_x < 0:
+    #    return "opp"
+    #else:
+    #    return "opp"
+    #return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
 
 def _initial_skill_idx(name: str, fallback: int = 0) -> int:
@@ -348,6 +353,30 @@ def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
     return vals.reshape(N_SKILLS, N_SKILLS)      # [ego_skill, opp_skill]
 
 
+def _pick_with_softmax_fallback(
+    action_scores: torch.Tensor,
+    tau: float,
+    confidence_margin: float,
+) -> int:
+    """
+    Pick argmax unless the top two scores are too close, then sample softmax.
+
+    This avoids deterministic tie-breaking artifacts on flat Φ surfaces while
+    preserving argmax behavior when the model expresses a clear preference.
+    """
+    action_scores = action_scores.reshape(-1)
+    if action_scores.numel() == 1:
+        return 0
+
+    sorted_scores, _ = torch.sort(action_scores, descending=True)
+    gap = (sorted_scores[0] - sorted_scores[1]).item()
+    if gap >= confidence_margin or tau <= 0:
+        return int(torch.argmax(action_scores).item())
+
+    probs = torch.softmax(action_scores / tau, dim=0)
+    return int(torch.multinomial(probs, 1).item())
+
+
 def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 tau: float = 0.2, confidence_margin: float = 0.05,
                 model1=None, model2=None):
@@ -358,11 +387,16 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
     -----------------------
     nash-p-hard      Joint argmax over the full Φ table (optimistic: assumes
                      both players coordinate on the global best joint action).
+                     Falls back to softmax over optimistic ego-skill scores
+                     when the top-2 gap is below `confidence_margin`.
     nash-p-br        Conditional best response: argmax_ego Φ(s, ego, opp_current).
                      Reactive — reads the opponent's currently-observed skill.
+                     Falls back to softmax over conditional response scores
+                     when the top-2 gap is below `confidence_margin`.
                      (Alias: "nash-p" for backwards compatibility.)
     nash-p-minimax   Worst-case-safe: for each ego skill take min over opponent
-                     responses, then pick the ego skill with the best worst-case.
+                     responses, then deterministically pick the ego skill with
+                     the best worst-case score.
     nash-p-adaptive  Same minimax scores, but uses softmax when the top-2 gap
                      is below `confidence_margin`; argmax otherwise.
     ibr              Q-based alternating best response (Φ-independent).
@@ -379,8 +413,8 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
     model1            : nn.Module or None — ego Q-value model (required for ibr / ibr-q)
     model2            : nn.Module or None — opp Q-value model (required for ibr / ibr-q)
     state_encoder_fn  : callable or None — maps (obs, info, player) -> encoded vector
-    tau               : float — softmax temperature for nash-p-adaptive
-    confidence_margin : float — gap threshold for nash-p-adaptive argmax/softmax switch
+    tau               : float — softmax temperature for Φ-strategy fallbacks
+    confidence_margin : float — gap threshold for Φ argmax/softmax switch
     """
     if strategy in SKILL_NAMES:
         fixed_idx = skill_index(strategy)
@@ -402,9 +436,11 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
     if strategy == "nash-p-hard":
         def pick_hard(player, obs_vec, _other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
-            best = int(phi.argmax().item())        # flat index into N×N
-            ego_best = best // N_SKILLS
-            return ego_best
+            # Preserve the optimistic joint-argmax semantics, but compare the
+            # best achievable value for each ego skill so fallback samples over
+            # ego actions rather than over N*N joint pairs.
+            action_scores = phi.max(dim=1).values
+            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
         return pick_hard
 
     # ------------------------------------------------------------------ #
@@ -415,9 +451,10 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
         def pick_br(player, obs_vec, other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
             if player == 1:
-                return int(phi[:, other_skill_idx].argmax().item())
+                action_scores = phi[:, other_skill_idx]
             else:
-                return int(phi[other_skill_idx, :].argmin().item())
+                action_scores = -phi[other_skill_idx, :]
+            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
         return pick_br
 
     # ------------------------------------------------------------------ #
@@ -443,12 +480,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 action_scores = phi.min(dim=1).values
             else:
                 action_scores = -phi.max(dim=0).values
-            sorted_scores, _ = torch.sort(action_scores, descending=True)
-            gap = (sorted_scores[0] - sorted_scores[1]).item()
-            if gap >= confidence_margin:
-                return int(torch.argmax(action_scores).item())
-            probs = torch.softmax(action_scores / tau, dim=0)
-            return int(torch.multinomial(probs, 1).item())
+            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
         return pick_adaptive
 
     # ------------------------------------------------------------------ #
@@ -572,13 +604,13 @@ def run_matchup(
     - One-time global warmup.
     - After warmup, keep running until we complete n_episodes.
     - If an episode hits max_steps_per_episode, truncate and reset it.
+    - max_total_steps is an optional absolute safety valve. By default there
+      is no total-step cap, so heavy truncation cannot silently reduce the
+      number of completed episodes.
     - model1 / model2: Q-value models required when strategy1 or strategy2 is
       'ibr' or 'ibr-q'.
     """
     from nash_skills.env_wrapper import SkillEnv
-
-    if max_total_steps is None:
-        max_total_steps = warmup_steps + n_episodes * max_steps_per_episode * 5
 
     pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
                         tau=tau, confidence_margin=confidence_margin,
@@ -647,7 +679,15 @@ def run_matchup(
     curr_rally_len = 0
     steps_in_episode = 0
 
-    while completed_episodes < n_episodes and total_steps < max_total_steps:
+    while completed_episodes < n_episodes:
+        if max_total_steps is not None and total_steps >= max_total_steps:
+            print(
+                f"WARNING: hit max_total_steps={max_total_steps} with "
+                f"{completed_episodes}/{n_episodes} done episodes collected. "
+                "Stopping early - results are based on done episodes only."
+            )
+            break
+
         obs1 = _build_obs1(obs, info)
         obs2 = _build_obs2(obs, info)
 
@@ -712,7 +752,7 @@ def run_matchup(
 
     env.close()
 
-    if completed_episodes < n_episodes:
+    if max_total_steps is not None and completed_episodes < n_episodes:
         print(
             f"WARNING: only completed {completed_episodes}/{n_episodes} episodes "
             f"before hitting max_total_steps={max_total_steps}"
@@ -956,7 +996,10 @@ def main():
         "--max-total-steps",
         type=int,
         default=None,
-        help="Optional safety cap on total simulator steps per matchup",
+        help=(
+            "Optional safety cap on total simulator steps per matchup. "
+            "Default None means keep running until --episodes done episodes are collected."
+        ),
     )
     parser.add_argument(
         "--output-csv",
@@ -1014,14 +1057,14 @@ def main():
         "--tau",
         type=float,
         default=0.2,
-        help="Softmax temperature for nash-p-adaptive (default: 0.2)",
+        help="Softmax temperature for flat-surface fallback in nash-p-hard/br/adaptive (default: 0.2)",
     )
     parser.add_argument(
         "--confidence-margin",
         type=float,
         default=0.05,
         dest="confidence_margin",
-        help="Gap threshold below which nash-p-adaptive uses softmax instead of argmax (default: 0.05)",
+        help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax instead of argmax (default: 0.05)",
     )
     args = parser.parse_args()
 
