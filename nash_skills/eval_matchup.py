@@ -53,29 +53,24 @@ TABLE_X_MIN = 0.0
 TABLE_X_MAX = TABLE_SHIFT + 1.37
 TABLE_Y_ABS_MAX = 0.75
 
-VALID_STRATEGIES = ["nash-p", "nash-p-adaptive", "ibr", "random"] + SKILL_NAMES
+VALID_STRATEGIES = [
+    "nash-p-hard",      # joint argmax over full Φ table (optimistic)
+    "nash-p-br",        # conditional best response fixing opp's current skill
+    "nash-p-minimax",   # worst-case-safe: argmax over per-ego min-over-opp Φ
+    "nash-p-adaptive",  # minimax scores + softmax when gap < margin
+    "ibr",              # Q-based alternating best response (Φ-independent)
+    "nash-p",           # alias for nash-p-br (backwards compat)
+    "random",
+] + SKILL_NAMES
 
-_LEARNED_STRATEGIES = {"nash-p", "nash-p-adaptive", "ibr"}
+_LEARNED_STRATEGIES = {"nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr", "nash-p"}
+
+_ALL_OPPONENTS = ["random", "left", "right", "left_short", "right_short", "center_safe"]
 
 DEFAULT_MATCHUPS = [
-    ("nash-p", "random"),
-    ("nash-p", "left"),
-    ("nash-p", "right"),
-    ("nash-p", "left_short"),
-    ("nash-p", "right_short"),
-    ("nash-p", "center_safe"),
-    ("nash-p-adaptive", "random"),
-    ("nash-p-adaptive", "left"),
-    ("nash-p-adaptive", "left_short"),
-    ("nash-p-adaptive", "center_safe"),
-    ("nash-p-adaptive", "right_short"),
-    ("nash-p-adaptive", "right"),
-    ("ibr", "random"),
-    ("ibr", "left"),
-    ("ibr", "left_short"),
-    ("ibr", "center_safe"),
-    ("ibr", "right_short"),
-    ("ibr", "right"),
+    (strategy, opp)
+    for strategy in ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr"]
+    for opp in _ALL_OPPONENTS
 ]
 
 LONG_RALLY_THRESHOLD = 100
@@ -288,149 +283,176 @@ def _initial_skill_idx(name: str, fallback: int = 0) -> int:
 # Strategy picker
 # --------------------------------------------------------------------------- #
 
+def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
+    """
+    Evaluate Φ(s, ego_s, opp_s) for all N×N skill pairs and return a
+    (N_SKILLS, N_SKILLS) tensor where rows = ego skills, cols = opp skills.
+
+    Batched: builds N² inputs in one forward pass. Encodes state once.
+    """
+    if state_encoder_fn is not None and info is not None:
+        base_vec = state_encoder_fn(obs_vec, info, player)
+    else:
+        base_vec = obs_vec
+    rows = []
+    for ego_s in range(N_SKILLS):
+        for opp_s in range(N_SKILLS):
+            base = torch.tensor(base_vec, dtype=torch.float32)
+            base[-2] = ego_s / (N_SKILLS - 1)
+            base[-1] = opp_s / (N_SKILLS - 1)
+            rows.append(base)
+    batch = torch.stack(rows)                    # (N*N, state_dim)
+    with torch.no_grad():
+        vals = model_p(batch)[:, 0]              # (N*N,)
+    return vals.reshape(N_SKILLS, N_SKILLS)      # [ego_skill, opp_skill]
+
+
 def make_picker(strategy: str, model_p, state_encoder_fn=None,
-                tau: float = 0.2, confidence_margin: float = 0.05):
+                tau: float = 0.2, confidence_margin: float = 0.05,
+                model1=None, model2=None):
     """
     Return pick_fn(player, obs_vec, other_skill_idx, info=None) -> skill_idx.
 
+    Five learned strategies
+    -----------------------
+    nash-p-hard      Joint argmax over the full Φ table (optimistic: assumes
+                     both players coordinate on the global best joint action).
+    nash-p-br        Conditional best response: argmax_ego Φ(s, ego, opp_current).
+                     Reactive — reads the opponent's currently-observed skill.
+                     (Alias: "nash-p" for backwards compatibility.)
+    nash-p-minimax   Worst-case-safe: for each ego skill take min over opponent
+                     responses, then pick the ego skill with the best worst-case.
+    nash-p-adaptive  Same minimax scores, but uses softmax when the top-2 gap
+                     is below `confidence_margin`; argmax otherwise.
+    ibr              Q-based alternating best response (Φ-independent).
+                     Requires model1 and model2 Q-value models.
+                     Alternates argmax_ego Q1 / argmax_opp Q2 for ibr_steps
+                     rounds and returns the converged ego skill.
+
     Parameters
     ----------
-    strategy          : str       — 'nash-p', 'nash-p-adaptive', 'random', or a skill name
-    model_p           : nn.Module — learned potential model
-    state_encoder_fn  : callable or None
-        If provided, called as state_encoder_fn(obs, info, player) -> encoded_state
-        before passing to model_p.  Used for the v2 pipeline where model_p
-        expects a 76-dim encoded state rather than the raw 116-dim obs.
-        If None (default), obs is passed directly (v1 / 5-skill behaviour).
-    tau               : float — softmax temperature for nash-p-adaptive (default 0.2)
-    confidence_margin : float — gap threshold below which softmax is used instead of
-                        argmax for nash-p-adaptive (default 0.05)
-
-    The returned function signature:
-        pick_fn(player, obs_vec, other_skill_idx, info=None) -> int
-
-    player:
-      1 -> ego, write into obs[-2] (or encoded[-2] for v2)
-      2 -> opp, write into obs[-1]
-
-    For 5-skill nash-p, the last two obs/encoded entries are normalised skill indices.
+    model_p           : nn.Module — learned potential Φ (required for all Φ strategies)
+    model1            : nn.Module or None — ego Q-value model (required for ibr)
+    model2            : nn.Module or None — opp Q-value model (required for ibr)
+    state_encoder_fn  : callable or None — maps (obs, info, player) -> encoded vector
+    tau               : float — softmax temperature for nash-p-adaptive
+    confidence_margin : float — gap threshold for nash-p-adaptive argmax/softmax switch
     """
     if strategy in SKILL_NAMES:
         fixed_idx = skill_index(strategy)
-        return lambda player, obs, other, info=None: fixed_idx
+        return lambda _player, _obs, _other, _info=None: fixed_idx
 
     if strategy == "random":
-        return lambda player, obs, other, info=None: np.random.randint(N_SKILLS)
+        return lambda _player, _obs, _other, _info=None: np.random.randint(N_SKILLS)
 
-    if strategy == "nash-p":
-        def pick_nash(player, obs_vec, other_skill_idx, info=None):
-            # Collect ALL skill values before taking argmax — avoids the
-            # best_idx=0 initialization bias that always returns LEFT on flat
-            # potential surfaces.
-            all_vals = []
-            for s in range(N_SKILLS):
-                # Apply optional v2 state encoder
-                if state_encoder_fn is not None and info is not None:
-                    base = state_encoder_fn(obs_vec, info, player)
-                else:
-                    base = obs_vec
-                x = torch.tensor(base, dtype=torch.float32).unsqueeze(0)
+    _PHI_STRATEGIES = {"nash-p-hard", "nash-p-br", "nash-p", "nash-p-minimax", "nash-p-adaptive"}
+    if strategy in _PHI_STRATEGIES and model_p is None:
+        raise ValueError(
+            f"Strategy '{strategy}' requires a loaded potential model. "
+            "Pass it to make_picker(model_p=...)."
+        )
 
-                if player == 1:
-                    x[0, -2] = s / (N_SKILLS - 1)
-                    x[0, -1] = other_skill_idx / (N_SKILLS - 1)
-                else:
-                    x[0, -2] = other_skill_idx / (N_SKILLS - 1)
-                    x[0, -1] = s / (N_SKILLS - 1)
+    # ------------------------------------------------------------------ #
+    # nash-p-hard: joint argmax over full Φ table                         #
+    # ------------------------------------------------------------------ #
+    if strategy == "nash-p-hard":
+        def pick_hard(player, obs_vec, _other_skill_idx, info=None):
+            phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
+            best = int(phi.argmax().item())        # flat index into N×N
+            ego_best = best // N_SKILLS
+            return ego_best
+        return pick_hard
 
-                with torch.no_grad():
-                    all_vals.append(model_p(x).item())
-
-            return int(np.argmax(all_vals))
-
-        return pick_nash
-
-    if strategy == "nash-p-adaptive":
-        def pick_nash_adaptive(player, obs_vec, other_skill_idx, info=None):
-            # Build one row per (ego_skill, opp_skill) joint combination so we can
-            # read the full N×N potential surface and compute minimax action scores.
-            rows = []
-            combos = []
-            for ego_s in range(N_SKILLS):
-                for opp_s in range(N_SKILLS):
-                    if state_encoder_fn is not None and info is not None:
-                        base = torch.tensor(
-                            state_encoder_fn(obs_vec, info, player),
-                            dtype=torch.float32,
-                        )
-                    else:
-                        base = torch.tensor(obs_vec, dtype=torch.float32)
-                    base = base.clone()
-                    base[-2] = ego_s / (N_SKILLS - 1)
-                    base[-1] = opp_s / (N_SKILLS - 1)
-                    rows.append(base)
-                    combos.append((ego_s, opp_s))
-
-            batch = torch.stack(rows)          # (N*N, state_dim)
-            with torch.no_grad():
-                vals = model_p(batch)[:, 0]    # (N*N,)
-
-            phi = vals.reshape(N_SKILLS, N_SKILLS)  # [ego, opp]
-
+    # ------------------------------------------------------------------ #
+    # nash-p-br: best response fixing opp's current skill                 #
+    # (original "nash-p" — kept as alias too)                             #
+    # ------------------------------------------------------------------ #
+    if strategy in ("nash-p-br", "nash-p"):
+        def pick_br(player, obs_vec, other_skill_idx, info=None):
+            phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
             if player == 1:
-                # Ego maximises; use worst-case (minimax) score per ego action
-                action_scores = phi.min(dim=1).values   # shape (N_SKILLS,)
+                return int(phi[:, other_skill_idx].argmax().item())
             else:
-                # Opp minimises; use best-case (maximin) score per opp action
-                action_scores = -phi.max(dim=0).values  # shape (N_SKILLS,)
+                return int(phi[other_skill_idx, :].argmin().item())
+        return pick_br
 
-            # Soft selection when top-2 are close; deterministic argmax otherwise
+    # ------------------------------------------------------------------ #
+    # nash-p-minimax: worst-case-safe argmax                               #
+    # ------------------------------------------------------------------ #
+    if strategy == "nash-p-minimax":
+        def pick_minimax(player, obs_vec, other_skill_idx, info=None):
+            phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
+            if player == 1:
+                action_scores = phi.min(dim=1).values   # worst opp response per ego skill
+            else:
+                action_scores = -phi.max(dim=0).values  # worst ego response per opp skill
+            return int(torch.argmax(action_scores).item())
+        return pick_minimax
+
+    # ------------------------------------------------------------------ #
+    # nash-p-adaptive: minimax + softmax fallback when surface is flat    #
+    # ------------------------------------------------------------------ #
+    if strategy == "nash-p-adaptive":
+        def pick_adaptive(player, obs_vec, other_skill_idx, info=None):
+            phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
+            if player == 1:
+                action_scores = phi.min(dim=1).values
+            else:
+                action_scores = -phi.max(dim=0).values
             sorted_scores, _ = torch.sort(action_scores, descending=True)
             gap = (sorted_scores[0] - sorted_scores[1]).item()
             if gap >= confidence_margin:
                 return int(torch.argmax(action_scores).item())
-
             probs = torch.softmax(action_scores / tau, dim=0)
             return int(torch.multinomial(probs, 1).item())
+        return pick_adaptive
 
-        return pick_nash_adaptive
-
+    # ------------------------------------------------------------------ #
+    # ibr: Q-based alternating best response (Φ-independent)              #
+    # ------------------------------------------------------------------ #
     if strategy == "ibr":
-        # Online fictitious-play IBR: maintain a running tally of how often the
-        # opponent has played each skill, then best-respond to that empirical mix.
-        # State is captured in a mutable list so the closure can update it.
-        opp_counts = [1.0] * N_SKILLS   # initialise uniform (Laplace smoothing)
+        if model1 is None or model2 is None:
+            raise ValueError(
+                "ibr requires model1 and model2 Q-value models. "
+                "Pass them to make_picker(model1=..., model2=...)."
+            )
+
+        IBR_STEPS = 10   # alternating rounds before returning
 
         def pick_ibr(player, obs_vec, other_skill_idx, info=None):
-            # Update tally for the opponent's most recent choice
-            opp_counts[other_skill_idx] += 1.0
-            total = sum(opp_counts)
-            opp_mix = [c / total for c in opp_counts]   # empirical opp distribution
+            if state_encoder_fn is not None and info is not None:
+                base_enc = torch.tensor(
+                    state_encoder_fn(obs_vec, info, player), dtype=torch.float32
+                )
+            else:
+                base_enc = torch.tensor(obs_vec, dtype=torch.float32)
 
-            # Evaluate Φ(s, ego_skill, opp_skill) for every ego skill, averaged
-            # over the opponent's empirical mix.
-            ego_vals = []
-            for ego_s in range(N_SKILLS):
-                val = 0.0
-                for opp_s in range(N_SKILLS):
-                    if state_encoder_fn is not None and info is not None:
-                        base = torch.tensor(
-                            state_encoder_fn(obs_vec, info, player),
-                            dtype=torch.float32,
-                        ).unsqueeze(0)
-                    else:
-                        base = torch.tensor(obs_vec, dtype=torch.float32).unsqueeze(0)
-                    if player == 1:
-                        base[0, -2] = ego_s / (N_SKILLS - 1)
-                        base[0, -1] = opp_s / (N_SKILLS - 1)
-                    else:
-                        base[0, -2] = opp_s / (N_SKILLS - 1)
-                        base[0, -1] = ego_s / (N_SKILLS - 1)
+            s1 = other_skill_idx
+            s2 = other_skill_idx
+
+            for _ in range(IBR_STEPS):
+                # Ego best-responds to s2 using Q1
+                q1_vals = []
+                for ego_s in range(N_SKILLS):
+                    x = base_enc.clone().unsqueeze(0)
+                    x[0, -2] = ego_s / (N_SKILLS - 1)
+                    x[0, -1] = s2    / (N_SKILLS - 1)
                     with torch.no_grad():
-                        val += opp_mix[opp_s] * model_p(base).item()
-                ego_vals.append(val)
+                        q1_vals.append(model1(x).item())
+                s1 = int(np.argmax(q1_vals))
 
-            return int(np.argmax(ego_vals))
+                # Opp best-responds to s1 using Q2 (opp minimises Q2 = maximises -Q2)
+                q2_vals = []
+                for opp_s in range(N_SKILLS):
+                    x = base_enc.clone().unsqueeze(0)
+                    x[0, -2] = s1    / (N_SKILLS - 1)
+                    x[0, -1] = opp_s / (N_SKILLS - 1)
+                    with torch.no_grad():
+                        q2_vals.append(model2(x).item())
+                # opp minimises Q2 (it's the ego-perspective value, opp wants it low)
+                s2 = int(np.argmin(q2_vals))
+
+            return s1 if player == 1 else s2
 
         return pick_ibr
 
@@ -456,6 +478,8 @@ def run_matchup(
     state_encoder_fn=None,
     tau: float = 0.2,
     confidence_margin: float = 0.05,
+    model1=None,
+    model2=None,
 ) -> MatchupResult:
     """
     Run one 5-skill matchup headlessly.
@@ -464,6 +488,7 @@ def run_matchup(
     - One-time global warmup.
     - After warmup, keep running until we complete n_episodes.
     - If an episode hits max_steps_per_episode, truncate and reset it.
+    - model1 / model2: Q-value models required when strategy1 or strategy2 == 'ibr'.
     """
     from nash_skills.env_wrapper import SkillEnv
 
@@ -471,9 +496,11 @@ def run_matchup(
         max_total_steps = warmup_steps + n_episodes * max_steps_per_episode * 5
 
     pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin)
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2)
     pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin)
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2)
 
     env = SkillEnv(proc_id=1, history=HISTORY)
 
@@ -916,6 +943,32 @@ def main():
     model_p.load_state_dict(_safe_load_state_dict(model_p_path))
     model_p.eval()
 
+    # Q-value models — needed only for ibr strategy
+    needs_q = any(s == "ibr" for s, _ in DEFAULT_MATCHUPS)
+    model1 = model2 = None
+    if needs_q:
+        if args.v2_5skill:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path = "models/model1_5skill_v2.pth"
+            _q2_path = "models/model2_5skill_v2.pth"
+        elif args.v2:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path = "models/model1_v2.pth"
+            _q2_path = "models/model2_v2.pth"
+        else:
+            _sdim = 116
+            _q1_path = "models/model1_5skill.pth"
+            _q2_path = "models/model2_5skill.pth"
+        model1 = SimpleModel(_sdim, [64, 32, 16], 1)
+        model2 = SimpleModel(_sdim, [64, 32, 16], 1)
+        model1.load_state_dict(_safe_load_state_dict(_q1_path))
+        model2.load_state_dict(_safe_load_state_dict(_q2_path))
+        model1.eval()
+        model2.eval()
+        print(f"  Loaded Q-models:    {_q1_path}, {_q2_path}")
+
     # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it
     if args.v2_5skill or args.v2:
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
@@ -955,6 +1008,8 @@ def main():
             state_encoder_fn=state_encoder_fn,
             tau=args.tau,
             confidence_margin=args.confidence_margin,
+            model1=model1,
+            model2=model2,
         )
         results.append(r)
 
