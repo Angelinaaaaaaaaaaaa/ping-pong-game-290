@@ -159,7 +159,8 @@ model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
 model_p.batch_norm.running_var  = model1.batch_norm.running_var.clone()
 model_p.batch_norm.momentum = 0.0
 
-opt_p = torch.optim.Adam(model_p.parameters(), lr=0.1)
+opt_p = torch.optim.Adam(model_p.parameters(), lr=0.001)
+scheduler_p = torch.optim.lr_scheduler.CosineAnnealingLR(opt_p, T_max=N_EPOCHS, eta_min=1e-5)
 min_loss = float("inf")
 
 # Build all N_SKILLS^2 skill-pair tensors
@@ -179,11 +180,9 @@ for i in range(N_SKILLS):
     for j in range(N_SKILLS):
         for i2 in range(N_SKILLS):
             if i2 != i:
-                # Player 1 deviates: (i,j) vs (i2,j)
                 pairs.append(('p1', i, j, i2, j))
         for j2 in range(N_SKILLS):
             if j2 != j:
-                # Player 2 deviates: (i,j) vs (i,j2)
                 pairs.append(('p2', i, j, i, j2))
 
 with open(LOG_PATH_P, "w", newline="") as p_csv:
@@ -193,8 +192,8 @@ with open(LOG_PATH_P, "w", newline="") as p_csv:
     for epoch in range(N_EPOCHS):
         total_loss = 0.0
         sampled = random.sample(pairs, min(len(pairs), 20))  # subsample for speed
+        opt_p.zero_grad()                                    # single zero per epoch
         for entry in sampled:
-            opt_p.zero_grad()
             if entry[0] == 'p1':
                 _, i, j, i2, _ = entry
                 Xij  = skill_tensors[(i,  j)]
@@ -209,9 +208,10 @@ with open(LOG_PATH_P, "w", newline="") as p_csv:
                 with torch.no_grad():
                     target = model2(Xij) - model2(Xij2)
                 loss = criterion(model_p(Xij) - model_p(Xij2), target)
-            loss.backward()
-            opt_p.step()
+            loss.backward()                                  # accumulate gradients
             total_loss += loss.item()
+        opt_p.step()                                         # single step per epoch
+        scheduler_p.step()
 
         saved = 0
         if total_loss < min_loss:
