@@ -158,7 +158,7 @@ def collect(
 
             # Episode ended with a real done signal → winner is known
             if done:
-                winner = detect_winner(curr_raw, done=True)
+                winner = detect_winner(curr_raw + [obs.copy()], done=True, info=info)
                 if len(curr_states) > 0:
                     all_rallies.append({
                         "skill1":  skill1,

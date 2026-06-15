@@ -99,7 +99,6 @@ class KukaTennisEnv(gym.Env):
         pose[3:] = q
         self.set_target_pose(pose)    
         self.set_target_pose_opp(pose)    
-    
         
     def set_target_pose(self,pose):
         self.curr_target = pose
@@ -391,11 +390,19 @@ class KukaTennisEnv(gym.Env):
         mj.mj_step(self.model, self.data)
         
         obs = np.float32(np.concatenate([self.data.qpos[:18], self.data.qvel[:18],self.data.body('ball').xpos,self.data.qvel[-6:-3],self.prev_actions.flatten(),self.prev_actions_opp.flatten(),np.array([self.side_target,self.side_target_opp])]))
-        racket_pos = self.data.body('tennis_racket').xpos
-        racket_pos_opp = self.data.body('tennis_racket_opp').xpos
-        ball_pos = self.data.body('ball').xpos
-        if ball_pos[0] < racket_pos[0] - 0.3 or ball_pos[0] > racket_pos_opp[0] + 0.3:
+        racket_pos = np.array(self.data.body('tennis_racket').xpos)
+        racket_pos_opp = np.array(self.data.body('tennis_racket_opp').xpos)
+        ball_pos = np.array(self.data.body('ball').xpos)
+        winner = None
+        termination_reason = None
+        if ball_pos[0] < racket_pos[0] - 0.3:
             done = True
+            winner = "opp"
+            termination_reason = "ball_past_ego_racket"
+        elif ball_pos[0] > racket_pos_opp[0] + 0.3:
+            done = True
+            winner = "ego"
+            termination_reason = "ball_past_opp_racket"
         # reward, done_ = self._calculate_reward()
         # if done_ :
         #     done = True
@@ -423,7 +430,24 @@ class KukaTennisEnv(gym.Env):
         #     self.current_step = 0
         #     done = True
                 
-        return obs, total_reward, done, False, {'diff_pos':diff_pos,'diff_quat':diff_quat,'target':self.curr_target,'diff_pos_opp':diff_pos_opp,'diff_quat_opp':diff_quat_opp,'target_opp':self.curr_target_opp}
+        info = {
+            'diff_pos': diff_pos,
+            'diff_quat': diff_quat,
+            'target': self.curr_target,
+            'diff_pos_opp': diff_pos_opp,
+            'diff_quat_opp': diff_quat_opp,
+            'target_opp': self.curr_target_opp,
+        }
+        if winner is not None:
+            info.update({
+                'winner': winner,
+                'termination_reason': termination_reason,
+                'ball_x': float(ball_pos[0]),
+                'ego_racket_x': float(racket_pos[0]),
+                'opp_racket_x': float(racket_pos_opp[0]),
+            })
+
+        return obs, total_reward, done, False, info
 
     def reset_target(self):
         self.curr_target = np.array([0.,0.,0.,0.,0.,0.,0.])
@@ -585,4 +609,3 @@ if __name__ == "__main__":
         # print(i,reward)
         env.render()
     env.close()
-    
