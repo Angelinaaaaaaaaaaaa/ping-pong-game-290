@@ -1,9 +1,8 @@
 """
 Multi-seed evaluation for the 5-skill Nash pipeline.
 
-Runs all five learned strategies (nash-p-hard, nash-p-br, nash-p-minimax,
-nash-p-adaptive, ibr) against all six fixed-skill opponents across seeds 0..4,
-then aggregates mean/std win rates.  30 matchups × n_seeds total runs.
+Runs learned strategies against fixed-skill opponents across seeds 0..4,
+then aggregates mean/std win rates.
 
 DO NOT retrain models.  Only evaluation — no weight updates.
 
@@ -44,15 +43,33 @@ from nash_skills.eval_matchup import (
 # Fixed evaluation spec — symmetric across all three strategies               #
 # --------------------------------------------------------------------------- #
 
-STRATEGIES = ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr"]
+STRATEGIES = ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr", "ibr-q"]
 
 OPPONENTS = ["random", "left", "right", "left_short", "right_short", "center_safe"]
 
-# All 30 matchups: 5 strategies × 6 opponents
+# All fixed-opponent matchups plus learned-vs-IBR / IBR-Q matchups.
 MULTISEED_MATCHUPS = [
     (strategy, opp)
     for strategy in STRATEGIES
     for opp in OPPONENTS
+]
+MULTISEED_MATCHUPS += [
+    ("nash-p-hard", "ibr"),
+    ("ibr", "nash-p-hard"),
+    ("nash-p-br", "ibr"),
+    ("ibr", "nash-p-br"),
+    ("nash-p-minimax", "ibr"),
+    ("ibr", "nash-p-minimax"),
+    ("nash-p-adaptive", "ibr"),
+    ("ibr", "nash-p-adaptive"),
+    ("nash-p-hard", "ibr-q"),
+    ("ibr-q", "nash-p-hard"),
+    ("nash-p-br", "ibr-q"),
+    ("ibr-q", "nash-p-br"),
+    ("nash-p-minimax", "ibr-q"),
+    ("ibr-q", "nash-p-minimax"),
+    ("nash-p-adaptive", "ibr-q"),
+    ("ibr-q", "nash-p-adaptive"),
 ]
 
 DEFAULT_SEEDS          = [0, 1, 2, 3, 4]
@@ -62,12 +79,29 @@ DEFAULT_WARMUP         = 300
 DEFAULT_OUTPUT_DIR     = "skill_eval/multiseed"
 
 PPO_MODEL_PATH         = "logs/best_model_tracker1/best_model"
+MODEL1_5SK_PATH        = "models/model1_5skill.pth"
+MODEL2_5SK_PATH        = "models/model2_5skill.pth"
 MODEL_P_5SK_PATH       = "models/model_p_5skill.pth"
+MODEL1_5SK_V2_PATH     = "models/model1_5skill_v2.pth"
+MODEL2_5SK_V2_PATH     = "models/model2_5skill_v2.pth"
+MODEL_P_5SK_V2_PATH    = "models/model_p_5skill_v2.pth"
+MODEL1_5SK_V3_PATH     = "models/model1_5skill_v3.pth"
+MODEL2_5SK_V3_PATH     = "models/model2_5skill_v3.pth"
+MODEL_P_5SK_V3_PATH    = "models/model_p_5skill_v3.pth"
+MODEL1_V2_PATH         = "models/model1_v2.pth"
+MODEL2_V2_PATH         = "models/model2_v2.pth"
+MODEL_P_V2_PATH        = "models/model_p_v2.pth"
 
 
 # --------------------------------------------------------------------------- #
 # Seeding helper                                                               #
 # --------------------------------------------------------------------------- #
+
+def _safe_load_state_dict(path: str):
+    try:
+        return torch.load(path, weights_only=True)
+    except TypeError:
+        return torch.load(path)
 
 def set_global_seed(seed: int) -> None:
     """Set Python, NumPy, and Torch seeds for reproducibility."""
@@ -178,6 +212,10 @@ def save_json(data, path: str) -> None:
         json.dump(data, f, indent=2)
 
 
+def _slugify_name(name: str) -> str:
+    return name.replace(",", "-").replace(" ", "_")
+
+
 # --------------------------------------------------------------------------- #
 # Main                                                                         #
 # --------------------------------------------------------------------------- #
@@ -207,6 +245,13 @@ def main() -> None:
         help=f"Directory for all output files (default: {DEFAULT_OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--strategies", nargs="+", default=None,
+        help=(
+            "Optional subset of strategy1 names to run, e.g. --strategies ibr-q "
+            "or --strategies nash-p-hard ibr-q"
+        ),
+    )
+    parser.add_argument(
         "--tau", type=float, default=0.2,
         help="Softmax temperature for nash-p-adaptive (default: 0.2)",
     )
@@ -222,7 +267,23 @@ def main() -> None:
         "--v2-5skill", action="store_true", default=False, dest="v2_5skill",
         help="Use 5-skill v2 model_p_5skill_v2.pth (76-dim, discounted returns, all 5 skills)",
     )
+    parser.add_argument(
+        "--v3-5skill", action="store_true", default=False, dest="v3_5skill",
+        help=(
+            "Use 5-skill v3 model_p_5skill_v3.pth (76-dim, discounted returns, all 5 skills, "
+            "same-state per-sample potential training)"
+        ),
+    )
     args = parser.parse_args()
+
+    selected_strategies = None
+    if args.strategies is not None:
+        selected_strategies = list(dict.fromkeys(args.strategies))
+        invalid = [s for s in selected_strategies if s not in STRATEGIES]
+        if invalid:
+            raise ValueError(
+                f"Unknown strategy in --strategies: {invalid}. Choose from: {STRATEGIES}"
+            )
 
     from stable_baselines3 import PPO
     from model_arch import SimpleModel
@@ -230,15 +291,22 @@ def main() -> None:
     print("Loading models ...")
     ppo = PPO.load(PPO_MODEL_PATH)
 
-    if args.v2_5skill:
+    if args.v3_5skill:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
-        model_p_path = "models/model_p_5skill_v2.pth"
+        model_p_path = MODEL_P_5SK_V3_PATH
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
-        try:
-            model_p.load_state_dict(torch.load(model_p_path, weights_only=True))
-        except TypeError:
-            model_p.load_state_dict(torch.load(model_p_path))
+        model_p.load_state_dict(_safe_load_state_dict(model_p_path))
+
+        def state_encoder_fn(obs, info, player):
+            return encode_ego(obs, info) if player == 1 else encode_opp(obs, info)
+
+    elif args.v2_5skill:
+        from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+        from nash_skills.v2.state_encoder import encode_ego, encode_opp
+        model_p_path = MODEL_P_5SK_V2_PATH
+        model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+        model_p.load_state_dict(_safe_load_state_dict(model_p_path))
 
         def state_encoder_fn(obs, info, player):
             return encode_ego(obs, info) if player == 1 else encode_opp(obs, info)
@@ -246,12 +314,9 @@ def main() -> None:
     elif args.v2:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
-        model_p_path = "models/model_p_v2.pth"
+        model_p_path = MODEL_P_V2_PATH
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
-        try:
-            model_p.load_state_dict(torch.load(model_p_path, weights_only=True))
-        except TypeError:
-            model_p.load_state_dict(torch.load(model_p_path))
+        model_p.load_state_dict(_safe_load_state_dict(model_p_path))
 
         def state_encoder_fn(obs, info, player):
             return encode_ego(obs, info) if player == 1 else encode_opp(obs, info)
@@ -259,47 +324,52 @@ def main() -> None:
     else:
         model_p_path = MODEL_P_5SK_PATH
         model_p = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
-        try:
-            model_p.load_state_dict(torch.load(model_p_path, weights_only=True))
-        except TypeError:
-            model_p.load_state_dict(torch.load(model_p_path))
+        model_p.load_state_dict(_safe_load_state_dict(model_p_path))
         state_encoder_fn = None
 
     model_p.eval()
 
-    # Q-value models — required for ibr strategy
-    needs_q = any(s == "ibr" for s, _ in MULTISEED_MATCHUPS) or any(
-        s == "ibr" for _, s in MULTISEED_MATCHUPS
+    matchups = MULTISEED_MATCHUPS
+    if selected_strategies is not None:
+        allowed = set(selected_strategies)
+        matchups = [m for m in MULTISEED_MATCHUPS if m[0] in allowed]
+
+    # Q-value models — required for ibr / ibr-q
+    needs_q = any(s in {"ibr", "ibr-q"} for s, _ in matchups) or any(
+        s in {"ibr", "ibr-q"} for _, s in matchups
     )
     model1 = model2 = None
     if needs_q:
-        if args.v2_5skill:
+        if args.v3_5skill:
             from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
             _sdim = V2_STATE_DIM
-            _q1_path, _q2_path = "models/model1_5skill_v2.pth", "models/model2_5skill_v2.pth"
+            _q1_path, _q2_path = MODEL1_5SK_V3_PATH, MODEL2_5SK_V3_PATH
+        elif args.v2_5skill:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path, _q2_path = MODEL1_5SK_V2_PATH, MODEL2_5SK_V2_PATH
         elif args.v2:
             from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
             _sdim = V2_STATE_DIM
-            _q1_path, _q2_path = "models/model1_v2.pth", "models/model2_v2.pth"
+            _q1_path, _q2_path = MODEL1_V2_PATH, MODEL2_V2_PATH
         else:
             _sdim = 116
-            _q1_path, _q2_path = "models/model1_5skill.pth", "models/model2_5skill.pth"
+            _q1_path, _q2_path = MODEL1_5SK_PATH, MODEL2_5SK_PATH
         model1 = SimpleModel(_sdim, [64, 32, 16], 1)
         model2 = SimpleModel(_sdim, [64, 32, 16], 1)
         for _m, _path in [(model1, _q1_path), (model2, _q2_path)]:
-            try:
-                _m.load_state_dict(torch.load(_path, weights_only=True))
-            except TypeError:
-                _m.load_state_dict(torch.load(_path))
+            _m.load_state_dict(_safe_load_state_dict(_path))
         model1.eval()
         model2.eval()
         print(f"  Q-models:  {_q1_path}, {_q2_path}")
 
     print(f"  PPO:       {PPO_MODEL_PATH}")
     print(f"  Potential: {model_p_path}")
+    if selected_strategies is not None:
+        print(f"  Filtered strategy1 set: {selected_strategies}")
     print()
 
-    n_matchups = len(MULTISEED_MATCHUPS)
+    n_matchups = len(matchups)
     n_seeds    = len(args.seeds)
     total_runs = n_matchups * n_seeds
     print(f"Plan: {n_matchups} matchups × {n_seeds} seeds = {total_runs} runs")
@@ -313,7 +383,7 @@ def main() -> None:
         print(f"=== Seed {seed} ===")
         set_global_seed(seed)
 
-        for strategy1, strategy2 in MULTISEED_MATCHUPS:
+        for strategy1, strategy2 in matchups:
             run_idx += 1
             print(f"  [{run_idx}/{total_runs}] {strategy1} vs {strategy2} ...", flush=True)
 
@@ -341,10 +411,14 @@ def main() -> None:
 
     # Write raw results
     out = args.output_dir
-    raw_csv_path  = os.path.join(out, "raw_results.csv")
-    raw_json_path = os.path.join(out, "raw_results.json")
-    agg_csv_path  = os.path.join(out, "aggregated.csv")
-    agg_json_path = os.path.join(out, "aggregated.json")
+    if selected_strategies is None:
+        suffix = ""
+    else:
+        suffix = "_" + "_".join(_slugify_name(s) for s in selected_strategies)
+    raw_csv_path  = os.path.join(out, f"raw_results{suffix}.csv")
+    raw_json_path = os.path.join(out, f"raw_results{suffix}.json")
+    agg_csv_path  = os.path.join(out, f"aggregated{suffix}.csv")
+    agg_json_path = os.path.join(out, f"aggregated{suffix}.json")
 
     save_raw_csv(raw_rows, raw_csv_path)
     save_json(raw_rows, raw_json_path)

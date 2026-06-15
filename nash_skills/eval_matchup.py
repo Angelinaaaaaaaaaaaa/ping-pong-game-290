@@ -40,11 +40,20 @@ from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_in
 # --------------------------------------------------------------------------- #
 
 PPO_MODEL_PATH        = "logs/best_model_tracker1/best_model"
+MODEL1_5SK_PATH       = "models/model1_5skill.pth"
+MODEL2_5SK_PATH       = "models/model2_5skill.pth"
 MODEL_P_5SK_PATH      = "models/model_p_5skill.pth"
 # v2 4-skill pipeline — discounted returns, 76-dim state
+MODEL1_V2_PATH        = "models/model1_v2.pth"
+MODEL2_V2_PATH        = "models/model2_v2.pth"
 MODEL_P_V2_PATH       = "models/model_p_v2.pth"
 # v2 5-skill pipeline — discounted returns, 76-dim state, all 5 skills
+MODEL1_5SK_V2_PATH    = "models/model1_5skill_v2.pth"
+MODEL2_5SK_V2_PATH    = "models/model2_5skill_v2.pth"
 MODEL_P_5SK_V2_PATH   = "models/model_p_5skill_v2.pth"
+MODEL1_5SK_V3_PATH    = "models/model1_5skill_v3.pth"
+MODEL2_5SK_V3_PATH    = "models/model2_5skill_v3.pth"
+MODEL_P_5SK_V3_PATH   = "models/model_p_5skill_v3.pth"
 
 HISTORY = 4
 
@@ -59,18 +68,39 @@ VALID_STRATEGIES = [
     "nash-p-minimax",   # worst-case-safe: argmax over per-ego min-over-opp Φ
     "nash-p-adaptive",  # minimax scores + softmax when gap < margin
     "ibr",              # Q-based alternating best response (Φ-independent)
+    "ibr-q",            # Q-based empirical-mix best response
     "nash-p",           # alias for nash-p-br (backwards compat)
     "random",
 ] + SKILL_NAMES
 
-_LEARNED_STRATEGIES = {"nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr", "nash-p"}
+_LEARNED_STRATEGIES = {
+    "nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr", "ibr-q", "nash-p"
+}
 
 _ALL_OPPONENTS = ["random", "left", "right", "left_short", "right_short", "center_safe"]
 
 DEFAULT_MATCHUPS = [
     (strategy, opp)
-    for strategy in ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr"]
+    for strategy in ["nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "ibr", "ibr-q"]
     for opp in _ALL_OPPONENTS
+]
+DEFAULT_MATCHUPS += [
+    ("nash-p-hard", "ibr"),
+    ("ibr", "nash-p-hard"),
+    ("nash-p-br", "ibr"),
+    ("ibr", "nash-p-br"),
+    ("nash-p-minimax", "ibr"),
+    ("ibr", "nash-p-minimax"),
+    ("nash-p-adaptive", "ibr"),
+    ("ibr", "nash-p-adaptive"),
+    ("nash-p-hard", "ibr-q"),
+    ("ibr-q", "nash-p-hard"),
+    ("nash-p-br", "ibr-q"),
+    ("ibr-q", "nash-p-br"),
+    ("nash-p-minimax", "ibr-q"),
+    ("ibr-q", "nash-p-minimax"),
+    ("nash-p-adaptive", "ibr-q"),
+    ("ibr-q", "nash-p-adaptive"),
 ]
 
 LONG_RALLY_THRESHOLD = 100
@@ -328,12 +358,15 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                      Requires model1 and model2 Q-value models.
                      Alternates argmax_ego Q1 / argmax_opp Q2 for ibr_steps
                      rounds and returns the converged ego skill.
+    ibr-q            Q-based empirical-mix best response.
+                     Tracks the opponent's observed skill frequencies and best
+                     responds to that mixture using model1 / model2.
 
     Parameters
     ----------
     model_p           : nn.Module — learned potential Φ (required for all Φ strategies)
-    model1            : nn.Module or None — ego Q-value model (required for ibr)
-    model2            : nn.Module or None — opp Q-value model (required for ibr)
+    model1            : nn.Module or None — ego Q-value model (required for ibr / ibr-q)
+    model2            : nn.Module or None — opp Q-value model (required for ibr / ibr-q)
     state_encoder_fn  : callable or None — maps (obs, info, player) -> encoded vector
     tau               : float — softmax temperature for nash-p-adaptive
     confidence_margin : float — gap threshold for nash-p-adaptive argmax/softmax switch
@@ -456,6 +489,46 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
 
         return pick_ibr
 
+    if strategy == "ibr-q":
+        if model1 is None or model2 is None:
+            raise ValueError(
+                "ibr-q requires model1 and model2 Q-value models. "
+                "Pass them to make_picker(model1=..., model2=...)."
+            )
+
+        opp_counts = [1.0] * N_SKILLS
+
+        def pick_ibr_q(player, obs_vec, other_skill_idx, info=None):
+            opp_counts[other_skill_idx] += 1.0
+            total = sum(opp_counts)
+            opp_mix = [c / total for c in opp_counts]
+
+            if state_encoder_fn is not None and info is not None:
+                base_enc = torch.tensor(
+                    state_encoder_fn(obs_vec, info, player), dtype=torch.float32
+                )
+            else:
+                base_enc = torch.tensor(obs_vec, dtype=torch.float32)
+
+            q_model = model1 if player == 1 else model2
+            ego_vals = []
+            for ego_s in range(N_SKILLS):
+                val = 0.0
+                for opp_s in range(N_SKILLS):
+                    x = base_enc.clone().unsqueeze(0)
+                    if player == 1:
+                        x[0, -2] = ego_s / (N_SKILLS - 1)
+                        x[0, -1] = opp_s / (N_SKILLS - 1)
+                    else:
+                        x[0, -2] = opp_s / (N_SKILLS - 1)
+                        x[0, -1] = ego_s / (N_SKILLS - 1)
+                    with torch.no_grad():
+                        val += opp_mix[opp_s] * q_model(x).item()
+                ego_vals.append(val)
+            return int(np.argmax(ego_vals))
+
+        return pick_ibr_q
+
     raise ValueError(
         f"Unknown strategy '{strategy}'. "
         f"Choose from: {VALID_STRATEGIES}"
@@ -488,7 +561,8 @@ def run_matchup(
     - One-time global warmup.
     - After warmup, keep running until we complete n_episodes.
     - If an episode hits max_steps_per_episode, truncate and reset it.
-    - model1 / model2: Q-value models required when strategy1 or strategy2 == 'ibr'.
+    - model1 / model2: Q-value models required when strategy1 or strategy2 is
+      'ibr' or 'ibr-q'.
     """
     from nash_skills.env_wrapper import SkillEnv
 
@@ -902,6 +976,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--v3-5skill",
+        action="store_true",
+        default=False,
+        dest="v3_5skill",
+        help=(
+            "Use the 5-skill v3 pipeline: load model_p_5skill_v3.pth (76-dim state "
+            "encoder, discounted-return labels, all 5 skills, same-state per-sample "
+            "potential training). Trained by train_q_model_5skill_v3.py."
+        ),
+    )
+    parser.add_argument(
         "--tau",
         type=float,
         default=0.2,
@@ -922,7 +1007,12 @@ def main():
     print("Loading models...")
     ppo = PPO.load(PPO_MODEL_PATH)
 
-    if args.v2_5skill:
+    if args.v3_5skill:
+        from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+        model_p_path = MODEL_P_5SK_V3_PATH
+        model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+        pipeline_tag = "v3-5skill"
+    elif args.v2_5skill:
         # 5-skill v2: 76-dim encoded states, all 5 skills, discounted-return training
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = MODEL_P_5SK_V2_PATH
@@ -943,24 +1033,31 @@ def main():
     model_p.load_state_dict(_safe_load_state_dict(model_p_path))
     model_p.eval()
 
-    # Q-value models — needed only for ibr strategy
-    needs_q = any(s == "ibr" for s, _ in DEFAULT_MATCHUPS)
+    # Q-value models — needed for ibr / ibr-q
+    needs_q = any(s in {"ibr", "ibr-q"} for s, _ in DEFAULT_MATCHUPS) or any(
+        s in {"ibr", "ibr-q"} for _, s in DEFAULT_MATCHUPS
+    )
     model1 = model2 = None
     if needs_q:
-        if args.v2_5skill:
+        if args.v3_5skill:
             from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
             _sdim = V2_STATE_DIM
-            _q1_path = "models/model1_5skill_v2.pth"
-            _q2_path = "models/model2_5skill_v2.pth"
+            _q1_path = MODEL1_5SK_V3_PATH
+            _q2_path = MODEL2_5SK_V3_PATH
+        elif args.v2_5skill:
+            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+            _sdim = V2_STATE_DIM
+            _q1_path = MODEL1_5SK_V2_PATH
+            _q2_path = MODEL2_5SK_V2_PATH
         elif args.v2:
             from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
             _sdim = V2_STATE_DIM
-            _q1_path = "models/model1_v2.pth"
-            _q2_path = "models/model2_v2.pth"
+            _q1_path = MODEL1_V2_PATH
+            _q2_path = MODEL2_V2_PATH
         else:
             _sdim = 116
-            _q1_path = "models/model1_5skill.pth"
-            _q2_path = "models/model2_5skill.pth"
+            _q1_path = MODEL1_5SK_PATH
+            _q2_path = MODEL2_5SK_PATH
         model1 = SimpleModel(_sdim, [64, 32, 16], 1)
         model2 = SimpleModel(_sdim, [64, 32, 16], 1)
         model1.load_state_dict(_safe_load_state_dict(_q1_path))
@@ -970,7 +1067,7 @@ def main():
         print(f"  Loaded Q-models:    {_q1_path}, {_q2_path}")
 
     # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it
-    if args.v2_5skill or args.v2:
+    if args.v3_5skill or args.v2_5skill or args.v2:
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
 
         def _v2_state_encoder(obs, info, player):
