@@ -2,7 +2,7 @@
 Multi-seed evaluation for the 5-skill Nash pipeline.
 
 Runs learned strategies against fixed-skill opponents across seeds 0..4,
-then aggregates mean/std win rates.
+then aggregates mean/std win rates and truncation diagnostics.
 
 DO NOT retrain models.  Only evaluation — no weight updates.
 
@@ -16,7 +16,7 @@ Usage (from project root):
 Output files (all written to --output-dir):
     raw_results.csv        — one row per (seed, strategy, opponent)
     raw_results.json       — same data as JSON
-    aggregated.csv         — mean/std win_rate per (strategy, opponent)
+    aggregated.csv         — mean/std win_rate plus episode/truncation diagnostics
     aggregated.json        — same data as JSON
 """
 
@@ -118,12 +118,19 @@ def set_global_seed(seed: int) -> None:
 
 def _result_to_row(seed: int, result) -> dict:
     """Convert a MatchupResult + seed into a flat CSV row."""
+    attempted_episodes = result.episodes + result.truncated_episodes
+    timeout_rate = (
+        result.truncated_episodes / attempted_episodes
+        if attempted_episodes > 0 else None
+    )
     return {
         "seed":                  seed,
         "strategy1":             result.strategy1,
         "strategy2":             result.strategy2,
         "episodes":              result.episodes,
         "truncated_episodes":    result.truncated_episodes,
+        "attempted_episodes":    attempted_episodes,
+        "timeout_rate":          round(timeout_rate, 4) if timeout_rate is not None else "",
         "ego_wins":              result.ego_wins,
         "opp_wins":              result.opp_wins,
         "win_rate":              round(result.win_rate, 4) if result.win_rate is not None else "",
@@ -144,13 +151,17 @@ def _result_to_row(seed: int, result) -> dict:
 
 def aggregate(raw_rows: list) -> list:
     """
-    Group raw rows by (strategy1, strategy2), compute mean and std of win_rate.
+    Group raw rows by (strategy1, strategy2), compute mean/std diagnostics.
 
     Returns list of dicts with keys:
         strategy1, strategy2, n_seeds,
+        episodes_mean, episodes_min, episodes_max,
+        truncated_mean, truncated_std,
+        timeout_rate_mean, timeout_rate_std,
         win_rate_mean, win_rate_std,
         avg_steps_mean, avg_steps_std,
-        avg_rally_mean, avg_rally_std
+        avg_rally_mean, avg_rally_std,
+        total_steps_mean, total_steps_std
     """
     from collections import defaultdict
 
@@ -161,20 +172,33 @@ def aggregate(raw_rows: list) -> list:
 
     agg_rows = []
     for (s1, s2), rows in groups.items():
+        episodes    = [r["episodes"]              for r in rows if r["episodes"]              != ""]
+        truncs      = [r["truncated_episodes"]    for r in rows if r["truncated_episodes"]    != ""]
+        timeout_rates = [r["timeout_rate"]         for r in rows if r.get("timeout_rate", "")  != ""]
         win_rates   = [r["win_rate"]              for r in rows if r["win_rate"]              != ""]
         avg_steps   = [r["avg_steps_per_episode"] for r in rows if r["avg_steps_per_episode"] != ""]
         avg_rallies = [r["avg_rally_length"]      for r in rows if r["avg_rally_length"]      != ""]
+        total_steps = [r["total_steps"]           for r in rows if r["total_steps"]           != ""]
 
         agg_rows.append({
             "strategy1":       s1,
             "strategy2":       s2,
             "n_seeds":         len(rows),
+            "episodes_mean":   round(float(np.mean(episodes)),    2) if episodes    else "",
+            "episodes_min":    int(np.min(episodes))                  if episodes    else "",
+            "episodes_max":    int(np.max(episodes))                  if episodes    else "",
+            "truncated_mean":  round(float(np.mean(truncs)),      2) if truncs      else "",
+            "truncated_std":   round(float(np.std(truncs)),       2) if truncs      else "",
+            "timeout_rate_mean": round(float(np.mean(timeout_rates)), 4) if timeout_rates else "",
+            "timeout_rate_std":  round(float(np.std(timeout_rates)),  4) if timeout_rates else "",
             "win_rate_mean":   round(float(np.mean(win_rates)),   4) if win_rates   else "",
             "win_rate_std":    round(float(np.std(win_rates)),    4) if win_rates   else "",
             "avg_steps_mean":  round(float(np.mean(avg_steps)),   2) if avg_steps   else "",
             "avg_steps_std":   round(float(np.std(avg_steps)),    2) if avg_steps   else "",
             "avg_rally_mean":  round(float(np.mean(avg_rallies)), 2) if avg_rallies else "",
             "avg_rally_std":   round(float(np.std(avg_rallies)),  2) if avg_rallies else "",
+            "total_steps_mean": round(float(np.mean(total_steps)), 2) if total_steps else "",
+            "total_steps_std":  round(float(np.std(total_steps)),  2) if total_steps else "",
         })
 
     # Sort by strategy then opponent for readability
@@ -241,6 +265,13 @@ def main() -> None:
         help=f"One-time warmup steps per matchup (default: {DEFAULT_WARMUP})",
     )
     parser.add_argument(
+        "--max-total-steps", type=int, default=None,
+        help=(
+            "Optional absolute safety cap on simulator steps per matchup. "
+            "Default None means keep running until --episodes done episodes are collected."
+        ),
+    )
+    parser.add_argument(
         "--output-dir", default=DEFAULT_OUTPUT_DIR,
         help=f"Directory for all output files (default: {DEFAULT_OUTPUT_DIR})",
     )
@@ -253,11 +284,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--tau", type=float, default=0.2,
-        help="Softmax temperature for nash-p-adaptive (default: 0.2)",
+        help="Softmax temperature for flat-surface fallback in nash-p-hard/br/adaptive (default: 0.2)",
     )
     parser.add_argument(
         "--confidence-margin", type=float, default=0.05, dest="confidence_margin",
-        help="Gap threshold for nash-p-adaptive deterministic cutoff (default: 0.05)",
+        help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax instead of argmax (default: 0.05)",
     )
     parser.add_argument(
         "--v2", action="store_true", default=False,
@@ -373,7 +404,11 @@ def main() -> None:
     n_seeds    = len(args.seeds)
     total_runs = n_matchups * n_seeds
     print(f"Plan: {n_matchups} matchups × {n_seeds} seeds = {total_runs} runs")
-    print(f"      {args.episodes} completed episodes each, max_steps={args.steps}")
+    cap = "none" if args.max_total_steps is None else str(args.max_total_steps)
+    print(
+        f"      {args.episodes} completed episodes each, "
+        f"max_steps={args.steps}, max_total_steps={cap}"
+    )
     print()
 
     raw_rows: list = []
@@ -395,6 +430,7 @@ def main() -> None:
                 n_episodes=args.episodes,
                 max_steps_per_episode=args.steps,
                 warmup_steps=args.warmup,
+                max_total_steps=args.max_total_steps,
                 state_encoder_fn=state_encoder_fn,
                 tau=args.tau,
                 confidence_margin=args.confidence_margin,
@@ -431,7 +467,10 @@ def main() -> None:
 
     # Print aggregated table
     print()
-    header = f"{'Strategy':<20} {'vs':<14} {'Mean WR':>8} {'Std WR':>8} {'Seeds':>6}"
+    header = (
+        f"{'Strategy':<20} {'vs':<14} {'Mean WR':>8} {'Std WR':>8} "
+        f"{'Ep':>6} {'Trunc':>8} {'TO%':>6} {'Seeds':>6}"
+    )
     sep    = "-" * len(header)
     print(f"\n{'AGGREGATED RESULTS (mean ± std win rate)':^{len(header)}}")
     print(sep)
@@ -440,7 +479,14 @@ def main() -> None:
     for row in agg_rows:
         wr_mean = f"{row['win_rate_mean']:.0%}" if row["win_rate_mean"] != "" else "---"
         wr_std  = f"{row['win_rate_std']:.0%}"  if row["win_rate_std"]  != "" else "---"
-        print(f"{row['strategy1']:<20} {row['strategy2']:<14} {wr_mean:>8} {wr_std:>8} {row['n_seeds']:>6}")
+        ep_mean = f"{row['episodes_mean']:.1f}" if row["episodes_mean"] != "" else "---"
+        trunc_mean = f"{row['truncated_mean']:.1f}" if row["truncated_mean"] != "" else "---"
+        timeout_rate = f"{row['timeout_rate_mean']:.0%}" if row["timeout_rate_mean"] != "" else "---"
+        print(
+            f"{row['strategy1']:<20} {row['strategy2']:<14} "
+            f"{wr_mean:>8} {wr_std:>8} {ep_mean:>6} {trunc_mean:>8} "
+            f"{timeout_rate:>6} {row['n_seeds']:>6}"
+        )
     print(sep)
 
 
