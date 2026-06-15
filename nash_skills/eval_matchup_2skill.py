@@ -29,6 +29,7 @@ import csv
 import dataclasses
 import io
 import json
+import random
 from contextlib import redirect_stdout
 
 from typing import Dict, List, Optional
@@ -228,8 +229,14 @@ def print_summary(results: List[MatchupResult], file=None,
 # ─────────────────────────────────────────────────────────────────────────── #
 
 PPO_MODEL_PATH      = "logs/best_model_tracker1/best_model"
+MODEL1_2SK_PATH     = "models/model1.pth"
+MODEL2_2SK_PATH     = "models/model2.pth"
 MODEL_P_2SK_PATH    = "models/model_p.pth"             # old buggy model (do not use)
+MODEL1_V2_PATH      = "models/model1_2skill_v2.pth"
+MODEL2_V2_PATH      = "models/model2_2skill_v2.pth"
 MODEL_P_V2_PATH     = "models/model_p_2skill_v2.pth"   # 116-dim raw-obs model
+MODEL1_76DIM_PATH   = "models/model1_76dim.pth"
+MODEL2_76DIM_PATH   = "models/model2_76dim.pth"
 MODEL_P_76DIM_PATH  = "models/model_p_76dim.pth"       # 76-dim encoded model (preferred)
 # NOTE: models/model_p_v2.pth is written by nash_skills/v2/train_models.py with
 # a 76-dim state encoder and CANNOT be loaded here; use MODEL_P_76DIM_PATH instead.
@@ -243,12 +250,30 @@ TABLE_Y_ABS_MAX = 0.75
 _SKILLS_2 = ["left", "right"]
 N_SKILLS_2 = 2
 
-VALID_STRATEGIES_2SKILL = ["nash-p-2skill", "random", "left", "right"]
+VALID_STRATEGIES_2SKILL = [
+    "nash-p-2skill",
+    "nash-p-adaptive-2skill",
+    "ibr",
+    "random",
+    "left",
+    "right",
+]
 
 DEFAULT_MATCHUPS_2SKILL = [
     ("nash-p-2skill", "random"),
+    ("nash-p-adaptive-2skill", "random"),
+    ("ibr", "random"),
     ("nash-p-2skill", "left"),
+    ("nash-p-adaptive-2skill", "left"),
+    ("ibr", "left"),
     ("nash-p-2skill", "right"),
+    ("nash-p-adaptive-2skill", "right"),
+    ("ibr", "right"),
+    ("nash-p-2skill", "ibr"),
+    ("nash-p-adaptive-2skill", "ibr"),
+    ("ibr", "nash-p-2skill"),
+    ("ibr", "nash-p-adaptive-2skill"),
+    ("nash-p-2skill", "nash-p-adaptive-2skill")
 ]
 
 # skill index -> side_target
@@ -296,7 +321,15 @@ class _TwoSkillEnv:
 # Strategy picker                                                             #
 # ─────────────────────────────────────────────────────────────────────────── #
 
-def make_picker_2skill(strategy: str, model_p, model_state_dim: int = 116):
+def make_picker_2skill(
+    strategy: str,
+    model_p,
+    model_state_dim: int = 116,
+    model1=None,
+    model2=None,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
+):
     """
     Return pick_fn(player, obs_vec, info, other_idx) -> skill_idx in {0, 1}.
 
@@ -312,7 +345,9 @@ def make_picker_2skill(strategy: str, model_p, model_state_dim: int = 116):
       'left'          -> always index 0
       'right'         -> always index 1
       'random'        -> uniform {0, 1}
+      'ibr'           -> iterated best response using the learned Q-models
       'nash-p-2skill' -> argmax of the learned potential over the 2 skills
+      'nash-p-adaptive-2skill' -> adaptive minimax-style selection using model_p
     """
     if strategy == "left":
         return lambda player, obs, info, other: 0
@@ -322,6 +357,47 @@ def make_picker_2skill(strategy: str, model_p, model_state_dim: int = 116):
 
     if strategy == "random":
         return lambda player, obs, info, other: np.random.randint(N_SKILLS_2)
+
+    if strategy == "ibr":
+        if model1 is None or model2 is None:
+            raise ValueError("strategy='ibr' requires loaded model1 and model2")
+
+        _sk_enc = {0: -1.0, 1: 1.0}
+        _use_76 = (model_state_dim == _STATE_DIM_76)
+
+        def pick_ibr(player, obs_vec, info, other_idx):
+            if _use_76:
+                base_np = encode_ego(obs_vec, info)
+            else:
+                base_np = obs_vec.copy()
+
+            base = torch.tensor(base_np, dtype=torch.float32)
+            curr_idx1 = 1
+            curr_idx2 = 1
+
+            with torch.no_grad():
+                for _ in range(4):
+                    rows_p1 = []
+                    for ego_s in range(N_SKILLS_2):
+                        row = base.clone()
+                        row[-2] = _sk_enc[ego_s]
+                        row[-1] = _sk_enc[curr_idx2]
+                        rows_p1.append(row)
+                    vals_p1 = model1(torch.stack(rows_p1))[:, 0]
+                    curr_idx1 = int(torch.argmax(vals_p1).item())
+
+                    rows_p2 = []
+                    for opp_s in range(N_SKILLS_2):
+                        row = base.clone()
+                        row[-2] = _sk_enc[curr_idx1]
+                        row[-1] = _sk_enc[opp_s]
+                        rows_p2.append(row)
+                    vals_p2 = model2(torch.stack(rows_p2))[:, 0]
+                    curr_idx2 = int(torch.argmax(vals_p2).item())
+
+            return curr_idx1 if player == 1 else curr_idx2
+
+        return pick_ibr
 
     if strategy == "nash-p-2skill":
         # Map skill index to the ±1 encoding the model was trained on
@@ -356,6 +432,44 @@ def make_picker_2skill(strategy: str, model_p, model_state_dim: int = 116):
             return ego_best if player == 1 else opp_best
 
         return pick_nash
+
+    if strategy == "nash-p-adaptive-2skill":
+        _sk_enc = {0: -1.0, 1: 1.0}
+        _use_76 = (model_state_dim == _STATE_DIM_76)
+
+        def pick_nash_adaptive(player, obs_vec, info, other_idx):
+            if _use_76:
+                base_np = encode_ego(obs_vec, info)
+            else:
+                base_np = obs_vec.copy()
+
+            base = torch.tensor(base_np, dtype=torch.float32)
+            rows = []
+            for ego_s in range(N_SKILLS_2):
+                for opp_s in range(N_SKILLS_2):
+                    row = base.clone()
+                    row[-2] = _sk_enc[ego_s]
+                    row[-1] = _sk_enc[opp_s]
+                    rows.append(row)
+
+            batch = torch.stack(rows)
+            with torch.no_grad():
+                vals = model_p(batch)[:, 0]
+
+            phi = vals.reshape(2, 2)
+            if player == 1:
+                action_scores = phi.min(dim=1).values
+            else:
+                action_scores = -phi.max(dim=0).values
+
+            gap = torch.abs(action_scores[0] - action_scores[1]).item()
+            if gap >= confidence_margin:
+                return int(torch.argmax(action_scores).item())
+
+            probs = torch.softmax(action_scores / tau, dim=0)
+            return int(torch.multinomial(probs, 1).item())
+
+        return pick_nash_adaptive
 
     raise ValueError(
         f"Unknown 2-skill strategy '{strategy}'. "
@@ -467,12 +581,16 @@ def run_matchup_2skill(
     strategy2: str,
     ppo,
     model_p,
+    model1,
+    model2,
     n_episodes: int,
     max_steps_per_episode: int,
     warmup_steps: int = 300,
     max_total_steps: int | None = None,
     debug_contacts: bool = False,
     model_state_dim: int = 116,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
 ) -> MatchupResult:
     """
     Run one 2-skill matchup headlessly, guaranteeing exactly n_episodes
@@ -488,8 +606,12 @@ def run_matchup_2skill(
     model_state_dim : 116 for raw-obs models, 76 for encoded models trained
                       via collect_data_v2.py + train_q_model_v2.py (--76dim).
     """
-    pick1 = make_picker_2skill(strategy1, model_p, model_state_dim)
-    pick2 = make_picker_2skill(strategy2, model_p, model_state_dim)
+    pick1 = make_picker_2skill(
+        strategy1, model_p, model_state_dim, model1, model2, tau, confidence_margin
+    )
+    pick2 = make_picker_2skill(
+        strategy2, model_p, model_state_dim, model1, model2, tau, confidence_margin
+    )
 
     env = _TwoSkillEnv(proc_id=1)
 
@@ -660,7 +782,7 @@ def save_csv_2skill(results, path: str):
 
 
 def print_summary_2skill(results, file=None):
-    print_summary(results, file=file, title="2-SKILL BASELINE EVALUATION RESULTS")
+    print_summary(results, file=file, title="2-SKILL STRATEGY COMPARISON RESULTS")
 
 
 # ─────────────────────────────────────────────────────────────────────────── #
@@ -720,27 +842,68 @@ def main():
             "  old    — model_p.pth (original buggy model, not recommended)"
         ),
     )
+    parser.add_argument(
+        "--tau",
+        type=float,
+        default=0.2,
+        help="Softmax temperature for nash-p-adaptive-2skill (default: 0.2)",
+    )
+    parser.add_argument(
+        "--confidence-margin",
+        type=float,
+        default=0.05,
+        help="Deterministic argmax threshold for nash-p-adaptive-2skill (default: 0.05)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Base random seed for matchup reproducibility (default: 42)",
+    )
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
     from model_arch import SimpleModel
 
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     print("Loading models...")
+    print(f"Evaluation seed: {args.seed}")
+    print(f"Adaptive Nash-p tau: {args.tau}")
+    print(f"Adaptive Nash-p confidence_margin: {args.confidence_margin}")
     ppo = PPO.load(PPO_MODEL_PATH)
 
     if args.model == "76dim":
+        model1_path = MODEL1_76DIM_PATH
+        model2_path = MODEL2_76DIM_PATH
         model_p_path = MODEL_P_76DIM_PATH
         state_dim = 76
     elif args.model == "116dim":
+        model1_path = MODEL1_V2_PATH
+        model2_path = MODEL2_V2_PATH
         model_p_path = MODEL_P_V2_PATH
         state_dim = 116
     else:
+        model1_path = MODEL1_2SK_PATH
+        model2_path = MODEL2_2SK_PATH
         model_p_path = MODEL_P_2SK_PATH
         state_dim = 116
 
+    model1 = SimpleModel(state_dim, [64, 32, 16], 1)
+    model2 = SimpleModel(state_dim, [64, 32, 16], 1)
     model_p = SimpleModel(state_dim, [64, 32, 16], 1, last_layer_activation=None)
+    model1.load_state_dict(torch.load(model1_path, weights_only=True))
+    model2.load_state_dict(torch.load(model2_path, weights_only=True))
     model_p.load_state_dict(torch.load(model_p_path, weights_only=True))
+    model1.eval()
+    model2.eval()
     model_p.eval()
+    print(f"  Loaded 2-skill Q1: {model1_path}  (state_dim={state_dim})")
+    print(f"  Loaded 2-skill Q2: {model2_path}  (state_dim={state_dim})")
     print(f"  Loaded 2-skill potential: {model_p_path}  (state_dim={state_dim})")
 
     print(
@@ -750,19 +913,29 @@ def main():
     )
 
     results = []
-    for s1, s2 in DEFAULT_MATCHUPS_2SKILL:
+    for idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS_2SKILL):
+        matchup_seed = args.seed + idx * 1000
+        random.seed(matchup_seed)
+        np.random.seed(matchup_seed)
+        torch.manual_seed(matchup_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(matchup_seed)
         print(f"  [{s1} vs {s2}] ...")
         r = run_matchup_2skill(
             strategy1=s1,
             strategy2=s2,
             ppo=ppo,
             model_p=model_p,
+            model1=model1,
+            model2=model2,
             n_episodes=args.episodes,
             max_steps_per_episode=args.steps,
             warmup_steps=args.warmup,
             max_total_steps=args.max_total_steps,
             debug_contacts=args.debug_contacts,
             model_state_dim=state_dim,
+            tau=args.tau,
+            confidence_margin=args.confidence_margin,
         )
         results.append(r)
 
@@ -794,6 +967,9 @@ def main():
         json_data[i]["avg_rally_length"] = r.avg_rally_length
         json_data[i]["ego_success_rate"] = r.ego_success_rate
         json_data[i]["opp_success_rate"] = r.opp_success_rate
+        json_data[i]["seed"] = args.seed
+        json_data[i]["tau"] = args.tau
+        json_data[i]["confidence_margin"] = args.confidence_margin
 
     with open(args.output_json, "w") as f:
         json.dump(json_data, f, indent=2)
