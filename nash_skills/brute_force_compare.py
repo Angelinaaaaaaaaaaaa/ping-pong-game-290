@@ -190,24 +190,35 @@ def main():
     parser.add_argument('--n-states', type=int, default=200,
                         help='Number of states to sample from rally data (default 200)')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--model', default="models/model_p_5skill.pth",
+                        help='Path to potential model checkpoint')
+    parser.add_argument('--rallies', default="data/rallies_5skill.pkl",
+                        help='Path to rally pickle (states must match model state_dim)')
+    parser.add_argument('--output', default="skill_eval/brute_force_compare.json",
+                        help='Output JSON path')
     args = parser.parse_args()
 
     import pickle
     import json
     import os
 
-    MODEL_P_PATH  = "models/model_p_5skill.pth"
-    RALLY_PATH    = "data/rallies_5skill.pkl"
-    OUTPUT_JSON   = "skill_eval/brute_force_compare.json"
+    MODEL_P_PATH = args.model
+    RALLY_PATH   = args.rallies
+    OUTPUT_JSON  = args.output
 
-    # Load potential model
+    # Load potential model — auto-detect state_dim from checkpoint
     sys.path.insert(0, '.')
     from model_arch import SimpleModel
 
-    model = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
-    model.load_state_dict(torch.load(MODEL_P_PATH, weights_only=True))
+    state_dict = torch.load(MODEL_P_PATH, weights_only=True)
+    # First Linear layer (or batch_norm) reveals input dim
+    first_weight_key = next(k for k in state_dict if k.endswith(".weight") and state_dict[k].ndim == 2)
+    state_dim = state_dict[first_weight_key].shape[1]
+    print(f"Loading potential model: {MODEL_P_PATH} (detected state_dim={state_dim})")
+
+    model = SimpleModel(state_dim, [64, 32, 16], 1, last_layer_activation=None)
+    model.load_state_dict(state_dict)
     model.eval()
-    print(f"Loaded potential model: {MODEL_P_PATH}")
 
     # Load rally states
     with open(RALLY_PATH, 'rb') as f:

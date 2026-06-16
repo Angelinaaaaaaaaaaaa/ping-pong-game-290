@@ -47,6 +47,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import argparse
 import itertools
 import pickle as pkl
+from collections import Counter
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -88,10 +90,72 @@ def _build_ppo_obs(obs, info, player: int) -> np.ndarray:
     return ppo_obs
 
 
+def _validate_skill(name: str) -> str:
+    if name not in SKILL_NAMES:
+        valid = ", ".join(SKILL_NAMES)
+        raise ValueError(f"Unknown skill '{name}'. Valid skills: {valid}")
+    return name
+
+
+def _selected_pairs(
+    skill1: Optional[str] = None,
+    skill2: Optional[str] = None,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> List[Tuple[str, str]]:
+    """
+    Return the skill pairs assigned to this collector run.
+
+    Defaults to all 25 pairs.  ``--skill1`` / ``--skill2`` restrict the Cartesian
+    product, and ``--num-shards`` / ``--shard-index`` split the resulting ordered
+    pair list so multiple processes can collect independent chunks.
+    """
+    if num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard_index < num_shards")
+
+    skills1: Sequence[str] = [_validate_skill(skill1)] if skill1 else SKILL_NAMES
+    skills2: Sequence[str] = [_validate_skill(skill2)] if skill2 else SKILL_NAMES
+    pairs = list(itertools.product(skills1, skills2))
+    return [pair for idx, pair in enumerate(pairs) if idx % num_shards == shard_index]
+
+
+def _save_rallies_atomic(rallies: list, output_path: str, label: str) -> None:
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        pkl.dump(rallies, f)
+    os.replace(tmp_path, output_path)
+    print(f"  [checkpoint:{label}] saved {len(rallies)} rallies to {output_path}", flush=True)
+
+
+def _load_existing_rallies(output_path: str) -> list:
+    if not os.path.exists(output_path):
+        return []
+    with open(output_path, "rb") as f:
+        rallies = pkl.load(f)
+    if not isinstance(rallies, list):
+        raise ValueError(f"Expected a list in existing output {output_path}")
+    print(f"Resuming from {output_path}: loaded {len(rallies)} existing rallies")
+    return rallies
+
+
+def _count_pairs(rallies: list) -> Counter:
+    counts = Counter()
+    for entry in rallies:
+        if "skill1" in entry and "skill2" in entry:
+            counts[(entry["skill1"], entry["skill2"])] += 1
+    return counts
+
+
 def collect(
     target_rallies: int = TARGET_RALLIES,
     output_path: str = DEFAULT_OUTPUT,
     ppo_path: str = PPO_MODEL_PATH,
+    pairs: Optional[Iterable[Tuple[str, str]]] = None,
+    checkpoint_every: int = 100,
+    resume: bool = True,
 ) -> list:
     """
     Collect `target_rallies` complete rallies for each of the 25 skill pairs.
@@ -101,14 +165,37 @@ def collect(
     env   = SkillEnv(proc_id=1, history=HISTORY)
     model = PPO.load(ppo_path)
 
-    all_rallies = []
+    selected = list(pairs) if pairs is not None else list(itertools.product(SKILL_NAMES, SKILL_NAMES))
+    if not selected:
+        raise ValueError("No skill pairs selected for collection.")
 
-    for skill1, skill2 in itertools.product(SKILL_NAMES, SKILL_NAMES):
+    print(f"Selected {len(selected)} skill pair(s):")
+    for idx, (skill1, skill2) in enumerate(selected):
+        print(f"  [{idx:02d}] {skill1} vs {skill2}")
+
+    all_rallies = _load_existing_rallies(output_path) if resume else []
+    existing_counts = _count_pairs(all_rallies)
+    if all_rallies:
+        print("Existing selected-pair counts:")
+        for skill1, skill2 in selected:
+            print(f"  {skill1:12s} vs {skill2:12s}: "
+                  f"{existing_counts.get((skill1, skill2), 0)}/{target_rallies}")
+
+    for skill1, skill2 in selected:
+        already_collected = existing_counts.get((skill1, skill2), 0)
+        if already_collected >= target_rallies:
+            print(f"\n=== Skipping: ego={skill1}  opp={skill2} "
+                  f"({already_collected}/{target_rallies} already collected) ===")
+            continue
+
         print(f"\n=== Collecting: ego={skill1}  opp={skill2} ===")
+        if already_collected > 0:
+            print(f"  Resume: {already_collected}/{target_rallies} already collected; "
+                  f"collecting {target_rallies - already_collected} more")
         env.set_skills(skill1, skill2)
         obs, info = env.reset()
 
-        completed = 0
+        completed = already_collected
         steps_this_combo = 0
         prev_ball_x = obs[36]
 
@@ -157,6 +244,12 @@ def collect(
                     if completed % 10 == 0:
                         print(f"  {completed}/{target_rallies} rallies  "
                               f"({steps_this_combo} steps so far)")
+                    if checkpoint_every > 0 and completed % checkpoint_every == 0:
+                        _save_rallies_atomic(
+                            all_rallies,
+                            output_path,
+                            label=f"{skill1}_vs_{skill2}_{completed}",
+                        )
 
                 # Reset for next episode
                 curr_states = []
@@ -168,13 +261,15 @@ def collect(
 
         print(f"  Done: {completed} rallies collected "
               f"({steps_this_combo} total steps)")
+        _save_rallies_atomic(
+            all_rallies,
+            output_path,
+            label=f"{skill1}_vs_{skill2}_done",
+        )
 
     env.close()
 
-    # Save
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-    with open(output_path, "wb") as f:
-        pkl.dump(all_rallies, f)
+    _save_rallies_atomic(all_rallies, output_path, label="final")
     print(f"\nSaved {len(all_rallies)} rallies to {output_path}")
 
     # Balance report
@@ -203,10 +298,32 @@ if __name__ == "__main__":
                         help=f"Output pickle path (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--ppo",     type=str, default=PPO_MODEL_PATH,
                         help="Path to PPO model checkpoint")
+    parser.add_argument("--skill1",  type=str, default=None,
+                        help="Optional ego skill filter. Default: all ego skills")
+    parser.add_argument("--skill2",  type=str, default=None,
+                        help="Optional opponent skill filter. Default: all opponent skills")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Split selected skill pairs across this many shards")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Collect only pairs whose ordered index mod num_shards equals this value")
+    parser.add_argument("--checkpoint-every", type=int, default=100,
+                        help="Save partial output every N collected rallies per skill pair; 0 disables periodic checkpoints")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore an existing output file and start this shard from scratch")
     args = parser.parse_args()
+
+    selected_pairs = _selected_pairs(
+        skill1=args.skill1,
+        skill2=args.skill2,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+    )
 
     collect(
         target_rallies=args.rallies,
         output_path=args.output,
         ppo_path=args.ppo,
+        pairs=selected_pairs,
+        checkpoint_every=args.checkpoint_every,
+        resume=not args.no_resume,
     )

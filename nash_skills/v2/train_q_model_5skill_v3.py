@@ -42,11 +42,17 @@ BATCH_SIZE       = 512
 POTENTIAL_PAIRS  = 20
 CHECKPOINT_EVERY = 100
 
-MODEL1_PATH  = "models/model1_5skill_v3.pth"
-MODEL2_PATH  = "models/model2_5skill_v3.pth"
-MODEL_P_PATH = "models/model_p_5skill_v3.pth"
-LOG_Q_PATH   = "logs/train_q_5skill_v3.csv"
-LOG_P_PATH   = "logs/train_p_5skill_v3.csv"
+#MODEL1_PATH  = "models/model1_5skill_v3.pth"
+#MODEL2_PATH  = "models/model2_5skill_v3.pth"
+#MODEL_P_PATH = "models/model_p_5skill_v3.pth"
+#LOG_Q_PATH   = "logs/train_q_5skill_v3.csv"
+#LOG_P_PATH   = "logs/train_p_5skill_v3.csv"
+
+MODEL1_PATH  = "models/model1_5skill_v3_1000.pth"                                                                    
+MODEL2_PATH  = "models/model2_5skill_v3_1000.pth"                                                                    
+MODEL_P_PATH = "models/model_p_5skill_v3_1000.pth"                                                                   
+LOG_Q_PATH   = "logs/train_q_5skill_v3_1000.csv"                                                                     
+LOG_P_PATH   = "logs/train_p_5skill_v3_1000.csv"  
 # --------------------------------------------------------------------------- #
 
 
@@ -89,6 +95,10 @@ def sample_base_batch(x: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 
 def train(rally_path: str, n_epochs: int, lr: float) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}"
+          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+
     print(f"Loading {rally_path} ...")
     rallies = pkl.load(open(rally_path, "rb"))
     print(f"  {len(rallies)} rallies loaded")
@@ -97,6 +107,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
 
     x, y1, y2 = build_dataset(rallies)
+    x = x.to(device); y1 = y1.to(device); y2 = y2.to(device)
     print(f"  Dataset: X={x.shape}, Y1={y1.shape}")
 
     n_nonzero = (y1.abs() > 1e-6).sum().item()
@@ -112,8 +123,8 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     # ------------------------------------------------------------------ #
     # Train Q-value models                                                 #
     # ------------------------------------------------------------------ #
-    model1 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
-    model2 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
+    model1 = SimpleModel(STATE_DIM, [64, 32, 16], 1).to(device)
+    model2 = SimpleModel(STATE_DIM, [64, 32, 16], 1).to(device)
     opt1 = torch.optim.Adam(model1.parameters(), lr=lr)
     opt2 = torch.optim.Adam(model2.parameters(), lr=lr)
 
@@ -145,7 +156,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     model1.eval()
     model2.eval()
 
-    model_p = SimpleModel(STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+    model_p = SimpleModel(STATE_DIM, [64, 32, 16], 1, last_layer_activation=None).to(device)
     model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
     model_p.batch_norm.running_var = model1.batch_norm.running_var.clone()
     model_p.batch_norm.momentum = 0.0
