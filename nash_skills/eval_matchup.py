@@ -1046,8 +1046,10 @@ def main():
                 "--arch factored requires --v2-5skill or --v3-5skill (the "
                 "factored ablation is only trained for the 5-skill pipelines)."
             )
-        # FactoredModel splits state vs skill internally; total input is 116.
-        model_p = FactoredModel(state_dim=114, skill_dim=2, last_layer_activation=None)
+        # FactoredModel splits state vs skill internally. After re-collecting
+        # 5-skill data via nash_skills/v2/collect_data.py, rallies store 76-dim
+        # encoded states (74 state dims + 2 skill dims).
+        model_p = FactoredModel(state_dim=74, skill_dim=2, last_layer_activation=None)
     elif args.v3_5skill:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = MODEL_P_5SK_V3_PATH
@@ -1089,8 +1091,9 @@ def main():
             else:  # args.v2_5skill (the model_p branch above already enforced this)
                 _q1_path = MODEL1_5SK_FACTORED_PATH
                 _q2_path = MODEL2_5SK_FACTORED_PATH
-            model1 = FactoredModel(state_dim=114, skill_dim=2)
-            model2 = FactoredModel(state_dim=114, skill_dim=2)
+            # 76-dim encoded data: 74 state dims + 2 skill dims (see model_p above).
+            model1 = FactoredModel(state_dim=74, skill_dim=2)
+            model2 = FactoredModel(state_dim=74, skill_dim=2)
         else:
             if args.v3_5skill:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
