@@ -51,9 +51,20 @@ MODEL_P_V2_PATH       = "models/model_p_v2.pth"
 MODEL1_5SK_V2_PATH    = "models/model1_5skill_v2.pth"
 MODEL2_5SK_V2_PATH    = "models/model2_5skill_v2.pth"
 MODEL_P_5SK_V2_PATH   = "models/model_p_5skill_v2.pth"
+# v3 5-skill pipeline — same-state per-sample potential training
 MODEL1_5SK_V3_PATH    = "models/model1_5skill_v3.pth"
 MODEL2_5SK_V3_PATH    = "models/model2_5skill_v3.pth"
 MODEL_P_5SK_V3_PATH   = "models/model_p_5skill_v3.pth"
+# FactoredModel weights for the 5-skill v2 pipeline (116-dim).
+# Trained by nash_skills/v2/train_q_model_5skill_factored.py.
+MODEL1_5SK_FACTORED_PATH  = "models/model1_5skill_factored.pth"
+MODEL2_5SK_FACTORED_PATH  = "models/model2_5skill_factored.pth"
+MODEL_P_5SK_FACTORED_PATH = "models/model_p_5skill_factored.pth"
+# FactoredModel weights for the 5-skill v3 pipeline (same-state per-sample
+# potential training). Trained by train_q_model_5skill_v3_factored.py.
+MODEL1_5SK_V3_FACTORED_PATH  = "models/model1_5skill_v3_factored.pth"
+MODEL2_5SK_V3_FACTORED_PATH  = "models/model2_5skill_v3_factored.pth"
+MODEL_P_5SK_V3_FACTORED_PATH = "models/model_p_5skill_v3_factored.pth"
 
 HISTORY = 4
 
@@ -987,6 +998,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--arch",
+        choices=["simple", "factored"],
+        default="simple",
+        help=(
+            "Estimator architecture (§3.6 ablation):\n"
+            "  simple   — SimpleModel (flat-concat MLP; default)\n"
+            "  factored — FactoredModel (separate state/skill encoders + fusion).\n"
+            "             Requires --v2-5skill or --v3-5skill. Loads\n"
+            "             model{1,2,p}_5skill_factored.pth   (with --v2-5skill) or\n"
+            "             model{1,2,p}_5skill_v3_factored.pth (with --v3-5skill)."
+        ),
+    )
+    parser.add_argument(
         "--tau",
         type=float,
         default=0.2,
@@ -1002,12 +1026,29 @@ def main():
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
-    from model_arch import SimpleModel
+    from model_arch import SimpleModel, FactoredModel
 
     print("Loading models...")
     ppo = PPO.load(PPO_MODEL_PATH)
 
-    if args.v3_5skill:
+    if args.arch == "factored":
+        # FactoredModel weights trained on 116-dim raw obs.
+        # Pick v2 (minibatch-mean) or v3 (same-state per-sample) trained weights
+        # based on the pipeline flag. One of --v2-5skill / --v3-5skill is required.
+        if args.v3_5skill:
+            model_p_path = MODEL_P_5SK_V3_FACTORED_PATH
+            pipeline_tag = "v3-5skill-factored"
+        elif args.v2_5skill:
+            model_p_path = MODEL_P_5SK_FACTORED_PATH
+            pipeline_tag = "v2-5skill-factored"
+        else:
+            raise SystemExit(
+                "--arch factored requires --v2-5skill or --v3-5skill (the "
+                "factored ablation is only trained for the 5-skill pipelines)."
+            )
+        # FactoredModel splits state vs skill internally; total input is 116.
+        model_p = FactoredModel(state_dim=114, skill_dim=2, last_layer_activation=None)
+    elif args.v3_5skill:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = MODEL_P_5SK_V3_PATH
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
@@ -1039,35 +1080,49 @@ def main():
     )
     model1 = model2 = None
     if needs_q:
-        if args.v3_5skill:
-            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-            _sdim = V2_STATE_DIM
-            _q1_path = MODEL1_5SK_V3_PATH
-            _q2_path = MODEL2_5SK_V3_PATH
-        elif args.v2_5skill:
-            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-            _sdim = V2_STATE_DIM
-            _q1_path = MODEL1_5SK_V2_PATH
-            _q2_path = MODEL2_5SK_V2_PATH
-        elif args.v2:
-            from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-            _sdim = V2_STATE_DIM
-            _q1_path = MODEL1_V2_PATH
-            _q2_path = MODEL2_V2_PATH
+        # Architecture branch first: under --arch factored we construct
+        # FactoredModel and skip the SimpleModel construction below.
+        if args.arch == "factored":
+            if args.v3_5skill:
+                _q1_path = MODEL1_5SK_V3_FACTORED_PATH
+                _q2_path = MODEL2_5SK_V3_FACTORED_PATH
+            else:  # args.v2_5skill (the model_p branch above already enforced this)
+                _q1_path = MODEL1_5SK_FACTORED_PATH
+                _q2_path = MODEL2_5SK_FACTORED_PATH
+            model1 = FactoredModel(state_dim=114, skill_dim=2)
+            model2 = FactoredModel(state_dim=114, skill_dim=2)
         else:
-            _sdim = 116
-            _q1_path = MODEL1_5SK_PATH
-            _q2_path = MODEL2_5SK_PATH
-        model1 = SimpleModel(_sdim, [64, 32, 16], 1)
-        model2 = SimpleModel(_sdim, [64, 32, 16], 1)
+            if args.v3_5skill:
+                from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+                _sdim = V2_STATE_DIM
+                _q1_path = MODEL1_5SK_V3_PATH
+                _q2_path = MODEL2_5SK_V3_PATH
+            elif args.v2_5skill:
+                from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+                _sdim = V2_STATE_DIM
+                _q1_path = MODEL1_5SK_V2_PATH
+                _q2_path = MODEL2_5SK_V2_PATH
+            elif args.v2:
+                from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
+                _sdim = V2_STATE_DIM
+                _q1_path = MODEL1_V2_PATH
+                _q2_path = MODEL2_V2_PATH
+            else:
+                _sdim = 116
+                _q1_path = MODEL1_5SK_PATH
+                _q2_path = MODEL2_5SK_PATH
+            model1 = SimpleModel(_sdim, [64, 32, 16], 1)
+            model2 = SimpleModel(_sdim, [64, 32, 16], 1)
         model1.load_state_dict(_safe_load_state_dict(_q1_path))
         model2.load_state_dict(_safe_load_state_dict(_q2_path))
         model1.eval()
         model2.eval()
         print(f"  Loaded Q-models:    {_q1_path}, {_q2_path}")
 
-    # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it
-    if args.v3_5skill or args.v2_5skill or args.v2:
+    # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it.
+    # FactoredModel-5skill is trained on raw 116-dim obs, so it must NOT use
+    # the 76-dim encoder even under --v2-5skill / --v3-5skill.
+    if (args.v3_5skill or args.v2_5skill or args.v2) and args.arch != "factored":
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
 
         def _v2_state_encoder(obs, info, player):
