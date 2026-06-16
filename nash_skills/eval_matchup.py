@@ -1123,9 +1123,10 @@ def main():
         print(f"  Loaded Q-models:    {_q1_path}, {_q2_path}")
 
     # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it.
-    # FactoredModel-5skill is trained on raw 116-dim obs, so it must NOT use
-    # the 76-dim encoder even under --v2-5skill / --v3-5skill.
-    if (args.v3_5skill or args.v2_5skill or args.v2) and args.arch != "factored":
+    # After re-collecting 5-skill data via nash_skills/v2/collect_data.py, ALL
+    # v2/v3 models (simple AND factored) are trained on 76-dim encoded state,
+    # so all of them need the encoder at eval time.
+    if args.v3_5skill or args.v2_5skill or args.v2:
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
 
         def _v2_state_encoder(obs, info, player):
