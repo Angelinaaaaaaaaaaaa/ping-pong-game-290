@@ -45,11 +45,16 @@ def _swallow_step(env, action):
 
 
 def pick_baseline(name, rng):
+    """Returns pick_fn(opp_state, obs, info, ego_idx) -> skill_idx.
+
+    Extra args (obs, info, ego_idx) are ignored by simple baselines but used by
+    nash-p-hard/ibr-q wrappers built via make_picker.
+    """
     if name == "random":
-        return lambda s: rng.randint(0, N_SKILLS - 1)
+        return lambda s, o, i, e: rng.randint(0, N_SKILLS - 1)
     if name in SKILL_NAMES:
         idx = SKILL_NAMES.index(name)
-        return lambda s: idx
+        return lambda s, o, i, e: idx
     raise ValueError(f"Unknown baseline {name}")
 
 
@@ -86,7 +91,7 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
                 opp_state = encode_opp(obs, info)
                 with torch.no_grad():
                     ego_idx, _ = ego_policy.sample(ego_state, device)
-                opp_idx = opp_pick_fn(opp_state)
+                opp_idx = opp_pick_fn(opp_state, obs, info, ego_idx)
                 ego_skill_count[ego_idx] += 1
                 env.set_skills(skill_from_index(ego_idx), skill_from_index(opp_idx))
 
@@ -124,34 +129,100 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--baselines", nargs="+",
                         default=["random"] + list(SKILL_NAMES))
+    parser.add_argument("--vs-checkpoint", default=None,
+                        help="Path to another self-play policy checkpoint. "
+                             "If provided, ego (--checkpoint) plays against this opp. "
+                             "Overrides --baselines.")
+    parser.add_argument("--vs-label", default=None,
+                        help="Display label for --vs-checkpoint opp (defaults to filename stem)")
+    parser.add_argument("--vs-strategy", default=None,
+                        choices=["nash-p-hard", "nash-p-br", "nash-p-minimax",
+                                 "nash-p-adaptive", "ibr", "ibr-q"],
+                        help="Use a Phi/Q-based strategy from eval_matchup as opp.")
+    parser.add_argument("--phi-model", default="models/model_p_5skill_v3.pth",
+                        help="Path to potential Phi model (for Phi-based strategies)")
+    parser.add_argument("--q1-model", default="models/model1_5skill_v3.pth",
+                        help="Path to Q1 model (for ibr/ibr-q)")
+    parser.add_argument("--q2-model", default="models/model2_5skill_v3.pth",
+                        help="Path to Q2 model (for ibr/ibr-q)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     rng = random.Random(args.seed)
 
-    print(f"Loading policy from {args.checkpoint} ...")
+    print(f"Loading ego policy from {args.checkpoint} ...")
     policy = MetaPolicy().to(device)
     policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
     policy.eval()
+
+    # Build the list of (label, pick_fn) opponents
+    opponents = []
+    if args.vs_checkpoint:
+        print(f"Loading opp policy from {args.vs_checkpoint} ...")
+        opp_policy = MetaPolicy().to(device)
+        opp_policy.load_state_dict(torch.load(args.vs_checkpoint, map_location=device))
+        opp_policy.eval()
+        label = args.vs_label or os.path.splitext(os.path.basename(args.vs_checkpoint))[0]
+
+        def opp_pick(state_np, _obs, _info, _ego_idx, _opp_policy=opp_policy):
+            with torch.no_grad():
+                idx, _ = _opp_policy.sample(state_np, device)
+            return idx
+        opponents.append((label, opp_pick))
+    elif args.vs_strategy:
+        from model_arch import SimpleModel
+        from nash_skills.eval_matchup import make_picker
+
+        print(f"Loading Phi from {args.phi_model}")
+        phi = SimpleModel(76, [64, 32, 16], 1, last_layer_activation=None)
+        phi.load_state_dict(torch.load(args.phi_model, weights_only=True, map_location="cpu"))
+        phi.eval()
+
+        m1 = m2 = None
+        if args.vs_strategy in ("ibr", "ibr-q"):
+            print(f"Loading Q1 from {args.q1_model}")
+            m1 = SimpleModel(76, [64, 32, 16], 1)
+            m1.load_state_dict(torch.load(args.q1_model, weights_only=True, map_location="cpu"))
+            m1.eval()
+            print(f"Loading Q2 from {args.q2_model}")
+            m2 = SimpleModel(76, [64, 32, 16], 1)
+            m2.load_state_dict(torch.load(args.q2_model, weights_only=True, map_location="cpu"))
+            m2.eval()
+
+        def _state_enc(obs, info, player):
+            return encode_ego(obs, info) if player == 1 else encode_opp(obs, info)
+
+        nash_picker = make_picker(args.vs_strategy, model_p=phi,
+                                   state_encoder_fn=_state_enc,
+                                   model1=m1, model2=m2)
+
+        def opp_pick(_state_np, obs, info, ego_idx, _picker=nash_picker):
+            # Opp is player 2; ego_idx is the "other_skill_idx" from opp's view.
+            return int(_picker(2, obs, ego_idx, info))
+
+        opponents.append((args.vs_strategy, opp_pick))
+    else:
+        for opp_name in args.baselines:
+            opponents.append((opp_name, pick_baseline(opp_name, rng)))
 
     print(f"Loading PPO from {PPO_MODEL_PATH} (CPU) ...")
     ppo = PPO.load(PPO_MODEL_PATH, device="cpu")
 
     env = SkillEnv(proc_id=1, history=HISTORY)
 
-    print(f"\nEvaluating {args.rallies} rallies vs each baseline\n" + "=" * 100)
+    print(f"\nEvaluating {args.rallies} rallies vs each opponent\n" + "=" * 100)
     skill_short = [s[:5] for s in SKILL_NAMES]
-    header = (f"{'opp':<12} {'real_wr':>8} {'wins':>5} {'loss':>5} {'trunc':>6} "
+    label_w = max(12, max(len(lbl) for lbl, _ in opponents) + 2)
+    header = (f"{'opp':<{label_w}} {'real_wr':>8} {'wins':>5} {'loss':>5} {'trunc':>6} "
               f"{'trunc%':>7} {'avg_xs':>7}  ego skill %: "
               + " ".join(f"{s:>6}" for s in skill_short))
     print(header)
     print("-" * len(header))
 
-    for opp_name in args.baselines:
-        pick_fn = pick_baseline(opp_name, rng)
+    for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng)
         skill_str = " ".join(f"{p:>5.1%}" for p in r["skill_pct"])
-        print(f"{opp_name:<12} {r['real_wr']:>8.1%} "
+        print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
               f"{r['wins']:>5d} {r['losses']:>5d} {r['trunc']:>6d} "
               f"{r['trunc_rate']:>7.1%} {r['avg_xs']:>7.1f}  "
               f"             {skill_str}")
