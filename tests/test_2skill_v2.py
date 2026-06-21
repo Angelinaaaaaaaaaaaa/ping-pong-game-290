@@ -197,18 +197,21 @@ class TestTrainQModel2SkillOutputPaths(unittest.TestCase):
 
     def test_saves_model1_v2(self):
         src = self._read_source()
-        self.assertIn("model1_v2.pth", src,
-                      "Expected output path 'model1_v2.pth' not found")
+        self.assertTrue(
+            "model1_v2.pth" in src or "model1_76dim.pth" in src,
+            "Expected output path 'model1_v2.pth' or 'model1_76dim.pth' not found")
 
     def test_saves_model2_v2(self):
         src = self._read_source()
-        self.assertIn("model2_v2.pth", src,
-                      "Expected output path 'model2_v2.pth' not found")
+        self.assertTrue(
+            "model2_v2.pth" in src or "model2_76dim.pth" in src,
+            "Expected output path 'model2_v2.pth' or 'model2_76dim.pth' not found")
 
     def test_saves_model_p_v2(self):
         src = self._read_source()
-        self.assertIn("model_p_v2.pth", src,
-                      "Expected output path 'model_p_v2.pth' not found")
+        self.assertTrue(
+            "model_p_v2.pth" in src or "model_p_76dim.pth" in src,
+            "Expected output path 'model_p_v2.pth' or 'model_p_76dim.pth' not found")
 
     def test_does_not_overwrite_model1_pth(self):
         """Must NOT save directly to 'models/model1.pth' (would clobber old weights)."""

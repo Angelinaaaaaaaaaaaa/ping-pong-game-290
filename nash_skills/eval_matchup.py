@@ -296,23 +296,7 @@ def _infer_winner(obs, info):
     4. Last resort: ball position relative to the net only when the previous
        signals are unavailable or exactly ambiguous.
     """
-    #if isinstance(info, dict):
-    #    for key in ["winner", "point_winner", "episode_winner"]:
-    #        if key in info:
-    #            val = info[key]
-    #            if val in ("ego", 0, "player0", "p0", "left"):
-    #                return "ego"
-    #            if val in ("opp", 1, "player1", "p1", "right"):
-    #                return "opp"
-
-    #ball_vel_x = float(obs[39])
-    #if ball_vel_x > 0:
-    #    return "ego"
-    #elif ball_vel_x < 0:
-    #    return "opp"
-    #else:
-    #    return "opp"
-    #return infer_terminal_winner(obs, info, fallback="position") or "opp"
+    return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
 
 def _initial_skill_idx(name: str, fallback: int = 0) -> int:
@@ -466,7 +450,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             if player == 1:
                 action_scores = phi.min(dim=1).values   # worst opp response per ego skill
             else:
-                action_scores = -phi.max(dim=0).values  # worst ego response per opp skill
+                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
             return int(torch.argmax(action_scores).item())
         return pick_minimax
 
@@ -479,7 +463,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             if player == 1:
                 action_scores = phi.min(dim=1).values
             else:
-                action_scores = -phi.max(dim=0).values
+                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
             return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
         return pick_adaptive
 

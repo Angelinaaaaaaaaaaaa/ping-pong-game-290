@@ -225,7 +225,7 @@ class KukaTennisEnv(gym.Env):
     
     def update_target_racket_pose_opp(self,bounce_factor=1,table_z=0.56,g = -9.81,x_target=TABLE_SHIFT+1.37/2.,y_target=0.38,x_dis=-1.8+TABLE_SHIFT,z_dis=0.9,vx_dis=4.5,vy_dis=2.):
         # Get ball position and velocity
-        ball_pos = self.data.body('ball').xpos
+        ball_pos = self.data.body('ball').xpos.copy()
         ball_pos[1] = -ball_pos[1]
         ball_pos[0] = 2*TABLE_SHIFT - ball_pos[0]
         ball_vel = np.zeros((3,1))
@@ -480,7 +480,7 @@ class KukaTennisEnv(gym.Env):
         # self.reset_target()
         self.reset_ball_throw()
         self.ep_no += 1
-        if self.ep_no%200 == -1 :
+        if self.ep_no%200 == 0 :
             for i in range(7):
                 self.data.qpos[i] = np.random.uniform(-1.,1.)
             self.data.qpos[7] = np.random.uniform(-1.5,-0.5)
@@ -515,7 +515,7 @@ class KukaTennisEnv(gym.Env):
         end_effector_quat_opp = R.from_matrix(end_effector_rot_opp).as_quat()
         diff_pos_opp = self.curr_target_opp[:3] - end_effector_pos_opp
         r_current = R.from_quat(end_effector_quat_opp)
-        r_target = R.from_quat(self.curr_target[3:7])
+        r_target = R.from_quat(self.curr_target_opp[3:7])
         diff_quat_opp = r_target*r_current.inv()
         diff_quat_opp = diff_quat_opp.as_quat()
         

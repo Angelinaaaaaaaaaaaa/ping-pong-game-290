@@ -534,6 +534,7 @@ VALID_STRATEGIES_2SKILL = [
     "nash-p-minimax",
     "nash-p-adaptive",
     "nash-p-br",
+    "nash-p-2skill",
     "ibr",
     "random",
     "left",
@@ -640,13 +641,13 @@ def make_picker_2skill(
       'nash-p-adaptive-2skill' -> adaptive minimax-style selection using model_p
     """
     if strategy == "left":
-        return lambda player, obs, info, other: 0
+        return lambda player, obs, info=None, other=0: 0
 
     if strategy == "right":
-        return lambda player, obs, info, other: 1
+        return lambda player, obs, info=None, other=0: 1
 
     if strategy == "random":
-        return lambda player, obs, info, other: np.random.randint(N_SKILLS_2)
+        return lambda player, obs, info=None, other=0: np.random.randint(N_SKILLS_2)
 
     if strategy == "ibr":
         if model1 is None or model2 is None:
@@ -850,6 +851,43 @@ def make_picker_2skill(
 
         return pick_nash_adaptive
 
+    # ------------------------------------------------------------------ #
+    # nash-p-2skill: argmax over the 2-skill potential (alias for hard)   #
+    # ------------------------------------------------------------------ #
+    if strategy == "nash-p-2skill":
+        _sk_enc = {0: -1.0, 1: 1.0}
+        _use_76 = (model_state_dim == _STATE_DIM_76)
+
+        def pick_nash_2skill(player, obs_vec, info=None, other_idx=0):
+            if _use_76 and info is not None:
+                base_np = encode_ego(obs_vec, info)
+            else:
+                base_np = obs_vec.copy()
+
+            base = torch.tensor(base_np, dtype=torch.float32)
+            rows = []
+            for ego_s in range(N_SKILLS_2):
+                for opp_s in range(N_SKILLS_2):
+                    row = base.clone()
+                    row[-2] = _sk_enc[ego_s]
+                    row[-1] = _sk_enc[opp_s]
+                    rows.append(row)
+            batch = torch.stack(rows)
+            with torch.no_grad():
+                vals = model_p(batch)[:, 0]
+            phi = vals.reshape(N_SKILLS_2, N_SKILLS_2)
+            if player == 1:
+                # Joint argmax of Φ — optimistic ego strategy
+                best = int(phi.argmax().item())
+                return best // N_SKILLS_2
+            else:
+                # Player 2 minimises ego utility: pick opp skill whose worst-case
+                # (over ego actions) Φ is smallest — minimax for the adversary
+                action_scores = phi.min(dim=0).values
+                return int(torch.argmax(action_scores).item())
+
+        return pick_nash_2skill
+
     raise ValueError(
         f"Unknown 2-skill strategy '{strategy}'. "
         f"Choose from: {VALID_STRATEGIES_2SKILL}"
@@ -946,10 +984,10 @@ def run_matchup_2skill(
     strategy2: str,
     ppo,
     model_p,
-    model1,
-    model2,
     n_episodes: int,
-    max_steps_per_episode: int,
+    max_steps_per_episode: int = 500,
+    model1=None,
+    model2=None,
     warmup_steps: int = 300,
     max_total_steps: int | None = None,
     debug_contacts: bool = False,
@@ -962,8 +1000,8 @@ def run_matchup_2skill(
     completed episodes regardless of episode length.
 
     Truncated episodes (hit per-episode step cap without env done=True) are
-    counted toward n_episodes but recorded separately in truncated_episodes;
-    they do NOT contribute a win or loss.
+    NOT counted toward n_episodes; they are tracked separately in
+    truncated_episodes and do not contribute a win or loss.
 
     The optional max_total_steps is kept as an absolute safety valve only —
     the primary termination condition is `completed_episodes == n_episodes`.
@@ -1107,9 +1145,8 @@ def run_matchup_2skill(
         # and would dilute the win_rate to near zero for stable-opponent matchups.
         if steps_in_episode >= max_steps_per_episode:
             truncated_episodes += 1
-            # Still track rally length and steps for diagnostics
-            rally_lengths.append(curr_rally_len)
-            episode_steps.append(steps_in_episode)
+            # Do NOT append to rally_lengths / episode_steps — truncated episodes
+            # have no winner and would skew avg_rally_length vs. the 5-skill evaluator.
 
             curr_rally_len = 0
             steps_in_episode = 0

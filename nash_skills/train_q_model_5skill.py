@@ -158,6 +158,7 @@ model_p = SimpleModel(X.shape[1], [64, 32, 16], 1, last_layer_activation=None)
 model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
 model_p.batch_norm.running_var  = model1.batch_norm.running_var.clone()
 model_p.batch_norm.momentum = 0.0
+model_p.eval()
 
 opt_p = torch.optim.Adam(model_p.parameters(), lr=0.001)
 scheduler_p = torch.optim.lr_scheduler.CosineAnnealingLR(opt_p, T_max=N_EPOCHS, eta_min=1e-5)

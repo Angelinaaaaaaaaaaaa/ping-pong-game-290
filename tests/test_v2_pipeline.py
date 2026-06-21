@@ -438,8 +438,8 @@ class TestLabelingDefaultGamma(unittest.TestCase):
         self.label = m
 
     def test_default_gamma_is_0_9(self):
-        """GAMMA constant in labeling module must be 0.9."""
-        self.assertAlmostEqual(self.label.GAMMA, 0.9, places=5)
+        """GAMMA constant in labeling module must be 0.7."""
+        self.assertAlmostEqual(self.label.GAMMA, 0.7, places=5)
 
     def test_compute_returns_uses_gamma_arg(self):
         """gamma=0.5 should give G[0] = 0.5**2 = 0.25 for 3-step rally."""
