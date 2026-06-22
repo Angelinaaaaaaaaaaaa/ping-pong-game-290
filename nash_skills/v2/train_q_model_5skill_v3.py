@@ -31,6 +31,7 @@ from model_arch import SimpleModel
 from nash_skills.skills import N_SKILLS
 from nash_skills.v2.labeling import compute_returns, check_balance, GAMMA
 from nash_skills.v2.state_encoder import STATE_DIM
+from nash_skills.v2.augment import augment_with_flip
 
 # --------------------------------------------------------------------------- #
 # Config                                                                       #
@@ -90,8 +91,12 @@ def sample_base_batch(x: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 def train(rally_path: str, n_epochs: int, lr: float) -> None:
     print(f"Loading {rally_path} ...")
-    rallies = pkl.load(open(rally_path, "rb"))
+    with open(rally_path, "rb") as f:
+        rallies = pkl.load(f)
     print(f"  {len(rallies)} rallies loaded")
+
+    rallies = augment_with_flip(rallies)
+    print(f"  {len(rallies)} rallies after flip augmentation")
 
     is_ok, ratio = check_balance(rallies, threshold=5.0)
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
