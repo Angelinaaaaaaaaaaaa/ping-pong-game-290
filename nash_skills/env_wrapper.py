@@ -18,9 +18,8 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import numpy as np
 from mujoco_env_comp import KukaTennisEnv
-from nash_skills.skills import get_skill, SKILL_NAMES
+from nash_skills.skills import get_skill, SKILL_NAMES, N_SKILLS, skill_index
 
 
 class SkillEnv:
@@ -65,6 +64,15 @@ class SkillEnv:
         self._x_target1 = x1
         self._x_target2 = x2
 
+    def _skill_value(self, skill: str) -> float:
+        return skill_index(skill) / (N_SKILLS - 1)
+
+    def _encode_obs_skills(self, obs):
+        obs = obs.copy()
+        obs[-2] = self._skill_value(self._skill1)
+        obs[-1] = self._skill_value(self._skill2)
+        return obs
+
     # ------------------------------------------------------------------ #
     # Gym-style interface (delegates to inner env)                         #
     # ------------------------------------------------------------------ #
@@ -72,14 +80,7 @@ class SkillEnv:
     def reset(self, seed=None):
         obs, info = self._env.reset(seed=seed)
         self._apply_skills()   # re-sync after reset randomises side_target
-        # Patch obs[-2:] so the returned observation reflects the current skill,
-        # not the stale randomised side_target written by reset_ball_throw().
-        obs = obs.copy()
-        side1, _ = get_skill(self._skill1)
-        side2, _ = get_skill(self._skill2)
-        obs[-2] = side1
-        obs[-1] = side2
-        return obs, info
+        return self._encode_obs_skills(obs), info
 
     def step(self, action):
         # Sync skill targets into the inner env before it runs
@@ -112,7 +113,8 @@ class SkillEnv:
             self._env.update_target_racket_pose     = original_update
             self._env.update_target_racket_pose_opp = original_update_opp
 
-        return result
+        obs, reward, done, truncated, info = result
+        return self._encode_obs_skills(obs), reward, done, truncated, info
 
     def render(self, mode="human"):
         return self._env.render(mode)

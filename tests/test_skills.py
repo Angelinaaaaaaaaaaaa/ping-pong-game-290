@@ -440,6 +440,60 @@ class TestSkillEnv(unittest.TestCase):
         self.assertAlmostEqual(mock._last_update_kwargs["x_target"], x_short)
 
 
+class TestSkillEnvObservationEncoding(unittest.TestCase):
+    """Actual SkillEnv must expose normalized 5-skill ids in obs[-2:]."""
+
+    def _make(self):
+        from unittest.mock import patch
+        if "mujoco_env_comp" not in sys.modules:
+            fake_module = types.ModuleType("mujoco_env_comp")
+            fake_module.KukaTennisEnv = lambda *args, **kwargs: _make_mock_env()
+            sys.modules["mujoco_env_comp"] = fake_module
+            self.addCleanup(lambda: sys.modules.pop("mujoco_env_comp", None))
+
+        from nash_skills.env_wrapper import SkillEnv
+
+        mock = _make_mock_env()
+        patcher = patch("nash_skills.env_wrapper.KukaTennisEnv", return_value=mock)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        return SkillEnv(proc_id=1, history=4), mock
+
+    def _norm(self, skill_name):
+        from nash_skills.skills import N_SKILLS, skill_index
+        return skill_index(skill_name) / (N_SKILLS - 1)
+
+    def test_reset_returns_normalized_skill_ids_for_all_five_skills(self):
+        from nash_skills.skills import SKILL_NAMES, get_skill
+
+        env, mock = self._make()
+        seen = []
+        for skill in SKILL_NAMES:
+            env.set_skills(skill, "right")
+            obs, _ = env.reset()
+            seen.append(float(obs[-2]))
+
+            expected_side, _ = get_skill(skill)
+            self.assertAlmostEqual(mock.side_target, expected_side)
+            self.assertAlmostEqual(float(obs[-2]), self._norm(skill))
+            self.assertAlmostEqual(float(obs[-1]), self._norm("right"))
+
+        self.assertEqual(seen, [0.0, 0.25, 0.5, 0.75, 1.0])
+
+    def test_step_returns_normalized_agent1_and_agent2_skill_ids(self):
+        from nash_skills.skills import SKILL_NAMES
+
+        env, _ = self._make()
+        for skill1 in SKILL_NAMES:
+            for skill2 in SKILL_NAMES:
+                env.set_skills(skill1, skill2)
+                obs, _reward, _done, _truncated, _info = env.step(np.zeros(18))
+                self.assertAlmostEqual(float(obs[-2]), self._norm(skill1),
+                                       msg=f"agent1={skill1}, agent2={skill2}")
+                self.assertAlmostEqual(float(obs[-1]), self._norm(skill2),
+                                       msg=f"agent1={skill1}, agent2={skill2}")
+
+
 # =========================================================================== #
 # 3. Observation preprocessing (from train_q_model_5skill logic)              #
 # =========================================================================== #
