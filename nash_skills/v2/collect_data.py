@@ -16,12 +16,12 @@ OLD (bugs / design flaws):
     → The v2 pipeline uses a richer 76-dim encoded state via state_encoder.py.
 
 NEW design:
-  - Collect exactly TARGET_RALLIES_PER_COMBO complete rallies per skill pair.
+  - Collect exactly TARGET_RALLIES complete rallies per skill pair.
     This guarantees a balanced dataset regardless of rally length.
   - Store both the encoded state (76-dim) and the raw obs (116-dim, for inspection).
-  - Record winner (1/2/0) and the done flag at episode end.
+  - Record winner (1/2) at episode end; discard truncated episodes.
   - Print a balance summary after collection.
-  - Cap maximum rallies per episode to avoid degenerate infinite rallies.
+  - Cap maximum steps per episode to avoid degenerate infinite rallies.
 
 Output format (pickle list of dicts)
 --------------------------------------
@@ -31,13 +31,15 @@ Each entry:
         'skill2' : str,                  # opp skill name
         'states' : list[np.ndarray],     # encoded states, shape (76,) each
         'raw_obs': list[np.ndarray],     # raw 116-dim obs (for debugging)
-        'winner' : int,                  # 1=ego, 2=opp, 0=truncated
+        'winner' : int,                  # 1=ego, 2=opp (truncated episodes discarded)
     }
 
 Run:
-    MUJOCO_GL=cgl venv/bin/python nash_skills/v2/collect_data.py
-    MUJOCO_GL=cgl venv/bin/python nash_skills/v2/collect_data.py \
-        --rallies 50 --output data/rallies_v2.pkl
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
+        venv/bin/python nash_skills/v2/collect_data.py
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
+        venv/bin/python nash_skills/v2/collect_data.py \
+        --rallies 50 --output data/rallies_5skill_v2.pkl
 """
 
 import sys
@@ -47,6 +49,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import argparse
 import itertools
 import pickle as pkl
+import time
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -60,7 +63,7 @@ from nash_skills.v2.labeling import detect_winner, summarise_balance, check_bala
 # Defaults                                                                     #
 # --------------------------------------------------------------------------- #
 PPO_MODEL_PATH        = "logs/best_model_tracker1/best_model"
-DEFAULT_OUTPUT        = "data/rallies_v2.pkl"
+DEFAULT_OUTPUT        = "data/rallies_5skill_v2.pkl"
 TARGET_RALLIES        = 50    # rallies per skill pair (25 pairs → 1250 total)
 MAX_STEPS_PER_EPISODE = 800   # step cap per episode (headless, no real-time)
 HISTORY               = 4
@@ -92,6 +95,9 @@ def collect(
     target_rallies: int = TARGET_RALLIES,
     output_path: str = DEFAULT_OUTPUT,
     ppo_path: str = PPO_MODEL_PATH,
+    max_steps_per_episode: int = MAX_STEPS_PER_EPISODE,
+    max_attempts_per_pair: int | None = None,
+    progress_every: int = 10,
 ) -> list:
     """
     Collect `target_rallies` complete rallies for each of the 25 skill pairs.
@@ -102,22 +108,32 @@ def collect(
     model = PPO.load(ppo_path)
 
     all_rallies = []
+    pair_summaries = []
+    incomplete_pairs = []
 
     for skill1, skill2 in itertools.product(SKILL_NAMES, SKILL_NAMES):
-        print(f"\n=== Collecting: ego={skill1}  opp={skill2} ===")
+        print(f"\n=== Collecting: ego={skill1}  opp={skill2} ===", flush=True)
         env.set_skills(skill1, skill2)
         obs, info = env.reset()
 
         completed = 0
+        attempts = 0
+        discarded = 0
         steps_this_combo = 0
+        steps_completed_attempts = 0
         prev_ball_x = obs[36]
+        pair_start_time = time.monotonic()
+        last_reason = "not-started"
+        last_winner = None
 
         # Per-episode state
         curr_states  = []   # encoded (76-dim)
         curr_raw     = []   # raw obs (116-dim)
         steps_in_ep  = 0
 
-        while completed < target_rallies:
+        while completed < target_rallies and (
+            max_attempts_per_pair is None or attempts < max_attempts_per_pair
+        ):
             # Build PPO obs for each player and act
             ppo1 = _build_ppo_obs(obs, info, player=1)
             ppo2 = _build_ppo_obs(obs, info, player=2)
@@ -141,11 +157,14 @@ def collect(
 
             prev_ball_x = curr_ball_x
 
-            # Episode ended (done) or step-capped (truncated)
-            if done or steps_in_ep >= MAX_STEPS_PER_EPISODE:
-                terminal_raw = curr_raw + [obs.copy()] if done else curr_raw
-                winner = detect_winner(terminal_raw, done=done, info=info)
-                if len(curr_states) > 0:
+            # Only completed rallies provide useful discounted-return labels.
+            if done:
+                terminal_raw = curr_raw + [obs.copy()]
+                winner = detect_winner(terminal_raw, done=True, info=info)
+                attempts += 1
+                steps_completed_attempts += steps_in_ep
+                last_winner = winner
+                if len(curr_states) > 0 and winner in (1, 2):
                     all_rallies.append({
                         "skill1":  skill1,
                         "skill2":  skill2,
@@ -154,9 +173,28 @@ def collect(
                         "winner":  winner,
                     })
                     completed += 1
+                    last_reason = "accepted-done"
                     if completed % 10 == 0:
                         print(f"  {completed}/{target_rallies} rallies  "
-                              f"({steps_this_combo} steps so far)")
+                              f"({steps_this_combo} steps so far)", flush=True)
+                else:
+                    discarded += 1
+                    if len(curr_states) == 0:
+                        last_reason = "discarded-done-no-crossing"
+                    else:
+                        last_reason = "discarded-done-inconclusive"
+
+                if progress_every > 0 and attempts % progress_every == 0:
+                    elapsed = time.monotonic() - pair_start_time
+                    avg_steps = steps_completed_attempts / attempts
+                    print(
+                        f"  progress ego={skill1} opp={skill2} "
+                        f"attempts={attempts} accepted={completed}/{target_rallies} "
+                        f"discarded={discarded} elapsed={elapsed:.1f}s "
+                        f"avg_steps/attempt={avg_steps:.1f} "
+                        f"last={last_reason} winner={last_winner}",
+                        flush=True,
+                    )
 
                 # Reset for next episode
                 curr_states = []
@@ -166,8 +204,57 @@ def collect(
                 obs, info = env.reset()
                 prev_ball_x = obs[36]
 
-        print(f"  Done: {completed} rallies collected "
-              f"({steps_this_combo} total steps)")
+            # Discard step-capped episodes instead of saving winner=0 labels.
+            elif steps_in_ep >= max_steps_per_episode:
+                attempts += 1
+                discarded += 1
+                steps_completed_attempts += steps_in_ep
+                last_reason = "discarded-step-cap"
+                last_winner = 0
+
+                if progress_every > 0 and attempts % progress_every == 0:
+                    elapsed = time.monotonic() - pair_start_time
+                    avg_steps = steps_completed_attempts / attempts
+                    print(
+                        f"  progress ego={skill1} opp={skill2} "
+                        f"attempts={attempts} accepted={completed}/{target_rallies} "
+                        f"discarded={discarded} elapsed={elapsed:.1f}s "
+                        f"avg_steps/attempt={avg_steps:.1f} "
+                        f"last={last_reason} winner={last_winner}",
+                        flush=True,
+                    )
+
+                curr_states = []
+                curr_raw = []
+                steps_in_ep = 0
+                env.set_skills(skill1, skill2)
+                obs, info = env.reset()
+                prev_ball_x = obs[36]
+
+        elapsed = time.monotonic() - pair_start_time
+        avg_steps = steps_completed_attempts / attempts if attempts else 0.0
+        summary = {
+            "skill1": skill1,
+            "skill2": skill2,
+            "attempts": attempts,
+            "accepted": completed,
+            "discarded": discarded,
+            "elapsed": elapsed,
+            "avg_steps_per_attempt": avg_steps,
+            "last_reason": last_reason,
+            "last_winner": last_winner,
+        }
+        pair_summaries.append(summary)
+        if completed < target_rallies:
+            incomplete_pairs.append((skill1, skill2))
+        print(
+            f"  Summary ego={skill1} opp={skill2}: "
+            f"attempts={attempts} accepted={completed}/{target_rallies} "
+            f"discarded={discarded} elapsed={elapsed:.1f}s "
+            f"avg_steps/attempt={avg_steps:.1f} "
+            f"last={last_reason} winner={last_winner}",
+            flush=True,
+        )
 
     env.close()
 
@@ -176,6 +263,25 @@ def collect(
     with open(output_path, "wb") as f:
         pkl.dump(all_rallies, f)
     print(f"\nSaved {len(all_rallies)} rallies to {output_path}")
+
+    print("\nDiagnostic pair summary:")
+    for s in pair_summaries:
+        print(
+            f"  {s['skill1']:12s} vs {s['skill2']:12s}: "
+            f"attempts={s['attempts']:4d} accepted={s['accepted']:4d} "
+            f"discarded={s['discarded']:4d} elapsed={s['elapsed']:.1f}s "
+            f"avg_steps/attempt={s['avg_steps_per_attempt']:.1f} "
+            f"last={s['last_reason']} winner={s['last_winner']}"
+        )
+
+    if incomplete_pairs:
+        print(
+            "\nWARNING: incomplete collection. "
+            "This output is diagnostic/smoke-test data, not a valid full dataset."
+        )
+        print("Incomplete pairs:")
+        for skill1, skill2 in incomplete_pairs:
+            print(f"  {skill1:12s} vs {skill2:12s}")
 
     # Balance report
     counts = summarise_balance(all_rallies)
@@ -203,10 +309,19 @@ if __name__ == "__main__":
                         help=f"Output pickle path (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--ppo",     type=str, default=PPO_MODEL_PATH,
                         help="Path to PPO model checkpoint")
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS_PER_EPISODE,
+                        help=f"Maximum steps per rally attempt (default: {MAX_STEPS_PER_EPISODE})")
+    parser.add_argument("--max-attempts-per-pair", type=int, default=None,
+                        help="Stop each skill pair after this many attempts, even if target rallies are not reached")
+    parser.add_argument("--progress-every", type=int, default=10,
+                        help="Print progress every N completed attempts per skill pair; <=0 disables attempt progress")
     args = parser.parse_args()
 
     collect(
         target_rallies=args.rallies,
         output_path=args.output,
         ppo_path=args.ppo,
+        max_steps_per_episode=args.max_steps,
+        max_attempts_per_pair=args.max_attempts_per_pair,
+        progress_every=args.progress_every,
     )
