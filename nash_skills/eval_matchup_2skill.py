@@ -581,9 +581,9 @@ _SIDE_TARGETS = {
 class _TwoSkillEnv:
     """Thin wrapper around the original competition env for 2-skill evaluation."""
 
-    def __init__(self, proc_id=1):
+    def __init__(self, proc_id=1, reset_mode="clean"):
         from mujoco_env_comp import KukaTennisEnv
-        self._env = KukaTennisEnv(proc_id=proc_id)
+        self._env = KukaTennisEnv(proc_id=proc_id, reset_mode=reset_mode)
         self._side1 = -1.0
         self._side2 =  1.0
 
@@ -994,6 +994,7 @@ def run_matchup_2skill(
     model_state_dim: int = 116,
     tau: float = 0.2,
     confidence_margin: float = 0.05,
+    reset_mode: str = "clean",
 ) -> MatchupResult:
     """
     Run one 2-skill matchup headlessly, guaranteeing exactly n_episodes
@@ -1016,7 +1017,7 @@ def run_matchup_2skill(
         strategy2, model_p, model_state_dim, model1, model2, tau, confidence_margin
     )
 
-    env = _TwoSkillEnv(proc_id=1)
+    env = _TwoSkillEnv(proc_id=1, reset_mode=reset_mode)
 
     # Start from left vs right
     curr_idx1 = 0
@@ -1287,6 +1288,7 @@ def main():
         default=3,
         help="Number of consecutive seeds to evaluate, starting at --seed (default: 3, so seeds 0..2)",
     )
+    parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
@@ -1395,6 +1397,7 @@ def main():
                 model_state_dim=state_dim,
                 tau=args.tau,
                 confidence_margin=args.confidence_margin,
+                reset_mode=args.reset_mode,
             )
             current_results.append(r)
             seed_results.append({"seed": seed, "matchup_seed": matchup_seed, "result": r})
