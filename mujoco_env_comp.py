@@ -8,9 +8,50 @@ import gymnasium as gym
 from scipy.spatial.transform import Rotation as R
 
 TABLE_SHIFT = 1.5
+TABLE_HALF_WIDTH = 0.7625
+TERMINAL_X_MARGIN = 0.3
+TERMINAL_LATERAL_MARGIN = 0.5
+HOME_GANTRY_X = -0.75
+HOME_GANTRY_Y = 0.0
+READY_GANTRY_X = -0.5
+READY_GANTRY_Y = 0.0
+READY_ARM_QPOS = np.array([
+    -0.066619,
+    0.260344,
+    0.195799,
+    -0.108022,
+    -0.115086,
+    -0.293993,
+    0.076169,
+])
 target_point = np.array([TABLE_SHIFT+1.37/2.,0.38,0.56])
 t_shift = 0.12
 DT = 0.01
+
+
+def infer_terminal_state(ball_pos, ball_vel, ego_racket_x, opp_racket_x):
+    """Return (done, winner, reason) for terminal ball states."""
+    ball_pos = np.asarray(ball_pos, dtype=float)
+    ball_vel = np.asarray(ball_vel, dtype=float)
+
+    if ball_pos[0] < ego_racket_x - TERMINAL_X_MARGIN:
+        return True, "opp", "ball_past_ego_racket"
+    if ball_pos[0] > opp_racket_x + TERMINAL_X_MARGIN:
+        return True, "ego", "ball_past_opp_racket"
+
+    lateral_limit = TABLE_HALF_WIDTH + TERMINAL_LATERAL_MARGIN
+    if abs(ball_pos[1]) > lateral_limit:
+        if ball_vel[0] > 0:
+            return True, "opp", "ball_lateral_out_toward_opp"
+        if ball_vel[0] < 0:
+            return True, "ego", "ball_lateral_out_toward_ego"
+        if ball_pos[0] >= TABLE_SHIFT:
+            return True, "opp", "ball_lateral_out_on_opp_side"
+        return True, "ego", "ball_lateral_out_on_ego_side"
+
+    return False, None, None
+
+
 # MuJoCo XML definition with Franka Panda robot and table tennis setup
 xml = """
 <mujoco model="table_tennis">
@@ -55,8 +96,16 @@ xml = """
 """
 
 class KukaTennisEnv(gym.Env):
-    def __init__(self,proc_id=0,history=4):
+    def __init__(self,proc_id=0,history=4,reset_mode="clean",gantry_speed_scale=1.0):
         super(KukaTennisEnv, self).__init__()
+        if reset_mode == "ready":
+            reset_mode = "clean"
+        if reset_mode not in {"clean", "clean_home", "carryover"}:
+            raise ValueError("reset_mode must be 'clean'/'ready', 'clean_home', or 'carryover'")
+        if gantry_speed_scale <= 0:
+            raise ValueError("gantry_speed_scale must be positive")
+        self.reset_mode = reset_mode
+        self.gantry_speed_scale = float(gantry_speed_scale)
         self.history = history  
         # Load the MuJoCo model
         self.model = mj.MjModel.from_xml_string(xml)  # Use your actual MuJoCo XML path
@@ -99,6 +148,68 @@ class KukaTennisEnv(gym.Env):
         pose[3:] = q
         self.set_target_pose(pose)    
         self.set_target_pose_opp(pose)    
+
+    def _reset_robots_to_home_pose(self):
+        """Reset both robots to the previous clean all-zero arm home stance."""
+        self.data.qpos[:18] = self.model.qpos0[:18]
+        self.data.qvel[:18] = 0.0
+
+        self.data.qpos[0] = HOME_GANTRY_X
+        self.data.qpos[1] = HOME_GANTRY_Y
+        self.data.qpos[9] = HOME_GANTRY_X
+        self.data.qpos[10] = HOME_GANTRY_Y
+
+        self.data.ctrl[:7] = self.data.qpos[2:9]
+        self.data.ctrl[7:14] = self.data.qpos[11:18]
+
+    def _reset_robots_to_ready_pose(self):
+        """Reset both robots to a mirrored receiving stance before a new rally."""
+        self.data.qpos[:18] = self.model.qpos0[:18]
+        self.data.qvel[:18] = 0.0
+
+        self.data.qpos[0] = READY_GANTRY_X
+        self.data.qpos[1] = READY_GANTRY_Y
+        self.data.qpos[9] = READY_GANTRY_X
+        self.data.qpos[10] = READY_GANTRY_Y
+        self.data.qpos[2:9] = READY_ARM_QPOS
+        self.data.qpos[11:18] = READY_ARM_QPOS
+
+        self.data.ctrl[:7] = self.data.qpos[2:9]
+        self.data.ctrl[7:14] = self.data.qpos[11:18]
+
+    def _apply_legacy_carryover_reset(self, prev_robot_pos, prev_robot_pos_opp):
+        if self.ep_no % 200 == 0:
+            for i in range(7):
+                self.data.qpos[i] = np.random.uniform(-1.,1.)
+            self.data.qpos[7] = np.random.uniform(-1.5,-0.5)
+            self.data.qpos[8] = np.random.uniform(-1.,1.)
+            for i in range(7):
+                self.data.qpos[9+i] = np.random.uniform(-1.,1.)
+            self.data.qpos[16] = np.random.uniform(-1.5,-0.5)
+            self.data.qpos[17] = np.random.uniform(-1.,1.)
+        else:
+            self.data.qpos[:9] = prev_robot_pos
+            self.data.qpos[9:18] = prev_robot_pos_opp
+
+    def get_initial_state_log(self):
+        p1_racket = np.asarray(self.data.body('tennis_racket').xpos, dtype=float).copy()
+        p2_racket = np.asarray(self.data.body('tennis_racket_opp').xpos, dtype=float).copy()
+        p2_racket_mirrored = p2_racket.copy()
+        p2_racket_mirrored[0] = 2 * TABLE_SHIFT - p2_racket_mirrored[0]
+        p2_racket_mirrored[1] = -p2_racket_mirrored[1]
+        return {
+            "reset_mode": self.reset_mode,
+            "p1_gantry": np.asarray(self.data.qpos[0:2], dtype=float).copy(),
+            "p2_gantry": np.asarray(self.data.qpos[9:11], dtype=float).copy(),
+            "p1_joints": np.asarray(self.data.qpos[2:9], dtype=float).copy(),
+            "p2_joints": np.asarray(self.data.qpos[11:18], dtype=float).copy(),
+            "p1_racket": p1_racket,
+            "p2_racket": p2_racket,
+            "p2_racket_mirrored": p2_racket_mirrored,
+            "racket_mirror_error": p1_racket - p2_racket_mirrored,
+            "ball_position": np.asarray(self.data.body('ball').xpos, dtype=float).copy(),
+            "ball_velocity": np.asarray(self.data.qvel[-6:-3], dtype=float).copy(),
+        }
         
     def set_target_pose(self,pose):
         self.curr_target = pose
@@ -315,13 +426,14 @@ class KukaTennisEnv(gym.Env):
         self.data.ctrl[:7] = np.array(action[2:9])/10. + np.array(self.data.qpos[2:9])
         self.data.ctrl[7:14] = np.array(action[11:18])/10. + np.array(self.data.qpos[11:18])
         
-        self.data.qpos[0] += 10*action[0]/1000.
-        self.data.qpos[1] += 10*action[1]/1000.
+        gantry_step = self.gantry_speed_scale * 10.0 / 1000.0
+        self.data.qpos[0] += gantry_step * action[0]
+        self.data.qpos[1] += gantry_step * action[1]
         self.data.qpos[0] = np.clip(self.data.qpos[0],-1.,-0.5)
         self.data.qpos[1] = np.clip(self.data.qpos[1],-1.,1.)
         
-        self.data.qpos[9] += 10*action[9]/1000.
-        self.data.qpos[10] += 10*action[10]/1000.
+        self.data.qpos[9] += gantry_step * action[9]
+        self.data.qpos[10] += gantry_step * action[10]
         self.data.qpos[9] = np.clip(self.data.qpos[9],-1.,-0.5)
         self.data.qpos[10] = np.clip(self.data.qpos[10],-1.,1.)
         self.update_target_racket_pose(y_target=self.side_target*0.38)
@@ -393,16 +505,13 @@ class KukaTennisEnv(gym.Env):
         racket_pos = np.array(self.data.body('tennis_racket').xpos)
         racket_pos_opp = np.array(self.data.body('tennis_racket_opp').xpos)
         ball_pos = np.array(self.data.body('ball').xpos)
-        winner = None
-        termination_reason = None
-        if ball_pos[0] < racket_pos[0] - 0.3:
-            done = True
-            winner = "opp"
-            termination_reason = "ball_past_ego_racket"
-        elif ball_pos[0] > racket_pos_opp[0] + 0.3:
-            done = True
-            winner = "ego"
-            termination_reason = "ball_past_opp_racket"
+        ball_vel = np.array(self.data.qvel[-6:-3])
+        done, winner, termination_reason = infer_terminal_state(
+            ball_pos,
+            ball_vel,
+            racket_pos[0],
+            racket_pos_opp[0],
+        )
         # reward, done_ = self._calculate_reward()
         # if done_ :
         #     done = True
@@ -443,6 +552,11 @@ class KukaTennisEnv(gym.Env):
                 'winner': winner,
                 'termination_reason': termination_reason,
                 'ball_x': float(ball_pos[0]),
+                'ball_y': float(ball_pos[1]),
+                'ball_z': float(ball_pos[2]),
+                'ball_vx': float(ball_vel[0]),
+                'ball_vy': float(ball_vel[1]),
+                'ball_vz': float(ball_vel[2]),
                 'ego_racket_x': float(racket_pos[0]),
                 'opp_racket_x': float(racket_pos_opp[0]),
             })
@@ -478,24 +592,19 @@ class KukaTennisEnv(gym.Env):
         prev_robot_pos_opp = np.array(self.data.qpos[9:18])
         mj.mj_resetData(self.model, self.data)
         # self.reset_target()
-        self.reset_ball_throw()
         self.ep_no += 1
-        if self.ep_no%200 == 0 :
-            for i in range(7):
-                self.data.qpos[i] = np.random.uniform(-1.,1.)
-            self.data.qpos[7] = np.random.uniform(-1.5,-0.5)
-            self.data.qpos[8] = np.random.uniform(-1.,1.)
-            for i in range(7):
-                self.data.qpos[9+i] = np.random.uniform(-1.,1.)
-            self.data.qpos[16] = np.random.uniform(-1.5,-0.5)
-            self.data.qpos[17] = np.random.uniform(-1.,1.)
-        else :
-            self.data.qpos[:9] = prev_robot_pos
-            self.data.qpos[9:18] = prev_robot_pos_opp
+        if self.reset_mode == "carryover":
+            self._apply_legacy_carryover_reset(prev_robot_pos, prev_robot_pos_opp)
+        elif self.reset_mode == "clean_home":
+            self._reset_robots_to_home_pose()
+        else:
+            self._reset_robots_to_ready_pose()
+        self.reset_ball_throw()
 
         # target_geom_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, 'vis')
         # print(self.data.geom_xpos[target_geom_id])
         mj.mj_forward(self.model, self.data)
+        initial_state = self.get_initial_state_log()
         # print(self.data.geom_xpos[target_geom_id])
         # self.prev_reward, _ = self._calculate_reward()
         # print(end_effector_pos)
@@ -523,7 +632,7 @@ class KukaTennisEnv(gym.Env):
         obs = np.float32(np.concatenate([self.data.qpos[:18], self.data.qvel[:18],self.data.body('ball').xpos,self.data.qvel[-6:-3],self.prev_actions.flatten(),self.prev_actions_opp.flatten(),np.array([self.side_target,self.side_target_opp])]))
         # obs = np.float32(np.concatenate([self.data.qpos[:9], self.data.qvel[:9],self.data.body('ball').xpos,self.data.qvel[-6:-3],self.prev_actions.flatten(),np.array([self.side_target])]))
 
-        info = {'diff_pos':diff_pos,'diff_quat':diff_quat,'target':self.curr_target,'diff_pos_opp':diff_pos_opp,'diff_quat_opp':diff_quat_opp,'target_opp':self.curr_target_opp}
+        info = {'diff_pos':diff_pos,'diff_quat':diff_quat,'target':self.curr_target,'diff_pos_opp':diff_pos_opp,'diff_quat_opp':diff_quat_opp,'target_opp':self.curr_target_opp,'initial_state':initial_state}
         return obs, info
 
     def render(self, mode="human"):

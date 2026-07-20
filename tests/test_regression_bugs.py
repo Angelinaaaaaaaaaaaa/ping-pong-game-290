@@ -13,6 +13,7 @@ Bugs covered:
   6. mujoco_env_comp.py: ball_pos = self.data.body('ball').xpos (live view)
      mutated in update_target_racket_pose_opp → corrupts MuJoCo state mid-step
   7. mujoco_env_comp.py: ep_no % 200 == -1 dead branch → randomization never runs
+  8. mujoco_env_comp.py: default reset must not carry robot pose across rallies
 
 Run (targeted):
     venv/bin/python -m pytest tests/test_regression_bugs.py -v
@@ -521,6 +522,56 @@ class TestMujocoEnvRandomizationBranch(unittest.TestCase):
             "ep_no % 200 == 0 condition not found. "
             "Randomization will never fire if the dead -1 branch is used."
         )
+
+
+# =========================================================================== #
+# 8. mujoco_env_comp.py — clean mirrored reset between rallies                 #
+# =========================================================================== #
+
+class TestMujocoEnvCleanReset(unittest.TestCase):
+    """
+    A new rally should reset both robots to the same mirrored ready stance.
+    Robot qpos from the previous rally must not carry over in default mode.
+    """
+
+    def test_default_reset_clears_robot_carryover(self):
+        try:
+            import numpy as np
+            from mujoco_env_comp import KukaTennisEnv, READY_ARM_QPOS, READY_GANTRY_X, READY_GANTRY_Y, TABLE_SHIFT
+        except Exception as exc:
+            self.skipTest(f"MuJoCo environment unavailable: {exc}")
+
+        env = KukaTennisEnv(proc_id=1, history=4)
+        try:
+            env.reset()
+            env.data.qpos[0] = -0.51
+            env.data.qpos[1] = 0.72
+            env.data.qpos[2:9] = np.linspace(-0.4, 0.4, 7)
+            env.data.qpos[9] = -0.98
+            env.data.qpos[10] = -0.66
+            env.data.qpos[11:18] = np.linspace(0.5, -0.5, 7)
+
+            _obs, info = env.reset()
+
+            self.assertAlmostEqual(float(env.data.qpos[0]), READY_GANTRY_X)
+            self.assertAlmostEqual(float(env.data.qpos[9]), READY_GANTRY_X)
+            self.assertAlmostEqual(float(env.data.qpos[1]), READY_GANTRY_Y)
+            self.assertAlmostEqual(float(env.data.qpos[10]), READY_GANTRY_Y)
+            np.testing.assert_allclose(env.data.qpos[2:9], READY_ARM_QPOS, atol=1e-9)
+            np.testing.assert_allclose(env.data.qpos[11:18], READY_ARM_QPOS, atol=1e-9)
+
+            initial = info["initial_state"]
+            self.assertEqual(initial["reset_mode"], "clean")
+            np.testing.assert_allclose(initial["p1_gantry"], [READY_GANTRY_X, READY_GANTRY_Y], atol=1e-9)
+            np.testing.assert_allclose(initial["p2_gantry"], [READY_GANTRY_X, READY_GANTRY_Y], atol=1e-9)
+
+            p1_racket = initial["p1_racket"]
+            p2_racket = initial["p2_racket"]
+            self.assertAlmostEqual(float(p1_racket[0]), float(2 * TABLE_SHIFT - p2_racket[0]), places=9)
+            self.assertAlmostEqual(float(p1_racket[1]), float(-p2_racket[1]), places=9)
+            self.assertAlmostEqual(float(p1_racket[2]), float(p2_racket[2]), places=9)
+        finally:
+            env.close()
 
 
 if __name__ == "__main__":
