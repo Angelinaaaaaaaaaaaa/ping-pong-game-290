@@ -34,12 +34,37 @@ Each entry:
         'winner' : int,                  # 1=ego, 2=opp (truncated episodes discarded)
     }
 
+Skill selection mode
+---------------------
+--skill-mode grid   (default) Exhaustive fixed-vs-fixed sweep: both players'
+                     skills are held constant for a whole block of rallies,
+                     cycling through all 25 (skill1, skill2) combinations.
+                     This is the original behavior.
+--skill-mode random  Random-vs-random: each individual rally independently
+                     draws a fresh (skill1, skill2) pair, uniformly at
+                     random with replacement (so a skill can face itself).
+                     Use --total-rallies to set the total count and --seed
+                     for reproducibility.
+--skill-mode fixed_random  Fixed-vs-random: --fixed-player (1 or 2) stays
+                     locked to --fixed-skill for every rally, while the
+                     other player's skill is redrawn uniformly at random
+                     each rally. Also supports --total-rallies and --seed.
+
 Run:
     MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
         venv/bin/python nash_skills/v2/collect_data.py
     MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
         venv/bin/python nash_skills/v2/collect_data.py \
         --rallies 50 --output data/rallies_5skill_v2.pkl
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
+        venv/bin/python nash_skills/v2/collect_data.py \
+        --skill-mode random --total-rallies 1250 --seed 0 \
+        --output data/rallies_5skill_v2_random.pkl
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
+        venv/bin/python nash_skills/v2/collect_data.py \
+        --skill-mode fixed_random --fixed-player 2 --fixed-skill center_safe \
+        --total-rallies 1250 --seed 0 \
+        --output data/rallies_5skill_v2_fixed_random.pkl
 """
 
 import sys
@@ -70,6 +95,92 @@ HISTORY               = 4
 # --------------------------------------------------------------------------- #
 
 
+def make_skill_pair_schedule(
+    mode: str,
+    skill_names: list,
+    rallies_per_pair: int,
+    total_rallies: int | None = None,
+    rng: np.random.Generator | None = None,
+    fixed_player: int | None = None,
+    fixed_skill: str | None = None,
+) -> list:
+    """
+    Build a schedule of (skill1, skill2, n_rallies) blocks to collect.
+
+    mode='grid'         Deterministic exhaustive sweep over every
+                        (skill1, skill2) combination via itertools.product,
+                        each block sized `rallies_per_pair`. This is the
+                        original collect_data.py behavior (fixed-vs-fixed,
+                        both skills held constant for an entire block of
+                        rallies) and remains the default.
+    mode='random'       `total_rallies` independent draws of (skill1, skill2),
+                        each uniformly sampled from skill_names with
+                        replacement -- ego and opp skills drawn
+                        independently, so a rally can pair a skill against
+                        itself. Every block has n_rallies=1, since skills
+                        are redrawn fresh for each individual rally rather
+                        than held fixed across a block (random-vs-random).
+    mode='fixed_random' Fixed-vs-random: `fixed_player` (1 or 2) is locked
+                        to `fixed_skill` for every rally, while the other
+                        player's skill is redrawn uniformly at random each
+                        rally. Every block has n_rallies=1. Requires both
+                        `fixed_player` and `fixed_skill`; raises ValueError
+                        if either is missing or invalid.
+
+    For 'random' and 'fixed_random', total_rallies defaults to
+    len(skill_names)**2 * rallies_per_pair (the same total collection
+    budget as the grid default) when not given explicitly.
+
+    Raises ValueError for any mode other than 'grid', 'random', or
+    'fixed_random'.
+    """
+    if mode == "grid":
+        return [
+            (s1, s2, rallies_per_pair)
+            for s1, s2 in itertools.product(skill_names, skill_names)
+        ]
+    if mode == "random":
+        if rng is None:
+            rng = np.random.default_rng()
+        n = (
+            total_rallies
+            if total_rallies is not None
+            else len(skill_names) ** 2 * rallies_per_pair
+        )
+        return [
+            (str(rng.choice(skill_names)), str(rng.choice(skill_names)), 1)
+            for _ in range(n)
+        ]
+    if mode == "fixed_random":
+        if fixed_player not in (1, 2):
+            raise ValueError(
+                f"fixed_random requires fixed_player to be 1 or 2, got {fixed_player!r}"
+            )
+        if fixed_skill not in skill_names:
+            raise ValueError(
+                f"fixed_random requires fixed_skill to be one of {skill_names}, "
+                f"got {fixed_skill!r}"
+            )
+        if rng is None:
+            rng = np.random.default_rng()
+        n = (
+            total_rallies
+            if total_rallies is not None
+            else len(skill_names) ** 2 * rallies_per_pair
+        )
+        schedule = []
+        for _ in range(n):
+            random_skill = str(rng.choice(skill_names))
+            if fixed_player == 1:
+                schedule.append((fixed_skill, random_skill, 1))
+            else:
+                schedule.append((random_skill, fixed_skill, 1))
+        return schedule
+    raise ValueError(
+        f"Unknown mode {mode!r}, expected 'grid', 'random', or 'fixed_random'"
+    )
+
+
 def _build_ppo_obs(obs, info, player: int) -> np.ndarray:
     """Build the 68-dim PPO input for `player` (1=ego, 2=opp)."""
     H = HISTORY
@@ -98,20 +209,46 @@ def collect(
     max_steps_per_episode: int = MAX_STEPS_PER_EPISODE,
     max_attempts_per_pair: int | None = None,
     progress_every: int = 10,
+    skill_mode: str = "grid",
+    total_rallies: int | None = None,
+    seed: int | None = None,
+    fixed_player: int | None = None,
+    fixed_skill: str | None = None,
 ) -> list:
     """
-    Collect `target_rallies` complete rallies for each of the 25 skill pairs.
+    Collect rally data for the v2 Nash pipeline.
+
+    skill_mode='grid' (default): collect `target_rallies` complete rallies
+        for each of the 25 fixed-vs-fixed skill pairs (both players' skills
+        held constant for the whole block) -- the original behavior.
+    skill_mode='random': random-vs-random -- each rally independently draws
+        a fresh (skill1, skill2) pair uniformly at random (with replacement)
+        instead of sweeping fixed pairs. `total_rallies` sets the total
+        rally count (defaults to the same budget as grid mode, 25 *
+        target_rallies). `seed` makes the random draws reproducible.
+    skill_mode='fixed_random': fixed-vs-random -- `fixed_player` (1 or 2) is
+        locked to `fixed_skill` for every rally, while the other player's
+        skill is redrawn uniformly at random each rally. `total_rallies` and
+        `seed` behave the same as in 'random' mode. Requires both
+        `fixed_player` and `fixed_skill`.
 
     Returns the full list of rally dicts (also saved to output_path).
     """
     env   = SkillEnv(proc_id=1, history=HISTORY)
     model = PPO.load(ppo_path)
+    rng = np.random.default_rng(seed) if skill_mode in ("random", "fixed_random") else None
+
+    schedule = make_skill_pair_schedule(
+        skill_mode, SKILL_NAMES, rallies_per_pair=target_rallies,
+        total_rallies=total_rallies, rng=rng,
+        fixed_player=fixed_player, fixed_skill=fixed_skill,
+    )
 
     all_rallies = []
     pair_summaries = []
     incomplete_pairs = []
 
-    for skill1, skill2 in itertools.product(SKILL_NAMES, SKILL_NAMES):
+    for skill1, skill2, block_target_rallies in schedule:
         print(f"\n=== Collecting: ego={skill1}  opp={skill2} ===", flush=True)
         env.set_skills(skill1, skill2)
         obs, info = env.reset()
@@ -131,7 +268,7 @@ def collect(
         curr_raw     = []   # raw obs (116-dim)
         steps_in_ep  = 0
 
-        while completed < target_rallies and (
+        while completed < block_target_rallies and (
             max_attempts_per_pair is None or attempts < max_attempts_per_pair
         ):
             # Build PPO obs for each player and act
@@ -175,7 +312,7 @@ def collect(
                     completed += 1
                     last_reason = "accepted-done"
                     if completed % 10 == 0:
-                        print(f"  {completed}/{target_rallies} rallies  "
+                        print(f"  {completed}/{block_target_rallies} rallies  "
                               f"({steps_this_combo} steps so far)", flush=True)
                 else:
                     discarded += 1
@@ -189,7 +326,7 @@ def collect(
                     avg_steps = steps_completed_attempts / attempts
                     print(
                         f"  progress ego={skill1} opp={skill2} "
-                        f"attempts={attempts} accepted={completed}/{target_rallies} "
+                        f"attempts={attempts} accepted={completed}/{block_target_rallies} "
                         f"discarded={discarded} elapsed={elapsed:.1f}s "
                         f"avg_steps/attempt={avg_steps:.1f} "
                         f"last={last_reason} winner={last_winner}",
@@ -217,7 +354,7 @@ def collect(
                     avg_steps = steps_completed_attempts / attempts
                     print(
                         f"  progress ego={skill1} opp={skill2} "
-                        f"attempts={attempts} accepted={completed}/{target_rallies} "
+                        f"attempts={attempts} accepted={completed}/{block_target_rallies} "
                         f"discarded={discarded} elapsed={elapsed:.1f}s "
                         f"avg_steps/attempt={avg_steps:.1f} "
                         f"last={last_reason} winner={last_winner}",
@@ -245,11 +382,11 @@ def collect(
             "last_winner": last_winner,
         }
         pair_summaries.append(summary)
-        if completed < target_rallies:
+        if completed < block_target_rallies:
             incomplete_pairs.append((skill1, skill2))
         print(
             f"  Summary ego={skill1} opp={skill2}: "
-            f"attempts={attempts} accepted={completed}/{target_rallies} "
+            f"attempts={attempts} accepted={completed}/{block_target_rallies} "
             f"discarded={discarded} elapsed={elapsed:.1f}s "
             f"avg_steps/attempt={avg_steps:.1f} "
             f"last={last_reason} winner={last_winner}",
@@ -315,6 +452,29 @@ if __name__ == "__main__":
                         help="Stop each skill pair after this many attempts, even if target rallies are not reached")
     parser.add_argument("--progress-every", type=int, default=10,
                         help="Print progress every N completed attempts per skill pair; <=0 disables attempt progress")
+    parser.add_argument("--skill-mode", choices=["grid", "random", "fixed_random"],
+                        default="grid", dest="skill_mode",
+                        help=(
+                            "grid (default): exhaustive fixed-vs-fixed sweep over all 25 "
+                            "skill pairs, preserving existing behavior. "
+                            "random: random-vs-random -- each rally independently draws a "
+                            "fresh (skill1, skill2) pair uniformly at random. "
+                            "fixed_random: fixed-vs-random -- --fixed-player is locked to "
+                            "--fixed-skill for every rally, the other player is randomized."
+                        ))
+    parser.add_argument("--total-rallies", type=int, default=None, dest="total_rallies",
+                        help=(
+                            "Only used with --skill-mode random/fixed_random: total rally "
+                            "count to collect (default: same budget as grid mode, 25 * --rallies)."
+                        ))
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed for --skill-mode random/fixed_random (default: None = non-reproducible)")
+    parser.add_argument("--fixed-player", type=int, choices=[1, 2], default=None,
+                        dest="fixed_player",
+                        help="Required with --skill-mode fixed_random: which player (1 or 2) stays fixed")
+    parser.add_argument("--fixed-skill", type=str, default=None, dest="fixed_skill",
+                        choices=SKILL_NAMES,
+                        help="Required with --skill-mode fixed_random: skill name the fixed player uses")
     args = parser.parse_args()
 
     collect(
@@ -324,4 +484,9 @@ if __name__ == "__main__":
         max_steps_per_episode=args.max_steps,
         max_attempts_per_pair=args.max_attempts_per_pair,
         progress_every=args.progress_every,
+        skill_mode=args.skill_mode,
+        total_rallies=args.total_rallies,
+        seed=args.seed,
+        fixed_player=args.fixed_player,
+        fixed_skill=args.fixed_skill,
     )
