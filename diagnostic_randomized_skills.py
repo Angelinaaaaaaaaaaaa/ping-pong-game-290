@@ -18,15 +18,37 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from diagnostic_rendering import (
+    EpisodeVideoRecorder,
+    add_render_args,
+    decode_np_random_state,
+    encode_np_random_state,
+    json_safe,
+    manual_render_requested,
+    outcome_label,
+    post_replay_requested,
+    prompt_manual_replays,
+    replay_selected_episodes,
+    render_episode_limit,
+    select_truncated_replays,
+    should_render_live,
+    validate_render_args,
+)
 from diagnostic_fixed_skill import build_ppo_obs
 from nash_skills.skills import SKILL_NAMES, SKILL_PROFILE_NAMES, world_target_xy
 
 RALLY_FIELDS = [
+    "episode_id",
     "rally_id",
     "seed",
     "mode",
+    "setting_index",
+    "setting",
+    "episode_index",
     "fixed_player",
     "fixed_skill",
+    "p1_initial_skill",
+    "p2_initial_skill",
     "p1_policy_type",
     "p2_policy_type",
     "winner",
@@ -34,6 +56,11 @@ RALLY_FIELDS = [
     "rally_length",
     "num_decisions",
     "max_steps",
+    "reset_mode",
+    "skill_profile",
+    "gantry_speed_scale",
+    "initial_state",
+    "np_random_state",
 ]
 
 DECISION_FIELDS = [
@@ -149,6 +176,30 @@ def make_rally_id(seed: int, mode: str, setting: str, episode_index: int) -> str
     return f"{seed}:{mode}:{setting}:{episode_index}"
 
 
+def randomized_video_stem(
+    *,
+    mode: str,
+    fixed_player: int | None,
+    fixed_skill: str | None,
+    episode_index: int,
+    winner: str,
+    truncated: bool,
+    steps: int,
+) -> str:
+    if mode == "random_vs_random":
+        p1_label = "random"
+        p2_label = "random"
+    elif fixed_player == 1:
+        p1_label = f"fixed_{fixed_skill}"
+        p2_label = "random"
+    elif fixed_player == 2:
+        p1_label = "random"
+        p2_label = f"fixed_{fixed_skill}"
+    else:
+        raise ValueError(f"Invalid video label setting: mode={mode} fixed_player={fixed_player}")
+    return f"{mode}_{p1_label}_vs_{p2_label}_ep{episode_index}_{outcome_label(winner, truncated)}_{steps}steps"
+
+
 def episode_rng(seed: int, mode_index: int, setting_index: int, episode_index: int) -> np.random.Generator:
     value = (
         (seed + 1_000_003) * 1_000_003
@@ -182,13 +233,23 @@ def run_rally(
     max_steps: int,
     rng: np.random.Generator,
     skill_profile: str,
+    render_live: bool = False,
+    video_recorder: EpisodeVideoRecorder | None = None,
+    episode_id: int | None = None,
+    setting_index: int | None = None,
+    setting: str | None = None,
+    episode_index: int | None = None,
+    reset_mode: str | None = None,
+    gantry_speed_scale: float | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     p1_policy_type, p2_policy_type = policy_types(mode, fixed_player)
     p1_skill = choose_skill(p1_policy_type, fixed_skill, rng)
     p2_skill = choose_skill(p2_policy_type, fixed_skill, rng)
 
     env.set_skills(p1_skill, p2_skill)
+    np_random_state = encode_np_random_state(np.random.get_state())
     obs, info = env.reset()
+    initial_state = json.dumps(json_safe(info.get("initial_state", {})))
     prev_ball_x = float(obs[36])
     decisions: list[dict[str, Any]] = []
     contacts: list[dict[str, Any]] = []
@@ -230,6 +291,10 @@ def run_rally(
         action[9:] = a2[:9]
 
         (obs, _reward, done, _truncated, info), lines = capture_step(env, action)
+        if render_live:
+            env.render()
+        if video_recorder is not None:
+            video_recorder.capture(step)
         contacts.extend(parse_contacts(lines, step, p1_skill, p2_skill, skill_profile))
         curr_ball_x = float(obs[36])
 
@@ -269,11 +334,17 @@ def run_rally(
         })
 
     row = {
+        "episode_id": "" if episode_id is None else episode_id,
         "rally_id": rally_id,
         "seed": seed,
         "mode": mode,
+        "setting_index": "" if setting_index is None else setting_index,
+        "setting": "" if setting is None else setting,
+        "episode_index": "" if episode_index is None else episode_index,
         "fixed_player": "" if fixed_player is None else fixed_player,
         "fixed_skill": "" if fixed_skill is None else fixed_skill,
+        "p1_initial_skill": decisions[0]["chosen_skill"],
+        "p2_initial_skill": decisions[1]["chosen_skill"],
         "p1_policy_type": p1_policy_type,
         "p2_policy_type": p2_policy_type,
         "winner": winner,
@@ -281,6 +352,11 @@ def run_rally(
         "rally_length": rally_length,
         "num_decisions": decision_t + 1,
         "max_steps": max_steps,
+        "reset_mode": "" if reset_mode is None else reset_mode,
+        "skill_profile": skill_profile,
+        "gantry_speed_scale": "" if gantry_speed_scale is None else gantry_speed_scale,
+        "initial_state": initial_state,
+        "np_random_state": np_random_state,
     }
     return row, decisions, contacts
 
@@ -302,7 +378,87 @@ def settings_for_mode(mode: str, episodes_per_setting: int, episodes: int) -> li
     raise ValueError(f"Unsupported mode: {mode}")
 
 
-def parse_args() -> argparse.Namespace:
+def randomized_replay_stem(row: dict[str, Any]) -> str:
+    return randomized_video_stem(
+        mode=str(row["mode"]),
+        fixed_player=None if row["fixed_player"] in ("", None) else int(row["fixed_player"]),
+        fixed_skill=None if row["fixed_skill"] in ("", None) else str(row["fixed_skill"]),
+        episode_index=int(row["episode_index"]),
+        winner=str(row["winner"]),
+        truncated=str(row["truncated"]).lower() in {"true", "1", "yes"},
+        steps=int(row["rally_length"]),
+    )
+
+
+def replay_randomized_rally(env, model, row: dict[str, Any], recorder: EpisodeVideoRecorder) -> None:
+    seed = int(row["seed"])
+    mode = str(row["mode"])
+    mode_index = 0 if mode == "fixed_vs_random" else 1
+    setting_index = int(row["setting_index"])
+    episode_index = int(row["episode_index"])
+    fixed_player = None if row["fixed_player"] in ("", None) else int(row["fixed_player"])
+    fixed_skill = None if row["fixed_skill"] in ("", None) else str(row["fixed_skill"])
+    np.random.set_state(decode_np_random_state(str(row["np_random_state"])))
+    run_rally(
+        env,
+        model,
+        rally_id=str(row["rally_id"]),
+        seed=seed,
+        mode=mode,
+        fixed_player=fixed_player,
+        fixed_skill=fixed_skill,
+        max_steps=int(row["max_steps"]),
+        rng=episode_rng(seed, mode_index, setting_index, episode_index),
+        skill_profile=str(row["skill_profile"]),
+        video_recorder=recorder,
+    )
+
+
+def run_post_eval_replay(args, model, rows: list[dict[str, Any]]) -> None:
+    if not post_replay_requested(args):
+        return
+    selected: list[dict[str, Any]]
+    video_dir = args.video_dir
+    limit = render_episode_limit(args)
+    if args.render_truncated_only:
+        selected = select_truncated_replays(rows, limit)
+    elif manual_render_requested(args):
+        selected, manual_dir = prompt_manual_replays(rows)
+        if manual_dir is not None:
+            video_dir = manual_dir
+    else:
+        selected = []
+    if not selected:
+        print("No episodes selected for replay.", flush=True)
+        return
+
+    from nash_skills.env_wrapper import SkillEnv
+
+    env = SkillEnv(
+        proc_id=1,
+        history=4,
+        reset_mode=args.reset_mode,
+        skill_profile=args.skill_profile,
+        gantry_speed_scale=args.gantry_speed_scale,
+    )
+    try:
+        saved = replay_selected_episodes(
+            env,
+            model,
+            selected,
+            replay_one=replay_randomized_rally,
+            filename_stem=randomized_replay_stem,
+            video_dir=video_dir,
+            fps=args.video_fps,
+            capture_every=args.capture_every,
+        )
+    finally:
+        env.close()
+    for path in saved:
+        print(f"Saved replay video: {path}", flush=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect randomized 5-skill diagnostics.")
     parser.add_argument("--mode", choices=["fixed_vs_random", "random_vs_random"], required=True)
     parser.add_argument("--episodes-per-setting", type=int, default=100)
@@ -314,7 +470,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
     parser.add_argument("--gantry-speed-scale", type=float, default=1.0)
     parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="current")
-    return parser.parse_args()
+    add_render_args(parser)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -325,6 +482,7 @@ def main() -> None:
         raise ValueError("--episodes must be positive")
     if args.steps <= 0:
         raise ValueError("--steps must be positive")
+    validate_render_args(args)
 
     from stable_baselines3 import PPO
     from nash_skills.env_wrapper import SkillEnv
@@ -350,6 +508,7 @@ def main() -> None:
         for setting_index, setting in enumerate(settings):
             print(f"Running {args.mode} {setting['setting']}", flush=True)
             for episode_index in range(setting["episodes"]):
+                episode_id = len(rally_rows)
                 rally_id = make_rally_id(args.seed, args.mode, setting["setting"], episode_index)
                 rng = episode_rng(args.seed, mode_index, setting_index, episode_index)
                 rally, decisions, contacts = run_rally(
@@ -363,6 +522,13 @@ def main() -> None:
                     max_steps=args.steps,
                     rng=rng,
                     skill_profile=args.skill_profile,
+                    render_live=should_render_live(args),
+                    episode_id=episode_id,
+                    setting_index=setting_index,
+                    setting=setting["setting"],
+                    episode_index=episode_index,
+                    reset_mode=args.reset_mode,
+                    gantry_speed_scale=args.gantry_speed_scale,
                 )
                 rally_rows.append(rally)
                 decision_rows.extend(decisions)
@@ -392,6 +558,7 @@ def main() -> None:
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2))
     print(f"Wrote randomized diagnostics to {out}", flush=True)
+    run_post_eval_replay(args, model, rally_rows)
 
 
 if __name__ == "__main__":

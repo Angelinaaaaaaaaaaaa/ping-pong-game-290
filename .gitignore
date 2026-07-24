@@ -20,6 +20,10 @@ models_new/*.pth
 data/*.pkl
 data_new/*.pkl
 data_new/*.csv
+data/rendered_rallies/
+*.mp4
+*.avi
+*.mov
 
 # Training and collection logs (re-generated)
 logs/*.csv
@@ -29,7 +33,10 @@ logs/*.log
 skill_eval/*.csv
 skill_eval/*.json
 skill_eval/*.log
+<<<<<<< HEAD
 
 # macOS
 .DS_Store
 
+=======
+>>>>>>> 3624139 (Add post-evaluation diagnostic rendering)

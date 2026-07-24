@@ -121,6 +121,7 @@ class KukaTennisEnv(gym.Env):
 
         self.ep_no = 0
         self.viewer = None
+        self._rgb_renderer = None
         self.last_racket_pos = np.zeros(3)
         self.last_racket_pos_opp = np.zeros(3)
         self.max_episode_steps = 200
@@ -636,6 +637,17 @@ class KukaTennisEnv(gym.Env):
         return obs, info
 
     def render(self, mode="human"):
+        if mode == "rgb_array":
+            if self._rgb_renderer is None:
+                self._rgb_renderer = mj.Renderer(self.model, height=480, width=640)
+            cam_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_CAMERA, "overview")
+            if cam_id >= 0:
+                self._rgb_renderer.update_scene(self.data, camera=cam_id)
+            else:
+                self._rgb_renderer.update_scene(self.data)
+            return self._rgb_renderer.render().astype(np.uint8, copy=False)
+        if mode != "human":
+            raise ValueError(f"Unsupported render mode: {mode}")
         if not hasattr(self, 'viewer') or self.viewer is None:
             import mujoco.viewer
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
@@ -650,6 +662,9 @@ class KukaTennisEnv(gym.Env):
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None
+        if self._rgb_renderer is not None:
+            self._rgb_renderer.close()
+            self._rgb_renderer = None
 
     
 
@@ -701,7 +716,7 @@ class KukaTennisEnv(gym.Env):
 def init_glfw():
     if not glfw.init():
         raise Exception("Unable to initialize GLFW")
-    window = glfw.create_window(1280, 720, "MuJoCo Simulation", None, None)
+    window = glfw.create_window(640, 480, "MuJoCo Simulation", None, None)
     if not window:
         glfw.terminate()
         raise Exception("Unable to create GLFW window")

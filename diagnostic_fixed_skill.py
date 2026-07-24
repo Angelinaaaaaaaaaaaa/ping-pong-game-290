@@ -24,10 +24,27 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from diagnostic_rendering import (
+    EpisodeVideoRecorder,
+    add_render_args,
+    decode_np_random_state,
+    encode_np_random_state,
+    json_safe,
+    manual_render_requested,
+    outcome_label,
+    post_replay_requested,
+    prompt_manual_replays,
+    replay_selected_episodes,
+    render_episode_limit,
+    select_truncated_replays,
+    should_render_live,
+    validate_render_args,
+)
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, SKILL_PROFILE_NAMES, get_skill, skill_index, world_target_xy
 
 HISTORY = 4
 EPISODE_FIELDS = [
+    "episode_id",
     "key",
     "seed",
     "episode_index",
@@ -48,6 +65,10 @@ EPISODE_FIELDS = [
     "player2_target_xy",
     "validation_ok",
     "validation_errors",
+    "reset_mode",
+    "gantry_speed_scale",
+    "initial_state",
+    "np_random_state",
 ]
 SUMMARY_FIELDS = [
     "player1_skill",
@@ -116,6 +137,17 @@ def episode_key(seed: int, player1_skill: str, episode_index: int, player2_skill
     if player2_skill is None:
         return f"{seed}:{player1_skill}:{episode_index}"
     return f"{seed}:{player1_skill}:{player2_skill}:{episode_index}"
+
+
+def fixed_skill_video_stem(
+    player1_skill: str,
+    player2_skill: str,
+    episode_index: int,
+    winner: str,
+    truncated: bool,
+    steps: int,
+) -> str:
+    return f"fixed_skill_{player1_skill}_vs_{player2_skill}_ep{episode_index}_{outcome_label(winner, truncated)}_{steps}steps"
 
 
 def episode_rng_seed(seed: int, player1_skill: str, episode_index: int, player2_skill: str | None = None) -> int:
@@ -404,12 +436,27 @@ def enrich_contacts(
     return enriched
 
 
-def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, player2_skill: str, steps: int):
+def run_episode(
+    env,
+    model,
+    seed: int,
+    episode_index: int,
+    player1_skill: str,
+    player2_skill: str,
+    steps: int,
+    render_live: bool = False,
+    video_recorder: EpisodeVideoRecorder | None = None,
+    episode_id: int | None = None,
+    reset_mode: str | None = None,
+    gantry_speed_scale: float | None = None,
+):
     from nash_skills.v2.state_encoder import encode_ego
     from nash_skills.winner_inference import infer_terminal_winner
 
     env.set_skills(player1_skill, player2_skill)
+    np_random_state = encode_np_random_state(np.random.get_state())
     obs, info = env.reset()
+    initial_state = json.dumps(json_safe(info.get("initial_state", {})))
     prev_ball_x = float(obs[36])
     decision_states = []
     trajectory_samples = []
@@ -431,6 +478,10 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
         action[9:] = a2[:9]
 
         (obs, _reward, done, _truncated, info), lines = capture_step(env, action)
+        if render_live:
+            env.render()
+        if video_recorder is not None:
+            video_recorder.capture(step)
         contacts.extend(parse_contacts(lines, step))
         curr_ball_x = float(obs[36])
 
@@ -467,6 +518,7 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
     validation_errors.extend(validate_episode_state(env, player1_skill, player2_skill, last_raw, last_state))
     key = episode_key(seed, player1_skill, episode_index, player2_skill)
     row = {
+        "episode_id": "" if episode_id is None else episode_id,
         "key": key,
         "seed": seed,
         "episode_index": episode_index,
@@ -487,6 +539,10 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
         "player2_target_xy": json.dumps(target_xy(player2_skill, getattr(env, "skill_profile", "current"))),
         "validation_ok": len(validation_errors) == 0,
         "validation_errors": json.dumps(validation_errors),
+        "reset_mode": "" if reset_mode is None else reset_mode,
+        "gantry_speed_scale": "" if gantry_speed_scale is None else gantry_speed_scale,
+        "initial_state": initial_state,
+        "np_random_state": np_random_state,
     }
     detail = {
         "key": key,
@@ -773,7 +829,78 @@ def write_report(out: Path, args, rows: list[dict[str, Any]], summary: list[dict
     return report
 
 
-def parse_args() -> argparse.Namespace:
+def fixed_skill_replay_stem(row: dict[str, Any]) -> str:
+    return fixed_skill_video_stem(
+        str(row["player1_skill"]),
+        str(row["player2_skill"]),
+        int(row["episode_index"]),
+        str(row["winner"]),
+        str(row["reached_step_limit"]).lower() in {"true", "1", "yes"},
+        int(row["physics_steps"]),
+    )
+
+
+def replay_fixed_episode(env, model, row: dict[str, Any], recorder: EpisodeVideoRecorder) -> None:
+    np.random.set_state(decode_np_random_state(str(row["np_random_state"])))
+    run_episode(
+        env,
+        model,
+        seed=int(row["seed"]),
+        episode_index=int(row["episode_index"]),
+        player1_skill=str(row["player1_skill"]),
+        player2_skill=str(row["player2_skill"]),
+        steps=int(row["physics_steps"]),
+        video_recorder=recorder,
+        reset_mode=str(row.get("reset_mode") or getattr(env, "reset_mode", "")),
+        gantry_speed_scale=float(row.get("gantry_speed_scale") or getattr(env, "gantry_speed_scale", 1.0)),
+    )
+
+
+def run_post_eval_replay(args, model, rows: list[dict[str, Any]]) -> None:
+    if not post_replay_requested(args):
+        return
+    selected: list[dict[str, Any]]
+    video_dir = args.video_dir
+    limit = render_episode_limit(args)
+    if args.render_truncated_only:
+        selected = select_truncated_replays(rows, limit)
+    elif manual_render_requested(args):
+        selected, manual_dir = prompt_manual_replays(rows)
+        if manual_dir is not None:
+            video_dir = manual_dir
+    else:
+        selected = []
+    if not selected:
+        print("No episodes selected for replay.", flush=True)
+        return
+
+    from nash_skills.env_wrapper import SkillEnv
+
+    env = SkillEnv(
+        proc_id=1,
+        history=HISTORY,
+        reset_mode=args.reset_mode,
+        skill_profile=args.skill_profile,
+        gantry_speed_scale=args.gantry_speed_scale,
+    )
+    try:
+        saved = replay_selected_episodes(
+            env,
+            model,
+            selected,
+            replay_one=replay_fixed_episode,
+            filename_stem=fixed_skill_replay_stem,
+            video_dir=video_dir,
+            fps=args.video_fps,
+            capture_every=args.capture_every,
+        )
+    finally:
+        env.close()
+    for path in saved:
+        print(f"Saved replay video: {path}", flush=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixed-player", type=int, choices=[1, 2], required=True)
     parser.add_argument("--fixed-skill", choices=SKILL_NAMES, required=True)
@@ -787,7 +914,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
     parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="current")
     parser.add_argument("--gantry-speed-scale", type=float, default=1.0)
-    return parser.parse_args()
+    add_render_args(parser)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -798,6 +926,7 @@ def main() -> None:
         raise ValueError("--steps must be positive")
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("--seeds contains duplicates")
+    validate_render_args(args)
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -836,8 +965,21 @@ def main() -> None:
                     key = episode_key(seed, player1_skill, episode_index, player2_skill)
                     if key in seen:
                         continue
+                    episode_id = len(existing) + len(new_rows)
                     np.random.seed(episode_rng_seed(seed, player1_skill, episode_index, player2_skill))
-                    row, detail = run_episode(env, model, seed, episode_index, player1_skill, player2_skill, args.steps)
+                    row, detail = run_episode(
+                        env,
+                        model,
+                        seed,
+                        episode_index,
+                        player1_skill,
+                        player2_skill,
+                        args.steps,
+                        render_live=should_render_live(args),
+                        episode_id=episode_id,
+                        reset_mode=args.reset_mode,
+                        gantry_speed_scale=args.gantry_speed_scale,
+                    )
                     new_rows.append(row)
                     details.append(detail)
                     seen.add(key)
@@ -867,6 +1009,7 @@ def main() -> None:
     report = write_report(out, args, rows, summary, failures, plots)
     print(f"Wrote outputs to {out}", flush=True)
     print(f"Report: {report}", flush=True)
+    run_post_eval_replay(args, model, new_rows)
 
 
 if __name__ == "__main__":
