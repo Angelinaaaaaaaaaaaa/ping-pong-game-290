@@ -79,6 +79,7 @@ def flip_rally(rally: dict) -> Optional[dict]:
 
     flip_states = []
     flip_raw = []
+    flip_skill_pairs = []
     for obs_raw in rally["raw_obs"]:
         obs_raw = np.asarray(obs_raw, dtype=np.float32)
         if obs_raw.shape[0] < _RAW_OBS_DIM:
@@ -110,13 +111,19 @@ def flip_rally(rally: dict) -> Optional[dict]:
         flip_states.append(s)
         flip_raw.append(obs_raw.copy())  # deep copy: isolate from original
 
-    return {
+    for skill1, skill2 in rally.get("skill_pairs", []):
+        flip_skill_pairs.append((mirror_skill(skill2), mirror_skill(skill1)))
+
+    flipped = {
         "skill1": flip_skill1,
         "skill2": flip_skill2,
         "states": flip_states,
         "raw_obs": flip_raw,
         "winner": flipped_winner,
     }
+    if flip_skill_pairs:
+        flipped["skill_pairs"] = flip_skill_pairs
+    return flipped
 
 
 def augment_with_flip(rallies: list) -> list:

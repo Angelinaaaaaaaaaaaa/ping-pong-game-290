@@ -104,6 +104,18 @@ def build_dataset(rallies: list):
     return X, Y1, Y2
 
 
+def state_skill_pair_indices(entry: dict, state_index: int) -> tuple[int, int]:
+    skill_pairs = entry.get("skill_pairs")
+    if skill_pairs is not None and state_index < len(skill_pairs):
+        s1, s2 = skill_pairs[state_index]
+        return skill_index(s1), skill_index(s2)
+    state = np.asarray(entry["states"][state_index])
+    return (
+        int(round(float(state[-2]) * (N_SKILLS - 1))),
+        int(round(float(state[-1]) * (N_SKILLS - 1))),
+    )
+
+
 def train(
     rally_path: str = DEFAULT_RALLY_PATH,
     n_epochs: int = N_EPOCHS,
@@ -190,13 +202,10 @@ def train(
     skill_pair_indices: dict = {}
     offset = 0
     for entry in rallies:
-        s1 = entry["skill1"]
-        s2 = entry["skill2"]
-        n  = len(entry["states"])
-        key = (skill_index(s1), skill_index(s2))
-        if key not in skill_pair_indices:
-            skill_pair_indices[key] = []
-        skill_pair_indices[key].extend(range(offset, offset + n))
+        n = len(entry["states"])
+        for state_idx in range(n):
+            key = state_skill_pair_indices(entry, state_idx)
+            skill_pair_indices.setdefault(key, []).append(offset + state_idx)
         offset += n
 
     # Build all valid unilateral-deviation constraint pairs
