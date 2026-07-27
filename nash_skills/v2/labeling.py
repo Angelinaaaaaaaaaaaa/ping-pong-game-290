@@ -7,7 +7,9 @@ Design rationale
 The old pipeline assigned labels {-1, 0, +1} only to the last two crossings
 in a rally, leaving ~96% of states labeled 0.  This was a debugging artifact,
 not an intentional design.  The mentor confirmed that the intended objective
-is to WIN and that gamma=0.9 is valid for shorter-horizon strategy learning.
+is to WIN. The discount factor is currently set to gamma=0.7 (see GAMMA
+below); gamma=0.9 is a candidate for a future ablation, not the current
+default.
 
 New scheme
 ----------
@@ -38,7 +40,8 @@ This means:
 
 Constants
 ---------
-GAMMA : float — default discount factor (0.9 per mentor guidance)
+GAMMA : float — default discount factor. Currently 0.7. Higher values such
+        as 0.9 should be tested in future ablations, not assumed as default.
 """
 
 from __future__ import annotations
@@ -49,7 +52,8 @@ import numpy as np
 
 from nash_skills.winner_inference import infer_terminal_winner, winner_to_label
 
-# Default discount factor — use gamma=0.9 for shorter-horizon strategy learning
+# Default discount factor. 0.9 was an earlier proposal; 0.7 is the current
+# default and should be treated as a future ablation candidate, not assumed.
 GAMMA: float = 0.7
 
 

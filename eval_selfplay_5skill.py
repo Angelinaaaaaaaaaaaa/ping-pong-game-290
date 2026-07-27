@@ -31,6 +31,7 @@ from stable_baselines3 import PPO
 from nash_skills.env_wrapper import SkillEnv
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_from_index
 from nash_skills.v2.state_encoder import encode_ego, encode_opp
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 from nash_skills.winner_inference import infer_terminal_winner
 from selfplay_5skill import (
     MetaPolicy, _build_ppo_obs,
@@ -113,12 +114,20 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
     n_done = wins + losses
     real_wr = wins / n_done if n_done > 0 else float("nan")
     total_skills = max(sum(ego_skill_count), 1)
+    skill_usage = dict(zip(SKILL_NAMES, ego_skill_count))
     return {
         "wins": wins, "losses": losses, "trunc": trunc,
         "real_wr": real_wr,
         "trunc_rate": trunc / n_rallies,
         "avg_xs": float(np.mean(crossings_list)),
         "skill_pct": [c / total_skills for c in ego_skill_count],
+        # Shared scorecard (nash_skills/v2/scorecard.py, ported from main,
+        # meeting note item 19): adds median rally length, skill-usage
+        # entropy, and dominant-skill fraction on top of the fields above.
+        "scorecard": compute_scorecard(
+            wins=wins, losses=losses, truncated=trunc,
+            rally_lengths=crossings_list, skill_usage=skill_usage,
+        ),
     }
 
 
@@ -219,8 +228,10 @@ def main():
     print(header)
     print("-" * len(header))
 
+    all_results = []
     for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng)
+        all_results.append((label, r))
         skill_str = " ".join(f"{p:>5.1%}" for p in r["skill_pct"])
         print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
               f"{r['wins']:>5d} {r['losses']:>5d} {r['trunc']:>6d} "
@@ -228,6 +239,13 @@ def main():
               f"             {skill_str}")
 
     print("-" * len(header))
+
+    print("\nFull scorecards (nash_skills/v2/scorecard.py)")
+    print("=" * len(header))
+    for label, r in all_results:
+        print(format_scorecard(r["scorecard"], label=f"vs {label}"))
+        print()
+
     env.close()
 
 

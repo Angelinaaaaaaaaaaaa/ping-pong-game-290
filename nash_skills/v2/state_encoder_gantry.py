@@ -60,14 +60,20 @@ def encode_opp_gantry(obs: np.ndarray) -> np.ndarray:
     """
     Encode raw 116-dim env obs into a 12-dim opp-perspective state.
 
-    From opp's perspective, swap ego/opp gantry. Ball + skill positions
-    stay the same since they are shared / symmetric.
+    From opp's perspective, swap ego/opp gantry AND swap the skill slots to
+    match: slot [10] is always "this perspective's own skill", slot [11] is
+    always "the other player's skill". obs[-2]/obs[-1] are stored in the
+    ego-perspective convention (ego skill, opp skill), so the opp-perspective
+    encoder must swap them too -- ported from main (nash_skills/v2/
+    state_encoder_gantry.py), where a diagnostic run showed the un-swapped
+    version fed the opp's own skill into the "opp" slot from its own point
+    of view, silently corrupting every opp-side Phi(s, ego, opp) lookup.
     """
     out = np.zeros(STATE_DIM, dtype=np.float32)
     out[0:2]   = obs[18:20]    # opp gantry (as their "ego")
     out[2:4]   = obs[0:2]      # ego gantry (as their "opp")
     out[4:7]   = obs[36:39]    # ball position
     out[7:10]  = obs[39:42]    # ball velocity
-    out[10]    = obs[-2]       # ego skill — kept in same slot for consistency
-    out[11]    = obs[-1]       # opp skill
+    out[10]    = obs[-1]       # opp's own skill -> their "ego" slot
+    out[11]    = obs[-2]       # ego's skill (as seen from opp) -> their "opp" slot
     return out

@@ -34,6 +34,7 @@ import torch
 
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_index
 from nash_skills.winner_inference import infer_terminal_winner
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 
 
 # --------------------------------------------------------------------------- #
@@ -296,10 +297,6 @@ def _infer_winner(obs, info):
     4. Last resort: ball position relative to the net only when the previous
        signals are unavailable or exactly ambiguous.
     """
-    # Delegates to the shared inference: explicit env winner (info['winner']) ->
-    # racket-boundary reconstruction -> ball x-velocity -> position fallback.
-    # Without this active return the function yielded None and run_matchup scored
-    # EVERY completed episode as an opp win (win_rate flat 0.0 for all matchups).
     return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
 
@@ -367,7 +364,11 @@ def _pick_with_softmax_fallback(
 
 def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 tau: float = 0.2, confidence_margin: float = 0.05,
-                model1=None, model2=None):
+                model1=None, model2=None,
+                selection_mode: str = "argmax",
+                temperature: float = 1.0,
+                epsilon: float = 0.0,
+                rng=None):
     """
     Return pick_fn(player, obs_vec, other_skill_idx, info=None) -> skill_idx.
 
@@ -418,6 +419,24 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             "Pass it to make_picker(model_p=...)."
         )
 
+    # Dispatch helper: converts ego action_scores tensor → skill index.
+    # 'argmax' preserves the existing confidence-margin softmax fallback;
+    # other modes use select_skill_from_values from skill_selection.py.
+    if selection_mode == "argmax":
+        def _dispatch(action_scores: "torch.Tensor") -> int:
+            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
+    else:
+        from nash_skills.v2.skill_selection import select_skill_from_values as _ssv
+
+        def _dispatch(action_scores: "torch.Tensor") -> int:
+            return _ssv(
+                action_scores.numpy(),
+                mode=selection_mode,
+                temperature=temperature,
+                epsilon=epsilon,
+                rng=rng,
+            )
+
     # ------------------------------------------------------------------ #
     # nash-p-hard: joint argmax over full Φ table                         #
     # ------------------------------------------------------------------ #
@@ -428,7 +447,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             # best achievable value for each ego skill so fallback samples over
             # ego actions rather than over N*N joint pairs.
             action_scores = phi.max(dim=1).values
-            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
+            return _dispatch(action_scores)
         return pick_hard
 
     # ------------------------------------------------------------------ #
@@ -442,7 +461,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 action_scores = phi[:, other_skill_idx]
             else:
                 action_scores = -phi[other_skill_idx, :]
-            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
+            return _dispatch(action_scores)
         return pick_br
 
     # ------------------------------------------------------------------ #
@@ -455,7 +474,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 action_scores = phi.min(dim=1).values   # worst opp response per ego skill
             else:
                 action_scores = phi.min(dim=0).values   # worst ego response per opp skill
-            return int(torch.argmax(action_scores).item())
+            return _dispatch(action_scores)
         return pick_minimax
 
     # ------------------------------------------------------------------ #
@@ -468,7 +487,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 action_scores = phi.min(dim=1).values
             else:
                 action_scores = phi.min(dim=0).values   # worst ego response per opp skill
-            return _pick_with_softmax_fallback(action_scores, tau, confidence_margin)
+            return _dispatch(action_scores)
         return pick_adaptive
 
     # ------------------------------------------------------------------ #
@@ -584,6 +603,11 @@ def run_matchup(
     confidence_margin: float = 0.05,
     model1=None,
     model2=None,
+    selection_mode: str = "argmax",
+    temperature: float = 1.0,
+    epsilon: float = 0.0,
+    rng1=None,
+    rng2=None,
 ) -> MatchupResult:
     """
     Run one 5-skill matchup headlessly.
@@ -597,15 +621,24 @@ def run_matchup(
       number of completed episodes.
     - model1 / model2: Q-value models required when strategy1 or strategy2 is
       'ibr' or 'ibr-q'.
+    - rng1 / rng2: independent numpy Generators for player 1 / player 2
+      probabilistic skill selection. Passing the same generator to both
+      players would couple their stochastic draws; keep them separate so
+      each player's sampling is reproducible but not correlated with the
+      other's.
     """
     from nash_skills.env_wrapper import SkillEnv
 
     pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
                         tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2)
+                        model1=model1, model2=model2,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng1)
     pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
                         tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2)
+                        model1=model1, model2=model2,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng2)
 
     env = SkillEnv(proc_id=1, history=HISTORY)
 
@@ -788,6 +821,36 @@ def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
         return None
 
     return max(result.skill_usage.values()) / total
+
+
+# --------------------------------------------------------------------------- #
+# Shared scorecard (nash_skills/v2/scorecard.py, meeting note item 19)         #
+# --------------------------------------------------------------------------- #
+
+def matchup_scorecard(result: MatchupResult) -> dict:
+    """
+    Adapt a MatchupResult into the shared scorecard metric set: adds median
+    rally length, skill-usage entropy, and dominant-skill fraction on top of
+    what print_summary/save_csv already report.
+    """
+    return compute_scorecard(
+        wins=result.ego_wins,
+        losses=result.opp_wins,
+        truncated=result.truncated_episodes,
+        rally_lengths=result.rally_lengths,
+        skill_usage=result.skill_usage,
+    )
+
+
+def print_full_scorecards(results: List[MatchupResult], file=None) -> None:
+    """Print the full shared scorecard for every matchup result, one block each."""
+    if file is None:
+        file = sys.stdout
+    for r in results:
+        label = f"{r.strategy1} vs {r.strategy2}"
+        sc = matchup_scorecard(r)
+        print(format_scorecard(sc, label=label), file=file)
+        print(file=file)
 
 
 # --------------------------------------------------------------------------- #
@@ -1054,6 +1117,47 @@ def main():
         dest="confidence_margin",
         help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax instead of argmax (default: 0.05)",
     )
+    parser.add_argument(
+        "--selection-mode",
+        default="argmax",
+        dest="selection_mode",
+        choices=["argmax", "softmax", "epsilon_argmax", "epsilon_softmax"],
+        help=(
+            "Skill-selection mode applied after computing action scores from Φ:\n"
+            "  argmax          — deterministic argmax (default; preserves original behavior)\n"
+            "  softmax         — sample from softmax(scores / --temperature)\n"
+            "  epsilon_argmax  — argmax with ε-greedy uniform exploration\n"
+            "  epsilon_softmax — softmax with ε-uniform mixing\n"
+            "Note: 'argmax' still uses the existing confidence-margin softmax fallback."
+        ),
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Softmax temperature for --selection-mode softmax/epsilon_softmax (default: 1.0)",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.0,
+        help="Exploration rate in [0,1] for --selection-mode epsilon_argmax/epsilon_softmax (default: 0.0)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="RNG seed for probabilistic selection modes (default: None = non-reproducible)",
+    )
+    parser.add_argument(
+        "--model-dir",
+        default=None,
+        dest="model_dir",
+        help=(
+            "Override the directory from which model .pth files are loaded "
+            "(default: 'models/'). Example: --model-dir models_new"
+        ),
+    )
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
@@ -1062,15 +1166,21 @@ def main():
     print("Loading models...")
     ppo = PPO.load(PPO_MODEL_PATH)
 
+    def _model_path(default_path: str) -> str:
+        if args.model_dir is None:
+            return default_path
+        import os
+        return os.path.join(args.model_dir, os.path.basename(default_path))
+
     if args.arch == "factored":
         # FactoredModel weights trained on 116-dim raw obs.
         # Pick v2 (minibatch-mean) or v3 (same-state per-sample) trained weights
         # based on the pipeline flag. One of --v2-5skill / --v3-5skill is required.
         if args.v3_5skill:
-            model_p_path = MODEL_P_5SK_V3_FACTORED_PATH
+            model_p_path = _model_path(MODEL_P_5SK_V3_FACTORED_PATH)
             pipeline_tag = "v3-5skill-factored"
         elif args.v2_5skill:
-            model_p_path = MODEL_P_5SK_FACTORED_PATH
+            model_p_path = _model_path(MODEL_P_5SK_FACTORED_PATH)
             pipeline_tag = "v2-5skill-factored"
         else:
             raise SystemExit(
@@ -1083,24 +1193,24 @@ def main():
         model_p = FactoredModel(state_dim=74, skill_dim=2, last_layer_activation=None)
     elif args.v3_5skill:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-        model_p_path = MODEL_P_5SK_V3_PATH
+        model_p_path = _model_path(MODEL_P_5SK_V3_PATH)
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v3-5skill"
     elif args.v2_5skill:
         # 5-skill v2: 76-dim encoded states, all 5 skills, discounted-return training
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-        model_p_path = MODEL_P_5SK_V2_PATH
+        model_p_path = _model_path(MODEL_P_5SK_V2_PATH)
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v2-5skill"
     elif args.v2:
         # 4-skill v2: 76-dim encoded states (original v2 diagnostic)
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
-        model_p_path = MODEL_P_V2_PATH
+        model_p_path = _model_path(MODEL_P_V2_PATH)
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v2-4skill"
     else:
         # v1: original 116-dim raw obs
-        model_p_path = MODEL_P_5SK_PATH
+        model_p_path = _model_path(MODEL_P_5SK_PATH)
         model_p = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v1-5skill"
 
@@ -1180,8 +1290,17 @@ def main():
 
     results: List[MatchupResult] = []
 
-    for s1, s2 in DEFAULT_MATCHUPS:
+    for matchup_idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS):
         print(f"  [{s1} vs {s2}] ...")
+
+        # Independent, per-matchup, per-player seeds: player 1 and player 2
+        # must not share a generator (coupled stochastic draws), and each
+        # matchup must not replay the same draws as the previous one.
+        if args.seed is not None:
+            rng1 = np.random.default_rng(args.seed + 2 * matchup_idx)
+            rng2 = np.random.default_rng(args.seed + 2 * matchup_idx + 1)
+        else:
+            rng1 = rng2 = None
 
         r = run_matchup(
             strategy1=s1,
@@ -1197,6 +1316,11 @@ def main():
             confidence_margin=args.confidence_margin,
             model1=model1,
             model2=model2,
+            selection_mode=args.selection_mode,
+            temperature=args.temperature,
+            epsilon=args.epsilon,
+            rng1=rng1,
+            rng2=rng2,
         )
         results.append(r)
 
