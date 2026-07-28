@@ -30,7 +30,11 @@ Each entry:
         'skill1' : str,                  # ego skill name
         'skill2' : str,                  # opp skill name
         'states' : list[np.ndarray],     # encoded states, shape (76,) each
-        'raw_obs': list[np.ndarray],     # raw 116-dim obs (for debugging)
+                                         # one per net crossing
+        'raw_obs': list[np.ndarray],     # raw 116-dim obs at each net crossing
+                                         # (aligned 1:1 with `states`)
+        'terminal_obs': np.ndarray,      # raw 116-dim obs at the actual done
+                                         # step (ball past racket); NOT in raw_obs
         'winner' : int,                  # 1=ego, 2=opp (truncated episodes discarded)
     }
 
@@ -50,6 +54,8 @@ import argparse
 import itertools
 import pickle as pkl
 import time
+from collections import Counter
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -68,6 +74,69 @@ TARGET_RALLIES        = 50    # rallies per skill pair (25 pairs → 1250 total)
 MAX_STEPS_PER_EPISODE = 800   # step cap per episode (headless, no real-time)
 HISTORY               = 4
 # --------------------------------------------------------------------------- #
+
+
+def _validate_skill(name: str) -> str:
+    if name not in SKILL_NAMES:
+        raise ValueError(f"Unknown skill '{name}'. Valid: {', '.join(SKILL_NAMES)}")
+    return name
+
+
+def _selected_pairs(
+    skill1: Optional[str] = None,
+    skill2: Optional[str] = None,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> List[Tuple[str, str]]:
+    """
+    Return the skill pairs assigned to this collector run.
+
+    Defaults to all 25 pairs. --skill1/--skill2 restrict the Cartesian
+    product. --num-shards/--shard-index split the ordered pair list so
+    multiple processes can collect DIFFERENT pairs in parallel (partition,
+    not replication).
+    """
+    if num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard_index < num_shards")
+    skills1: Sequence[str] = [_validate_skill(skill1)] if skill1 else SKILL_NAMES
+    skills2: Sequence[str] = [_validate_skill(skill2)] if skill2 else SKILL_NAMES
+    pairs = list(itertools.product(skills1, skills2))
+    return [pair for idx, pair in enumerate(pairs) if idx % num_shards == shard_index]
+
+
+def _save_rallies_atomic(rallies: list, output_path: str, label: str) -> None:
+    """Atomic write: tmp file + rename so a crash never corrupts the pickle."""
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
+                exist_ok=True)
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        pkl.dump(rallies, f)
+    os.replace(tmp_path, output_path)
+    print(f"  [checkpoint:{label}] saved {len(rallies)} rallies to {output_path}",
+          flush=True)
+
+
+def _load_existing_rallies(output_path: str) -> list:
+    """Load existing pickle if present; return [] otherwise."""
+    if not os.path.exists(output_path):
+        return []
+    with open(output_path, "rb") as f:
+        rallies = pkl.load(f)
+    if not isinstance(rallies, list):
+        raise ValueError(f"Expected a list in existing output {output_path}")
+    print(f"Resuming from {output_path}: loaded {len(rallies)} existing rallies")
+    return rallies
+
+
+def _count_pairs(rallies: list) -> Counter:
+    """Count rallies per (skill1, skill2) pair in the loaded list."""
+    counts = Counter()
+    for entry in rallies:
+        if "skill1" in entry and "skill2" in entry:
+            counts[(entry["skill1"], entry["skill2"])] += 1
+    return counts
 
 
 def _build_ppo_obs(obs, info, player: int) -> np.ndarray:
@@ -98,25 +167,61 @@ def collect(
     max_steps_per_episode: int = MAX_STEPS_PER_EPISODE,
     max_attempts_per_pair: int | None = None,
     progress_every: int = 10,
+    keep_truncated: bool = False,
+    pairs: Optional[Iterable[Tuple[str, str]]] = None,
+    checkpoint_every: int = 100,
+    resume: bool = True,
 ) -> list:
     """
-    Collect `target_rallies` complete rallies for each of the 25 skill pairs.
+    Collect `target_rallies` complete rallies for each selected skill pair.
+
+    pairs:            iterable of (skill1, skill2). Defaults to all 25 pairs.
+                      Use _selected_pairs(num_shards=, shard_index=) to partition.
+    checkpoint_every: atomic save every N accepted rallies per pair (0 disables).
+                      Pair completion always triggers a save regardless.
+    resume:           if True (default), load existing output_path on start and
+                      skip pairs already at target. Set False for a fresh run.
 
     Returns the full list of rally dicts (also saved to output_path).
     """
     env   = SkillEnv(proc_id=1, history=HISTORY)
     model = PPO.load(ppo_path)
 
-    all_rallies = []
+    selected = list(pairs) if pairs is not None else \
+               list(itertools.product(SKILL_NAMES, SKILL_NAMES))
+    if not selected:
+        raise ValueError("No skill pairs selected for collection.")
+
+    print(f"Selected {len(selected)} skill pair(s):")
+    for idx, (s1, s2) in enumerate(selected):
+        print(f"  [{idx:02d}] {s1} vs {s2}")
+
+    all_rallies = _load_existing_rallies(output_path) if resume else []
+    existing_counts = _count_pairs(all_rallies)
+    if all_rallies:
+        print("Existing selected-pair counts:")
+        for s1, s2 in selected:
+            print(f"  {s1:12s} vs {s2:12s}: "
+                  f"{existing_counts.get((s1, s2), 0)}/{target_rallies}")
+
     pair_summaries = []
     incomplete_pairs = []
 
-    for skill1, skill2 in itertools.product(SKILL_NAMES, SKILL_NAMES):
+    for skill1, skill2 in selected:
+        already = existing_counts.get((skill1, skill2), 0)
+        if already >= target_rallies:
+            print(f"\n=== Skipping: ego={skill1}  opp={skill2} "
+                  f"({already}/{target_rallies} already collected) ===", flush=True)
+            continue
+
         print(f"\n=== Collecting: ego={skill1}  opp={skill2} ===", flush=True)
+        if already > 0:
+            print(f"  Resume: {already}/{target_rallies} already collected; "
+                  f"collecting {target_rallies - already} more")
         env.set_skills(skill1, skill2)
         obs, info = env.reset()
 
-        completed = 0
+        completed = already            # resume count
         attempts = 0
         discarded = 0
         steps_this_combo = 0
@@ -159,7 +264,8 @@ def collect(
 
             # Only completed rallies provide useful discounted-return labels.
             if done:
-                terminal_raw = curr_raw + [obs.copy()]
+                terminal_obs = obs.copy()
+                terminal_raw = curr_raw + [terminal_obs]
                 winner = detect_winner(terminal_raw, done=True, info=info)
                 attempts += 1
                 steps_completed_attempts += steps_in_ep
@@ -170,6 +276,7 @@ def collect(
                         "skill2":  skill2,
                         "states":  curr_states,
                         "raw_obs": curr_raw,
+                        "terminal_obs": terminal_obs,
                         "winner":  winner,
                     })
                     completed += 1
@@ -177,6 +284,11 @@ def collect(
                     if completed % 10 == 0:
                         print(f"  {completed}/{target_rallies} rallies  "
                               f"({steps_this_combo} steps so far)", flush=True)
+                    if checkpoint_every > 0 and completed % checkpoint_every == 0:
+                        _save_rallies_atomic(
+                            all_rallies, output_path,
+                            label=f"{skill1}_vs_{skill2}_{completed}",
+                        )
                 else:
                     discarded += 1
                     if len(curr_states) == 0:
@@ -207,10 +319,27 @@ def collect(
             # Discard step-capped episodes instead of saving winner=0 labels.
             elif steps_in_ep >= max_steps_per_episode:
                 attempts += 1
-                discarded += 1
                 steps_completed_attempts += steps_in_ep
-                last_reason = "discarded-step-cap"
-                last_winner = 0
+                if keep_truncated and len(curr_states) > 0:
+                    terminal_obs = obs.copy()
+                    all_rallies.append({
+                        "skill1": skill1, "skill2": skill2,
+                        "states": curr_states,
+                        "raw_obs": curr_raw,
+                        "terminal_obs": terminal_obs,
+                        "winner": 0,                    # tie
+                    })
+                    completed += 1
+                    last_reason = "accepted-truncated-tie"
+                    if checkpoint_every > 0 and completed % checkpoint_every == 0:
+                        _save_rallies_atomic(
+                            all_rallies, output_path,
+                            label=f"{skill1}_vs_{skill2}_{completed}",
+                        )
+                else:
+                    discarded += 1
+                    last_reason = "discarded-step-cap"
+                    last_winner = 0
 
                 if progress_every > 0 and attempts % progress_every == 0:
                     elapsed = time.monotonic() - pair_start_time
@@ -256,12 +385,17 @@ def collect(
             flush=True,
         )
 
+        # Per-pair checkpoint (always, regardless of checkpoint_every).
+        _save_rallies_atomic(
+            all_rallies, output_path,
+            label=f"{skill1}_vs_{skill2}_done",
+        )
+
     env.close()
 
-    # Save
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-    with open(output_path, "wb") as f:
-        pkl.dump(all_rallies, f)
+    # Final save (same content as the last checkpoint; kept for the
+    # "Saved N rallies" log line callers grep for).
+    _save_rallies_atomic(all_rallies, output_path, label="final")
     print(f"\nSaved {len(all_rallies)} rallies to {output_path}")
 
     print("\nDiagnostic pair summary:")
@@ -315,7 +449,29 @@ if __name__ == "__main__":
                         help="Stop each skill pair after this many attempts, even if target rallies are not reached")
     parser.add_argument("--progress-every", type=int, default=10,
                         help="Print progress every N completed attempts per skill pair; <=0 disables attempt progress")
+    parser.add_argument("--keep-truncated", action="store_true",
+                        help="Keep step-capped rallies as ties (winner=0) instead of discarding")
+    parser.add_argument("--skill1", default=None,
+                        help="Restrict ego skill (default: all 5)")
+    parser.add_argument("--skill2", default=None,
+                        help="Restrict opp skill (default: all 5)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Split selected pairs across this many shards (partition)")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Collect pairs whose ordered index mod num_shards equals this value")
+    parser.add_argument("--checkpoint-every", type=int, default=100,
+                        help="Atomic save every N accepted rallies per pair (0 disables periodic; per-pair save still happens)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                        help="Ignore any existing output file and start this shard from scratch")
+    parser.set_defaults(resume=True)
     args = parser.parse_args()
+
+    sel_pairs = _selected_pairs(
+        skill1=args.skill1,
+        skill2=args.skill2,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+    )
 
     collect(
         target_rallies=args.rallies,
@@ -324,4 +480,8 @@ if __name__ == "__main__":
         max_steps_per_episode=args.max_steps,
         max_attempts_per_pair=args.max_attempts_per_pair,
         progress_every=args.progress_every,
+        keep_truncated=args.keep_truncated,
+        pairs=sel_pairs,
+        checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
     )

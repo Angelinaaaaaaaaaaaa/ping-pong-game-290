@@ -154,7 +154,8 @@ def main():
     print(f"\n[6] Sample Q1 surface (state[0])")
     surf = q1_table[0]
     skill_w = 12
-    header = f"  {'ego \\\\ opp':<14}" + "".join(f"{s[:8]:>{skill_w}}" for s in SKILL_NAMES)
+    hd = 'ego \\\\ opp'
+    header = f"  {hd:<14}" + "".join(f"{s[:8]:>{skill_w}}" for s in SKILL_NAMES)
     print(header)
     for i, name in enumerate(SKILL_NAMES):
         row = f"  {name:<14}"

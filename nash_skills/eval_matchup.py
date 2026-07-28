@@ -228,11 +228,12 @@ def _build_obs2(obs, info):
 def _safe_load_state_dict(path: str):
     """
     Load a PyTorch checkpoint and support older torch versions.
+    Maps storages to CPU so checkpoints saved on CUDA load on CPU-only machines.
     """
     try:
-        return torch.load(path, weights_only=True)
+        return torch.load(path, weights_only=True, map_location="cpu")
     except TypeError:
-        return torch.load(path)
+        return torch.load(path, map_location="cpu")
 
 
 def _capture_env_step(env, action):
@@ -570,42 +571,28 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
 # Single matchup runner
 # --------------------------------------------------------------------------- #
 
-def run_matchup(
+def _run_eval_loop(
+    pick1,
+    pick2,
     strategy1: str,
     strategy2: str,
     ppo,
-    model_p,
     n_episodes: int,
     max_steps_per_episode: int,
     warmup_steps: int = 300,
     max_total_steps: Optional[int] = None,
-    state_encoder_fn=None,
-    tau: float = 0.2,
-    confidence_margin: float = 0.05,
-    model1=None,
-    model2=None,
 ) -> MatchupResult:
     """
-    Run one 5-skill matchup headlessly.
+    Core headless eval loop. Takes pre-built pickers, runs `n_episodes`
+    completed rallies, returns a MatchupResult.
 
-    Important:
-    - One-time global warmup.
-    - After warmup, keep running until we complete n_episodes.
-    - If an episode hits max_steps_per_episode, truncate and reset it.
-    - max_total_steps is an optional absolute safety valve. By default there
-      is no total-step cap, so heavy truncation cannot silently reduce the
-      number of completed episodes.
-    - model1 / model2: Q-value models required when strategy1 or strategy2 is
-      'ibr' or 'ibr-q'.
+    strategy1/strategy2 are kept for metadata/logging only
+    (skill_usage tracking is gated on strategy1 being a learned strategy).
+
+    Used by both `run_matchup` (single model set) and `run_matchup_dual`
+    (player A and player B use different model sets).
     """
     from nash_skills.env_wrapper import SkillEnv
-
-    pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2)
-    pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2)
 
     env = SkillEnv(proc_id=1, history=HISTORY)
 
@@ -761,6 +748,88 @@ def run_matchup(
         episode_steps=episode_steps,
         skill_usage=skill_usage,
         total_steps=total_steps,
+    )
+
+
+def run_matchup(
+    strategy1: str,
+    strategy2: str,
+    ppo,
+    model_p,
+    n_episodes: int,
+    max_steps_per_episode: int,
+    warmup_steps: int = 300,
+    max_total_steps: Optional[int] = None,
+    state_encoder_fn=None,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
+    model1=None,
+    model2=None,
+) -> MatchupResult:
+    """
+    Run one 5-skill matchup headlessly. Both players use the same model set.
+
+    Important:
+    - One-time global warmup.
+    - After warmup, keep running until we complete n_episodes.
+    - If an episode hits max_steps_per_episode, truncate and reset it.
+    - max_total_steps is an optional absolute safety valve. By default there
+      is no total-step cap, so heavy truncation cannot silently reduce the
+      number of completed episodes.
+    - model1 / model2: Q-value models required when strategy1 or strategy2 is
+      'ibr' or 'ibr-q'.
+    """
+    pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2)
+    pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2)
+    return _run_eval_loop(
+        pick1, pick2, strategy1, strategy2, ppo,
+        n_episodes=n_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        warmup_steps=warmup_steps,
+        max_total_steps=max_total_steps,
+    )
+
+
+def run_matchup_dual(
+    strategy1: str,
+    strategy2: str,
+    ppo,
+    model_p_a,
+    model_p_b,
+    n_episodes: int,
+    max_steps_per_episode: int,
+    warmup_steps: int = 300,
+    max_total_steps: Optional[int] = None,
+    state_encoder_fn=None,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
+    model1_a=None, model2_a=None,
+    model1_b=None, model2_b=None,
+) -> MatchupResult:
+    """
+    Head-to-head: player 1 uses model set A, player 2 uses model set B.
+
+    Lets you compare two trained pipelines (e.g. tie-trained Q+Phi vs
+    discard-trained Q+Phi) by having them play each other directly.
+
+    All other behaviour is identical to `run_matchup`.
+    """
+    pick1 = make_picker(strategy1, model_p_a, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1_a, model2=model2_a)
+    pick2 = make_picker(strategy2, model_p_b, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1_b, model2=model2_b)
+    return _run_eval_loop(
+        pick1, pick2, strategy1, strategy2, ppo,
+        n_episodes=n_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        warmup_steps=warmup_steps,
+        max_total_steps=max_total_steps,
     )
 
 
@@ -1054,6 +1123,31 @@ def main():
         dest="confidence_margin",
         help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax instead of argmax (default: 0.05)",
     )
+    # ----------------------------- Dual mode --------------------------------
+    # When all three --dual-* paths are supplied, run a single head-to-head
+    # matchup where player 1 uses the model set loaded by the existing pipeline
+    # flags (--v3-5skill / --arch / etc.) and player 2 uses the dual paths.
+    # Skips the DEFAULT_MATCHUPS loop entirely.
+    parser.add_argument("--dual-model1-a", default=None,
+                        help="Override Q model 1 path for player A (otherwise "
+                             "uses the path implied by --v3-5skill / etc.)")
+    parser.add_argument("--dual-model2-a", default=None,
+                        help="Override Q model 2 path for player A")
+    parser.add_argument("--dual-model-p-a", default=None,
+                        help="Override potential model path for player A")
+    parser.add_argument("--dual-model1-b", default=None,
+                        help="Q model 1 path for player B (enables dual mode)")
+    parser.add_argument("--dual-model2-b", default=None,
+                        help="Q model 2 path for player B")
+    parser.add_argument("--dual-model-p-b", default=None,
+                        help="Potential model path for player B")
+    parser.add_argument("--dual-strategy1", default="nash-p-hard",
+                        help="Strategy for player 1 in dual mode (default: nash-p-hard)")
+    parser.add_argument("--dual-strategy2", default="nash-p-hard",
+                        help="Strategy for player 2 in dual mode (default: nash-p-hard)")
+    parser.add_argument("--dual-swap", action="store_true",
+                        help="Also run swapped match (B as p1, A as p2) "
+                             "to control for ego-side advantage")
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
@@ -1104,6 +1198,9 @@ def main():
         model_p = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v1-5skill"
 
+    # Dual mode: optionally override player-A potential path
+    if args.dual_model_p_a:
+        model_p_path = args.dual_model_p_a
     model_p.load_state_dict(_safe_load_state_dict(model_p_path))
     model_p.eval()
 
@@ -1147,6 +1244,11 @@ def main():
                 _q2_path = MODEL2_5SK_PATH
             model1 = SimpleModel(_sdim, [64, 32, 16], 1)
             model2 = SimpleModel(_sdim, [64, 32, 16], 1)
+        # Dual mode: optionally override player-A Q paths
+        if args.dual_model1_a:
+            _q1_path = args.dual_model1_a
+        if args.dual_model2_a:
+            _q2_path = args.dual_model2_a
         model1.load_state_dict(_safe_load_state_dict(_q1_path))
         model2.load_state_dict(_safe_load_state_dict(_q2_path))
         model1.eval()
@@ -1172,6 +1274,92 @@ def main():
 
     print(f"  Loaded PPO:         {PPO_MODEL_PATH}")
     print(f"  Loaded potential:   {model_p_path}  ({pipeline_tag})")
+
+    # ------------------------------------------------------------------ #
+    # Dual mode: head-to-head model A (loaded above) vs model B          #
+    # ------------------------------------------------------------------ #
+    dual_paths = (args.dual_model1_b, args.dual_model2_b, args.dual_model_p_b)
+    if any(dual_paths):
+        if not all(dual_paths):
+            raise SystemExit(
+                "Dual mode requires all three: --dual-model1-b, --dual-model2-b, "
+                "--dual-model-p-b. Got " + repr(dual_paths)
+            )
+        if args.arch == "factored":
+            raise SystemExit("Dual mode currently only supports --arch simple.")
+
+        # Reuse model A's state_dim — model B must match.
+        sdim_a = model_p.batch_norm.num_features
+        print(f"\nLoading model set B (state_dim={sdim_a}) ...")
+        model1_b = SimpleModel(sdim_a, [64, 32, 16], 1)
+        model2_b = SimpleModel(sdim_a, [64, 32, 16], 1)
+        model_p_b = SimpleModel(sdim_a, [64, 32, 16], 1, last_layer_activation=None)
+        model1_b.load_state_dict(_safe_load_state_dict(args.dual_model1_b))
+        model2_b.load_state_dict(_safe_load_state_dict(args.dual_model2_b))
+        model_p_b.load_state_dict(_safe_load_state_dict(args.dual_model_p_b))
+        model1_b.eval(); model2_b.eval(); model_p_b.eval()
+        print(f"  Loaded {args.dual_model1_b}")
+        print(f"  Loaded {args.dual_model2_b}")
+        print(f"  Loaded {args.dual_model_p_b}")
+
+        if model1 is None or model2 is None:
+            # Strategies like nash-p-hard don't need Q, but dual A still needs them
+            # if dual_strategy uses ibr/ibr-q. Load them lazily.
+            needs_q_dual = {args.dual_strategy1, args.dual_strategy2} & {"ibr", "ibr-q"}
+            if needs_q_dual:
+                raise SystemExit(
+                    f"Dual strategy {needs_q_dual} requires player-A Q models, "
+                    "but DEFAULT_MATCHUPS didn't load them. Add an ibr matchup "
+                    "to DEFAULT_MATCHUPS or extend dual mode to load them."
+                )
+
+        def _run_one(label, p1_strategy, p2_strategy,
+                     mp1, m1_1, m2_1, mp2, m1_2, m2_2):
+            print(f"\n=== {label}: P1={p1_strategy} (A)  vs  P2={p2_strategy} (B) ===")
+            res = run_matchup_dual(
+                strategy1=p1_strategy, strategy2=p2_strategy,
+                ppo=ppo,
+                model_p_a=mp1, model_p_b=mp2,
+                model1_a=m1_1, model2_a=m2_1,
+                model1_b=m1_2, model2_b=m2_2,
+                n_episodes=args.episodes,
+                max_steps_per_episode=args.steps,
+                warmup_steps=args.warmup,
+                max_total_steps=args.max_total_steps,
+                state_encoder_fn=state_encoder_fn,
+                tau=args.tau,
+                confidence_margin=args.confidence_margin,
+            )
+            wr = res.ego_wins / res.episodes if res.episodes else 0.0
+            print(f"  ego_wins={res.ego_wins}/{res.episodes} = {wr:.1%}  "
+                  f"truncated={res.truncated_episodes}")
+            return wr
+
+        wr_a_p1 = _run_one("Match 1 (A as P1)",
+                           args.dual_strategy1, args.dual_strategy2,
+                           model_p,  model1,  model2,
+                           model_p_b, model1_b, model2_b)
+
+        if args.dual_swap:
+            wr_b_p1 = _run_one("Match 2 (B as P1, swapped)",
+                               args.dual_strategy1, args.dual_strategy2,
+                               model_p_b, model1_b, model2_b,
+                               model_p,  model1,  model2)
+            print(f"\n=== Dual summary (ego-side controlled) ===")
+            print(f"  A as P1 win rate: {wr_a_p1:.1%}")
+            print(f"  B as P1 win rate: {wr_b_p1:.1%}")
+            a_total = wr_a_p1 + (1 - wr_b_p1)
+            b_total = (1 - wr_a_p1) + wr_b_p1
+            print(f"  A net (both directions): {a_total:.2f}  vs  B net: {b_total:.2f}")
+            if a_total > b_total + 0.05:
+                print(f"  → A stronger by {a_total - b_total:.2f}")
+            elif b_total > a_total + 0.05:
+                print(f"  → B stronger by {b_total - a_total:.2f}")
+            else:
+                print(f"  → roughly equal")
+
+        return  # skip DEFAULT_MATCHUPS loop
+
     print(
         f"\nRunning {len(DEFAULT_MATCHUPS)} matchups "
         f"to {args.episodes} completed episodes each "

@@ -52,7 +52,7 @@ def flip_rally(rally: dict) -> Optional[dict]:
     Raises ValueError if any raw_obs entry is not 116-dimensional.
     """
     winner = rally.get("winner")
-    if winner not in (1, 2):
+    if winner not in (0, 1, 2):
         return None
 
     flip_skill1 = mirror_skill(rally["skill2"])
