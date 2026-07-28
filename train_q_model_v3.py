@@ -17,7 +17,8 @@ OLD (bugs / design flaws):
      from truncations.
 
 NEW design:
-  1. Discounted-return targets via labeling.compute_returns (gamma=0.9).
+  1. Discounted-return targets via labeling.compute_returns (gamma=GAMMA,
+     currently 0.7 -- see nash_skills/v2/labeling.py).
      Every crossing in a won rally receives a nonzero label.
   2. Potential LR = 0.001 (same as Q models) → stable training.
   3. Skill encoding: {-1, +1} matching the env's side_target convention.
@@ -70,7 +71,7 @@ CHECKPOINT_EVERY   = 100
 # --------------------------------------------------------------------------- #
 
 
-def build_dataset_2skill(rallies: list, gamma: float = 0.7):
+def build_dataset_2skill(rallies: list, gamma: float = GAMMA):
     """
     Convert 2-skill rally dicts into (X, Y1, Y2) tensors using discounted returns.
 
@@ -79,7 +80,7 @@ def build_dataset_2skill(rallies: list, gamma: float = 0.7):
     rallies : list of dicts with keys 'states', 'winner'
         Each state is a numpy array (any dim — may be 116-dim raw obs or
         76-dim encoded, depending on the collector used).
-    gamma   : discount factor (default 0.9)
+    gamma   : discount factor (default: GAMMA from nash_skills.v2.labeling, currently 0.7)
 
     Returns
     -------
@@ -125,7 +126,7 @@ def train(
     rallies = pkl.load(open(rally_path, "rb"))
     print(f"  {len(rallies)} rallies loaded")
 
-    X, Y1_flat, Y2_flat = build_dataset_2skill(rallies, gamma=0.7)
+    X, Y1_flat, Y2_flat = build_dataset_2skill(rallies, gamma=GAMMA)
     # Reshape for MSELoss: (N, 1)
     Y1 = Y1_flat.unsqueeze(1)
     Y2 = Y2_flat.unsqueeze(1)

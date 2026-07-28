@@ -90,15 +90,11 @@ def sample_base_batch(x: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 
 def train(rally_path: str, n_epochs: int, lr: float) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}"
-          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
-
     print(f"Loading {rally_path} ...")
     with open(rally_path, "rb") as f:
         rallies = pkl.load(f)
     print(f"  {len(rallies)} rallies loaded")
-    
+
     rallies = augment_with_flip(rallies)
     print(f"  {len(rallies)} rallies after flip augmentation")
 
@@ -106,20 +102,12 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
 
     x, y1, y2 = build_dataset(rallies)
-    x = x.to(device); y1 = y1.to(device); y2 = y2.to(device)
     print(f"  Dataset: X={x.shape}, Y1={y1.shape}")
-
-    # Auto-detect state_dim from data (allows training on re-encoded rallies
-    # with different encoders, e.g. the 12-dim gantry encoder).
-    detected_state_dim = x.shape[1]
-    if detected_state_dim != STATE_DIM:
-        print(f"  ⚠ Detected state_dim={detected_state_dim} (encoder default={STATE_DIM}). "
-              f"Using detected value.")
 
     n_nonzero = (y1.abs() > 1e-6).sum().item()
     print(f"  Non-zero Y1: {n_nonzero}/{len(y1)} = {100*n_nonzero/len(y1):.1f}%"
           f"  (sparse pipeline had ~4%)")
-    print(f"  GAMMA={GAMMA}, state_dim={detected_state_dim}, N_SKILLS={N_SKILLS}")
+    print(f"  GAMMA={GAMMA}, STATE_DIM={STATE_DIM}, N_SKILLS={N_SKILLS}")
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -129,8 +117,8 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     # ------------------------------------------------------------------ #
     # Train Q-value models                                                 #
     # ------------------------------------------------------------------ #
-    model1 = SimpleModel(detected_state_dim, [64, 32, 16], 1).to(device)
-    model2 = SimpleModel(detected_state_dim, [64, 32, 16], 1).to(device)
+    model1 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
+    model2 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
     opt1 = torch.optim.Adam(model1.parameters(), lr=lr)
     opt2 = torch.optim.Adam(model2.parameters(), lr=lr)
 
@@ -162,7 +150,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     model1.eval()
     model2.eval()
 
-    model_p = SimpleModel(detected_state_dim, [64, 32, 16], 1, last_layer_activation=None).to(device)
+    model_p = SimpleModel(STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
     model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
     model_p.batch_norm.running_var = model1.batch_norm.running_var.clone()
     model_p.batch_norm.momentum = 0.0
@@ -251,16 +239,6 @@ if __name__ == "__main__":
                         help=f"Training epochs (default: {N_EPOCHS})")
     parser.add_argument("--lr", type=float, default=LR,
                         help=f"Learning rate (default: {LR})")
-    parser.add_argument("--output-suffix", default="",
-                        help="Suffix appended to model/log filenames "
-                             "(e.g. '_gantry' → model1_5skill_v3_gantry.pth)")
     args = parser.parse_args()
-
-    if args.output_suffix:
-        MODEL1_PATH  = f"models/model1_5skill_v3{args.output_suffix}.pth"
-        MODEL2_PATH  = f"models/model2_5skill_v3{args.output_suffix}.pth"
-        MODEL_P_PATH = f"models/model_p_5skill_v3{args.output_suffix}.pth"
-        LOG_Q_PATH   = f"logs/train_q_5skill_v3{args.output_suffix}.csv"
-        LOG_P_PATH   = f"logs/train_p_5skill_v3{args.output_suffix}.csv"
 
     train(args.rallies, args.epochs, args.lr)

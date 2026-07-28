@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable fixed-player-2 skill diagnostic for the 5-skill setup."""
+"""Resumable fixed-player skill diagnostic for the 5-skill setup."""
 
 from __future__ import annotations
 
@@ -24,13 +24,31 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from nash_skills.skills import SKILL_NAMES, N_SKILLS, get_skill, skill_index
+from diagnostic_rendering import (
+    EpisodeVideoRecorder,
+    add_render_args,
+    decode_np_random_state,
+    encode_np_random_state,
+    json_safe,
+    manual_render_requested,
+    outcome_label,
+    post_replay_requested,
+    prompt_manual_replays,
+    replay_selected_episodes,
+    render_episode_limit,
+    select_truncated_replays,
+    should_render_live,
+    validate_render_args,
+)
+from nash_skills.skills import SKILL_NAMES, N_SKILLS, SKILL_PROFILE_NAMES, get_skill, skill_index, world_target_xy
 
 HISTORY = 4
 EPISODE_FIELDS = [
+    "episode_id",
     "key",
     "seed",
     "episode_index",
+    "skill_profile",
     "player1_skill",
     "player2_skill",
     "winner",
@@ -38,12 +56,19 @@ EPISODE_FIELDS = [
     "reached_step_limit",
     "physics_steps",
     "decision_state_count",
+    "net_crossings",
+    "successful_returns",
+    "return_bucket",
     "raw_obs_ids",
     "state_ids",
     "player1_target_xy",
     "player2_target_xy",
     "validation_ok",
     "validation_errors",
+    "reset_mode",
+    "gantry_speed_scale",
+    "initial_state",
+    "np_random_state",
 ]
 SUMMARY_FIELDS = [
     "player1_skill",
@@ -72,6 +97,30 @@ SUMMARY_FIELDS = [
     "decision_states_mean",
     "decision_states_median",
     "decision_states_max",
+    "net_crossings_mean",
+    "successful_returns_mean",
+    "zero_return_rate",
+    "one_return_rate",
+    "two_plus_return_rate",
+]
+CONTACT_FIELDS = [
+    "key",
+    "seed",
+    "episode_index",
+    "player1_skill",
+    "player2_skill",
+    "step",
+    "player",
+    "returning_skill",
+    "x_land",
+    "y_land",
+    "expected_x",
+    "expected_y",
+    "error_dx",
+    "error_dy",
+    "error_dist",
+    "winner",
+    "truncated",
 ]
 
 
@@ -79,17 +128,36 @@ def norm_id(skill: str) -> float:
     return skill_index(skill) / (N_SKILLS - 1)
 
 
-def target_xy(skill: str) -> list[float]:
-    side, x_target = get_skill(skill)
+def target_xy(skill: str, skill_profile: str = "current") -> list[float]:
+    side, x_target = get_skill(skill, profile=skill_profile)
     return [float(x_target), float(side * 0.38)]
 
 
-def episode_key(seed: int, player1_skill: str, episode_index: int) -> str:
-    return f"{seed}:{player1_skill}:{episode_index}"
+def episode_key(seed: int, player1_skill: str, episode_index: int, player2_skill: str | None = None) -> str:
+    if player2_skill is None:
+        return f"{seed}:{player1_skill}:{episode_index}"
+    return f"{seed}:{player1_skill}:{player2_skill}:{episode_index}"
 
 
-def episode_rng_seed(seed: int, player1_skill: str, episode_index: int) -> int:
-    return ((seed + 1_000_003) * 1_000_003 + skill_index(player1_skill) * 10_007 + episode_index) % (2**32 - 1)
+def fixed_skill_video_stem(
+    player1_skill: str,
+    player2_skill: str,
+    episode_index: int,
+    winner: str,
+    truncated: bool,
+    steps: int,
+) -> str:
+    return f"fixed_skill_{player1_skill}_vs_{player2_skill}_ep{episode_index}_{outcome_label(winner, truncated)}_{steps}steps"
+
+
+def episode_rng_seed(seed: int, player1_skill: str, episode_index: int, player2_skill: str | None = None) -> int:
+    player2_term = 0 if player2_skill is None else skill_index(player2_skill) * 101
+    return (
+        (seed + 1_000_003) * 1_000_003
+        + skill_index(player1_skill) * 10_007
+        + player2_term
+        + episode_index
+    ) % (2**32 - 1)
 
 
 def wilson_interval(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float | None, float | None]:
@@ -165,17 +233,26 @@ def existing_keys(rows: Iterable[dict[str, Any]]) -> set[str]:
     return keys
 
 
-def validate_resume_rows(rows: Iterable[dict[str, Any]], fixed_skill: str, seeds: list[int], episodes_per_matchup: int) -> None:
+def validate_resume_rows(
+    rows: Iterable[dict[str, Any]],
+    fixed_skill: str,
+    seeds: list[int],
+    episodes_per_matchup: int,
+    fixed_player: int = 2,
+) -> None:
     allowed_seeds = set(seeds)
     for row in rows:
         key = row.get("key")
-        if row.get("player2_skill") != fixed_skill:
+        fixed_field = f"player{fixed_player}_skill"
+        if row.get(fixed_field) != fixed_skill:
             raise ValueError(
-                f"Resume row {key} has player2_skill={row.get('player2_skill')}; "
+                f"Resume row {key} has {fixed_field}={row.get(fixed_field)}; "
                 f"expected {fixed_skill}"
             )
         if row.get("player1_skill") not in SKILL_NAMES:
             raise ValueError(f"Resume row {key} has unknown player1_skill={row.get('player1_skill')}")
+        if row.get("player2_skill") not in SKILL_NAMES:
+            raise ValueError(f"Resume row {key} has unknown player2_skill={row.get('player2_skill')}")
         seed = int(row["seed"])
         episode_index = int(row["episode_index"])
         if seed not in allowed_seeds:
@@ -205,6 +282,8 @@ def rows_for_aggregation(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
         item["reached_step_limit"] = str(item["reached_step_limit"]).lower() in {"true", "1", "yes"}
         item["physics_steps"] = int(item["physics_steps"])
         item["decision_state_count"] = int(item["decision_state_count"])
+        item["net_crossings"] = int(item.get("net_crossings") or item["decision_state_count"])
+        item["successful_returns"] = int(item.get("successful_returns") or 0)
         item["validation_ok"] = str(item["validation_ok"]).lower() in {"true", "1", "yes"}
         normalized.append(item)
     return normalized
@@ -225,6 +304,8 @@ def aggregate_rows(rows: list[dict[str, Any]], fixed_skill: str) -> list[dict[st
         completed = p1 + p2
         steps = [r["physics_steps"] for r in rs]
         decision_counts = [r["decision_state_count"] for r in rs]
+        crossing_counts = [r["net_crossings"] for r in rs]
+        return_counts = [r["successful_returns"] for r in rs]
         p1_ci = wilson_interval(p1, n)
         p2_ci = wilson_interval(p2, n)
         step_ci = wilson_interval(step_limit, n)
@@ -256,6 +337,11 @@ def aggregate_rows(rows: list[dict[str, Any]], fixed_skill: str) -> list[dict[st
             "decision_states_mean": statistics.mean(decision_counts) if decision_counts else None,
             "decision_states_median": statistics.median(decision_counts) if decision_counts else None,
             "decision_states_max": max(decision_counts) if decision_counts else None,
+            "net_crossings_mean": statistics.mean(crossing_counts) if crossing_counts else None,
+            "successful_returns_mean": statistics.mean(return_counts) if return_counts else None,
+            "zero_return_rate": sum(v == 0 for v in return_counts) / n if n else None,
+            "one_return_rate": sum(v == 1 for v in return_counts) / n if n else None,
+            "two_plus_return_rate": sum(v >= 2 for v in return_counts) / n if n else None,
         })
     return summary
 
@@ -267,8 +353,9 @@ def validate_episode_state(env, player1_skill: str, player2_skill: str, raw_obs,
         errors.append(f"raw ids {np.asarray(raw_obs)[-2:].tolist()} != {expected}")
     if state is not None and not np.allclose(np.asarray(state)[-2:], expected, atol=1e-6):
         errors.append(f"state ids {np.asarray(state)[-2:].tolist()} != {expected}")
-    side1, x1 = get_skill(player1_skill)
-    side2, x2 = get_skill(player2_skill)
+    skill_profile = getattr(env, "skill_profile", "current")
+    side1, x1 = get_skill(player1_skill, profile=skill_profile)
+    side2, x2 = get_skill(player2_skill, profile=skill_profile)
     if float(env.side_target) != float(side1):
         errors.append(f"player1 side target {env.side_target} != {side1}")
     if float(env.side_target_opp) != float(side2):
@@ -307,12 +394,69 @@ def parse_contacts(lines: list[str], step: int) -> list[dict[str, Any]]:
     return contacts
 
 
-def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, player2_skill: str, steps: int):
+def enrich_contacts(
+    contacts: list[dict[str, Any]],
+    row: dict[str, Any],
+    player1_skill: str,
+    player2_skill: str,
+    skill_profile: str,
+) -> list[dict[str, Any]]:
+    enriched = []
+    for contact in contacts:
+        player_num = 1 if contact["player"] == "player1" else 2
+        returning_skill = player1_skill if player_num == 1 else player2_skill
+        expected_x, expected_y = world_target_xy(player_num, returning_skill, profile=skill_profile)
+        x_land = contact.get("x_land")
+        y_land = contact.get("y_land")
+        if x_land is None or y_land is None:
+            dx = dy = dist = ""
+        else:
+            dx = float(x_land) - expected_x
+            dy = float(y_land) - expected_y
+            dist = math.hypot(dx, dy)
+        enriched.append({
+            "key": row["key"],
+            "seed": row["seed"],
+            "episode_index": row["episode_index"],
+            "player1_skill": player1_skill,
+            "player2_skill": player2_skill,
+            "step": contact["step"],
+            "player": contact["player"],
+            "returning_skill": returning_skill,
+            "x_land": x_land,
+            "y_land": y_land,
+            "expected_x": expected_x,
+            "expected_y": expected_y,
+            "error_dx": dx,
+            "error_dy": dy,
+            "error_dist": dist,
+            "winner": row["winner"],
+            "truncated": row["winner"] == "truncated" or row["reached_step_limit"],
+        })
+    return enriched
+
+
+def run_episode(
+    env,
+    model,
+    seed: int,
+    episode_index: int,
+    player1_skill: str,
+    player2_skill: str,
+    steps: int,
+    render_live: bool = False,
+    video_recorder: EpisodeVideoRecorder | None = None,
+    episode_id: int | None = None,
+    reset_mode: str | None = None,
+    gantry_speed_scale: float | None = None,
+):
     from nash_skills.v2.state_encoder import encode_ego
     from nash_skills.winner_inference import infer_terminal_winner
 
     env.set_skills(player1_skill, player2_skill)
+    np_random_state = encode_np_random_state(np.random.get_state())
     obs, info = env.reset()
+    initial_state = json.dumps(json_safe(info.get("initial_state", {})))
     prev_ball_x = float(obs[36])
     decision_states = []
     trajectory_samples = []
@@ -334,6 +478,10 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
         action[9:] = a2[:9]
 
         (obs, _reward, done, _truncated, info), lines = capture_step(env, action)
+        if render_live:
+            env.render()
+        if video_recorder is not None:
+            video_recorder.capture(step)
         contacts.extend(parse_contacts(lines, step))
         curr_ball_x = float(obs[36])
 
@@ -368,11 +516,13 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
             break
 
     validation_errors.extend(validate_episode_state(env, player1_skill, player2_skill, last_raw, last_state))
-    key = episode_key(seed, player1_skill, episode_index)
+    key = episode_key(seed, player1_skill, episode_index, player2_skill)
     row = {
+        "episode_id": "" if episode_id is None else episode_id,
         "key": key,
         "seed": seed,
         "episode_index": episode_index,
+        "skill_profile": getattr(env, "skill_profile", "current"),
         "player1_skill": player1_skill,
         "player2_skill": player2_skill,
         "winner": winner,
@@ -380,19 +530,32 @@ def run_episode(env, model, seed: int, episode_index: int, player1_skill: str, p
         "reached_step_limit": not done,
         "physics_steps": step,
         "decision_state_count": len(decision_states),
+        "net_crossings": len(decision_states),
+        "successful_returns": len(contacts),
+        "return_bucket": "0" if len(contacts) == 0 else "1" if len(contacts) == 1 else "2+",
         "raw_obs_ids": json.dumps(np.asarray(last_raw)[-2:].astype(float).tolist()),
         "state_ids": json.dumps(np.asarray(last_state)[-2:].astype(float).tolist()),
-        "player1_target_xy": json.dumps(target_xy(player1_skill)),
-        "player2_target_xy": json.dumps(target_xy(player2_skill)),
+        "player1_target_xy": json.dumps(target_xy(player1_skill, getattr(env, "skill_profile", "current"))),
+        "player2_target_xy": json.dumps(target_xy(player2_skill, getattr(env, "skill_profile", "current"))),
         "validation_ok": len(validation_errors) == 0,
         "validation_errors": json.dumps(validation_errors),
+        "reset_mode": "" if reset_mode is None else reset_mode,
+        "gantry_speed_scale": "" if gantry_speed_scale is None else gantry_speed_scale,
+        "initial_state": initial_state,
+        "np_random_state": np_random_state,
     }
     detail = {
         "key": key,
         "row": row,
         "decision_states": decision_states,
         "trajectory_samples": trajectory_samples,
-        "contacts": contacts,
+        "contacts": enrich_contacts(
+            contacts,
+            row,
+            player1_skill,
+            player2_skill,
+            getattr(env, "skill_profile", "current"),
+        ),
     }
     return row, detail
 
@@ -415,7 +578,14 @@ def select_representatives(details: list[dict[str, Any]], per_skill: int) -> lis
     return unique
 
 
-def plot_outputs(out: Path, rows: list[dict[str, Any]], summary: list[dict[str, Any]], representatives: list[dict[str, Any]], steps: int) -> list[str]:
+def plot_outputs(
+    out: Path,
+    rows: list[dict[str, Any]],
+    summary: list[dict[str, Any]],
+    representatives: list[dict[str, Any]],
+    steps: int,
+    skill_profile: str = "current",
+) -> list[str]:
     plot_dir = out / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     paths = []
@@ -445,7 +615,10 @@ def plot_outputs(out: Path, rows: list[dict[str, Any]], summary: list[dict[str, 
     rates = [row["step_limit_rate"] or 0 for row in summary]
     lows = [row["step_limit_ci_low"] or 0 for row in summary]
     highs = [row["step_limit_ci_high"] or 0 for row in summary]
-    yerr = [[rate - low for rate, low in zip(rates, lows)], [high - rate for rate, high in zip(rates, highs)]]
+    yerr = [
+        [max(0.0, rate - low) for rate, low in zip(rates, lows)],
+        [max(0.0, high - rate) for rate, high in zip(rates, highs)],
+    ]
     plt.figure(figsize=(8, 5))
     plt.bar(x, rates, yerr=yerr, capsize=3)
     plt.xticks(x, labels, rotation=30, ha="right")
@@ -478,8 +651,8 @@ def plot_outputs(out: Path, rows: list[dict[str, Any]], summary: list[dict[str, 
     comp_lows = [row["completed_player1_win_ci_low"] for row in summary]
     comp_highs = [row["completed_player1_win_ci_high"] for row in summary]
     comp_yerr = [
-        [0.0 if low is None else rate - low for rate, low in zip(comp_rates, comp_lows)],
-        [0.0 if high is None else high - rate for rate, high in zip(comp_rates, comp_highs)],
+        [0.0 if low is None else max(0.0, rate - low) for rate, low in zip(comp_rates, comp_lows)],
+        [0.0 if high is None else max(0.0, high - rate) for rate, high in zip(comp_rates, comp_highs)],
     ]
     plt.figure(figsize=(8, 5))
     plt.bar(x, comp_rates, yerr=comp_yerr, capsize=3)
@@ -491,7 +664,7 @@ def plot_outputs(out: Path, rows: list[dict[str, Any]], summary: list[dict[str, 
 
     plt.figure(figsize=(7, 5))
     for skill in SKILL_NAMES:
-        tx, ty = target_xy(skill)
+        tx, ty = target_xy(skill, skill_profile)
         plt.scatter([tx], [ty], s=60)
         plt.text(tx + 0.01, ty + 0.01, skill)
     plt.xlabel("target x")
@@ -518,15 +691,86 @@ def plot_outputs(out: Path, rows: list[dict[str, Any]], summary: list[dict[str, 
     return paths
 
 
+def plot_landing_outputs(out: Path, contacts: list[dict[str, Any]], fixed_player: int, fixed_skill: str) -> list[str]:
+    if not contacts:
+        return []
+    plot_dir = out / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    fixed_player_name = f"player{fixed_player}"
+    fixed_contacts = [
+        c for c in contacts
+        if c["player"] == fixed_player_name and c.get("x_land") not in (None, "") and c.get("y_land") not in (None, "")
+    ]
+    if fixed_contacts:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        for skill in SKILL_NAMES:
+            pts = np.array(
+                [[float(c["x_land"]), float(c["y_land"])] for c in fixed_contacts if c["player2_skill" if fixed_player == 1 else "player1_skill"] == skill],
+                dtype=float,
+            )
+            if len(pts):
+                ax.scatter(pts[:, 0], pts[:, 1], alpha=0.6, s=20, label=f"opp {skill}")
+        expected = np.array([[float(c["expected_x"]), float(c["expected_y"])] for c in fixed_contacts], dtype=float)
+        actual = np.array([[float(c["x_land"]), float(c["y_land"])] for c in fixed_contacts], dtype=float)
+        target = expected[0]
+        ax.scatter([target[0]], [target[1]], marker="x", s=100, color="black", label=f"expected {fixed_skill}")
+        sample_idx = np.linspace(0, len(actual) - 1, min(len(actual), 40), dtype=int)
+        ax.quiver(
+            expected[sample_idx, 0],
+            expected[sample_idx, 1],
+            actual[sample_idx, 0] - expected[sample_idx, 0],
+            actual[sample_idx, 1] - expected[sample_idx, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1,
+            width=0.003,
+            alpha=0.35,
+            color="gray",
+        )
+        ax.set_xlabel("world landing x")
+        ax.set_ylabel("world landing y")
+        ax.set_title(f"P{fixed_player} {fixed_skill}: expected vs actual landings")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        path = plot_dir / "fixed_player_landing_error_vectors.png"
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        paths.append(str(path))
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    errors = [
+        [float(c["error_dist"]) for c in fixed_contacts if c["player2_skill" if fixed_player == 1 else "player1_skill"] == skill and c["error_dist"] not in ("", None)]
+        for skill in SKILL_NAMES
+    ]
+    labels = [skill for skill, values in zip(SKILL_NAMES, errors) if values]
+    values = [values for values in errors if values]
+    if values:
+        try:
+            ax.boxplot(values, tick_labels=labels, showmeans=True)
+        except TypeError:
+            ax.boxplot(values, labels=labels, showmeans=True)
+    ax.set_ylabel("landing error distance")
+    ax.set_title(f"P{fixed_player} {fixed_skill}: landing error by opponent skill")
+    ax.tick_params(axis="x", labelrotation=30)
+    fig.tight_layout()
+    path = plot_dir / "fixed_player_landing_error_distribution.png"
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+    paths.append(str(path))
+    return paths
+
+
 def write_metadata(out: Path, args, rows: list[dict[str, Any]], failures: list[dict[str, Any]], elapsed: float) -> None:
     metadata = {
         "args": vars(args),
         "episode_count": len(rows),
         "validation_failures": len(failures),
         "all_player1_skills_present": sorted({row["player1_skill"] for row in rows}) == sorted(SKILL_NAMES),
+        "player1_skills_seen": sorted({row["player1_skill"] for row in rows}),
         "player2_skills_seen": sorted({row["player2_skill"] for row in rows}),
         "skills": [
-            {"name": skill, "index": skill_index(skill), "normalized_id": norm_id(skill), "target_xy": target_xy(skill)}
+            {"name": skill, "index": skill_index(skill), "normalized_id": norm_id(skill), "target_xy": target_xy(skill, args.skill_profile)}
             for skill in SKILL_NAMES
         ],
         "elapsed_seconds": elapsed,
@@ -535,31 +779,34 @@ def write_metadata(out: Path, args, rows: list[dict[str, Any]], failures: list[d
 
 
 def write_report(out: Path, args, rows: list[dict[str, Any]], summary: list[dict[str, Any]], failures: list[dict[str, Any]], plots: list[str]) -> Path:
-    highest = sorted(summary, key=lambda row: row["step_limit_rate"] or 0, reverse=True)[:5]
-    report = out / "fixed_player2_diagnostic_report.md"
+    populated = [row for row in summary if row.get("episode_count")]
+    highest = sorted(populated, key=lambda row: row["step_limit_rate"] or 0, reverse=True)[:5]
+    report = out / f"fixed_player{args.fixed_player}_diagnostic_report.md"
     lines = [
-        "# Fixed Player 2 Diagnostic Report",
+        f"# Fixed Player {args.fixed_player} Diagnostic Report",
         "",
         "## Files Inspected And Modified",
         "- Inspected: `nash_skills/skills.py`, `nash_skills/env_wrapper.py`, `nash_skills/winner_inference.py`, `diagnostic_fixed_skill.py`.",
         "- Modified: `diagnostic_fixed_skill.py`.",
         "",
         "## Skill Flow",
-        "Player 2 is fixed to the requested canonical skill for every episode. Player 1 is swept over `SKILL_NAMES`. `SkillEnv` applies physical side/depth targets while observations and encoded states store normalized skill IDs.",
+        f"Player {args.fixed_player} is fixed to the requested canonical skill for every episode. The other player is swept over `SKILL_NAMES`. `SkillEnv` applies physical side/depth targets while observations and encoded states store normalized skill IDs.",
         "",
         "## Command",
-        f"`MUJOCO_GL=egl venv/bin/python diagnostic_fixed_skill.py --fixed-player 2 --fixed-skill {args.fixed_skill} --episodes-per-matchup {args.episodes_per_matchup} --steps {args.steps} --seeds {' '.join(map(str, args.seeds))} --output-dir {args.output_dir}`",
+        f"`MUJOCO_GL=egl venv/bin/python diagnostic_fixed_skill.py --fixed-player {args.fixed_player} --fixed-skill {args.fixed_skill} --episodes-per-matchup {args.episodes_per_matchup} --steps {args.steps} --seeds {' '.join(map(str, args.seeds))} --reset-mode {args.reset_mode} --skill-profile {args.skill_profile} --gantry-speed-scale {args.gantry_speed_scale} --output-dir {args.output_dir}`",
         "",
         "## Validation Results",
         f"- Rows: {len(rows)}",
         f"- Validation failures: {len(failures)}",
-        f"- Fixed player 2 skill: `{args.fixed_skill}`",
+        f"- Fixed player {args.fixed_player} skill: `{args.fixed_skill}`",
         "",
         "## Highest Step-Limit Matchups",
     ]
     for row in highest:
         rate = row["step_limit_rate"]
         lines.append(f"- {row['player1_skill']} vs {row['player2_skill']}: {rate:.3f} ({row['step_limit_count']}/{row['episode_count']})")
+    if not highest:
+        lines.append("- No populated matchup rows were available.")
     lines += [
         "",
         "## Bugs Found",
@@ -573,6 +820,7 @@ def write_report(out: Path, args, rows: list[dict[str, Any]], summary: list[dict
         "- `summary.csv`",
         "- `metadata.json`",
         "- `representative_trajectories.json`",
+        "- `contacts.csv`",
         "- `validation_failures.csv`",
         "- `validation_failures.json`",
     ]
@@ -581,9 +829,80 @@ def write_report(out: Path, args, rows: list[dict[str, Any]], summary: list[dict
     return report
 
 
-def parse_args() -> argparse.Namespace:
+def fixed_skill_replay_stem(row: dict[str, Any]) -> str:
+    return fixed_skill_video_stem(
+        str(row["player1_skill"]),
+        str(row["player2_skill"]),
+        int(row["episode_index"]),
+        str(row["winner"]),
+        str(row["reached_step_limit"]).lower() in {"true", "1", "yes"},
+        int(row["physics_steps"]),
+    )
+
+
+def replay_fixed_episode(env, model, row: dict[str, Any], recorder: EpisodeVideoRecorder) -> None:
+    np.random.set_state(decode_np_random_state(str(row["np_random_state"])))
+    run_episode(
+        env,
+        model,
+        seed=int(row["seed"]),
+        episode_index=int(row["episode_index"]),
+        player1_skill=str(row["player1_skill"]),
+        player2_skill=str(row["player2_skill"]),
+        steps=int(row["physics_steps"]),
+        video_recorder=recorder,
+        reset_mode=str(row.get("reset_mode") or getattr(env, "reset_mode", "")),
+        gantry_speed_scale=float(row.get("gantry_speed_scale") or getattr(env, "gantry_speed_scale", 1.0)),
+    )
+
+
+def run_post_eval_replay(args, model, rows: list[dict[str, Any]]) -> None:
+    if not post_replay_requested(args):
+        return
+    selected: list[dict[str, Any]]
+    video_dir = args.video_dir
+    limit = render_episode_limit(args)
+    if args.render_truncated_only:
+        selected = select_truncated_replays(rows, limit)
+    elif manual_render_requested(args):
+        selected, manual_dir = prompt_manual_replays(rows)
+        if manual_dir is not None:
+            video_dir = manual_dir
+    else:
+        selected = []
+    if not selected:
+        print("No episodes selected for replay.", flush=True)
+        return
+
+    from nash_skills.env_wrapper import SkillEnv
+
+    env = SkillEnv(
+        proc_id=1,
+        history=HISTORY,
+        reset_mode=args.reset_mode,
+        skill_profile=args.skill_profile,
+        gantry_speed_scale=args.gantry_speed_scale,
+    )
+    try:
+        saved = replay_selected_episodes(
+            env,
+            model,
+            selected,
+            replay_one=replay_fixed_episode,
+            filename_stem=fixed_skill_replay_stem,
+            video_dir=video_dir,
+            fps=args.video_fps,
+            capture_every=args.capture_every,
+        )
+    finally:
+        env.close()
+    for path in saved:
+        print(f"Saved replay video: {path}", flush=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fixed-player", type=int, choices=[2], required=True)
+    parser.add_argument("--fixed-player", type=int, choices=[1, 2], required=True)
     parser.add_argument("--fixed-skill", choices=SKILL_NAMES, required=True)
     parser.add_argument("--episodes-per-matchup", type=int, default=100)
     parser.add_argument("--steps", type=int, default=600)
@@ -592,7 +911,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppo", default="logs/best_model_tracker1/best_model")
     parser.add_argument("--representatives-per-skill", type=int, default=2)
     parser.add_argument("--no-resume", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
+    parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="current")
+    parser.add_argument("--gantry-speed-scale", type=float, default=1.0)
+    add_render_args(parser)
+    return parser.parse_args(argv)
 
 
 def main() -> None:
@@ -603,35 +926,60 @@ def main() -> None:
         raise ValueError("--steps must be positive")
     if len(set(args.seeds)) != len(args.seeds):
         raise ValueError("--seeds contains duplicates")
+    validate_render_args(args)
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     episodes_path = out / "episodes.csv"
 
     existing = [] if args.no_resume else load_episode_rows(episodes_path)
-    validate_resume_rows(existing, args.fixed_skill, args.seeds, args.episodes_per_matchup)
+    validate_resume_rows(existing, args.fixed_skill, args.seeds, args.episodes_per_matchup, args.fixed_player)
     seen = existing_keys(existing)
 
     from stable_baselines3 import PPO
     from nash_skills.env_wrapper import SkillEnv
 
     model = PPO.load(args.ppo)
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(
+        proc_id=1,
+        history=HISTORY,
+        reset_mode=args.reset_mode,
+        skill_profile=args.skill_profile,
+        gantry_speed_scale=args.gantry_speed_scale,
+    )
     new_rows = []
     details = []
     start = time.monotonic()
     try:
         for seed in args.seeds:
             np.random.seed(seed)
-            for player1_skill in SKILL_NAMES:
-                player2_skill = args.fixed_skill
+            for other_skill in SKILL_NAMES:
+                if args.fixed_player == 1:
+                    player1_skill = args.fixed_skill
+                    player2_skill = other_skill
+                else:
+                    player1_skill = other_skill
+                    player2_skill = args.fixed_skill
                 print(f"Running seed={seed} {player1_skill} vs {player2_skill}", flush=True)
                 for episode_index in range(args.episodes_per_matchup):
-                    key = episode_key(seed, player1_skill, episode_index)
+                    key = episode_key(seed, player1_skill, episode_index, player2_skill)
                     if key in seen:
                         continue
-                    np.random.seed(episode_rng_seed(seed, player1_skill, episode_index))
-                    row, detail = run_episode(env, model, seed, episode_index, player1_skill, player2_skill, args.steps)
+                    episode_id = len(existing) + len(new_rows)
+                    np.random.seed(episode_rng_seed(seed, player1_skill, episode_index, player2_skill))
+                    row, detail = run_episode(
+                        env,
+                        model,
+                        seed,
+                        episode_index,
+                        player1_skill,
+                        player2_skill,
+                        args.steps,
+                        render_live=should_render_live(args),
+                        episode_id=episode_id,
+                        reset_mode=args.reset_mode,
+                        gantry_speed_scale=args.gantry_speed_scale,
+                    )
                     new_rows.append(row)
                     details.append(detail)
                     seen.add(key)
@@ -647,17 +995,21 @@ def main() -> None:
     summary = aggregate_rows(rows, args.fixed_skill)
     failures = [row for row in rows if str(row["validation_ok"]).lower() not in {"true", "1", "yes"}]
     representatives = select_representatives(details, args.representatives_per_skill)
+    contacts = [contact for detail in details for contact in detail["contacts"]]
 
     write_csv(episodes_path, rows, EPISODE_FIELDS)
     write_csv(out / "summary.csv", summary, SUMMARY_FIELDS)
+    write_csv(out / "contacts.csv", contacts, CONTACT_FIELDS)
     write_csv(out / "validation_failures.csv", failures, EPISODE_FIELDS)
     (out / "validation_failures.json").write_text(json.dumps(failures, indent=2))
     (out / "representative_trajectories.json").write_text(json.dumps(representatives, indent=2))
     write_metadata(out, args, rows, failures, time.monotonic() - start)
-    plots = plot_outputs(out, rows, summary, representatives, args.steps)
+    plots = plot_outputs(out, rows, summary, representatives, args.steps, args.skill_profile)
+    plots.extend(plot_landing_outputs(out, contacts, args.fixed_player, args.fixed_skill))
     report = write_report(out, args, rows, summary, failures, plots)
     print(f"Wrote outputs to {out}", flush=True)
     print(f"Report: {report}", flush=True)
+    run_post_eval_replay(args, model, new_rows)
 
 
 if __name__ == "__main__":

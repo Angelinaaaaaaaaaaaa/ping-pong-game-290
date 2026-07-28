@@ -39,8 +39,8 @@ Each entry:
     }
 
 Run:
-    MUJOCO_GL=cgl venv/bin/python collect_data_v2.py
-    MUJOCO_GL=cgl venv/bin/python collect_data_v2.py \
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib venv/bin/python collect_data_v2.py
+    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib venv/bin/python collect_data_v2.py \
         --rallies 100 --output data/rallies_v2_2skill.pkl
 """
 
@@ -159,7 +159,7 @@ def collect(
             # Episode ended with a real done signal → winner is known
             if done:
                 winner = detect_winner(curr_raw + [obs.copy()], done=True, info=info)
-                if len(curr_states) > 0:
+                if len(curr_states) > 0 and winner in (1, 2):
                     all_rallies.append({
                         "skill1":  skill1,
                         "skill2":  skill2,

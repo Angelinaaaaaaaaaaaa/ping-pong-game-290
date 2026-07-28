@@ -37,12 +37,25 @@ import pickle as pkl
 import numpy as np
 
 from nash_skills.v2.state_encoder_gantry import encode_opp_gantry
+from nash_skills.v2.augment import flip_winner
+# flip_winner is the shared winner-label inverter (1↔2, 0/None unchanged).
+# This script handles the 12-dim gantry encoder; nash_skills/v2/augment.py
+# handles the 76-dim encoder — both use the same flip_winner logic.
 
 
-def flip_winner(w):
-    if w == 1: return 2
-    if w == 2: return 1
-    return 0   # truncated stays truncated
+def count_winners(rallies: list) -> dict:
+    """
+    Count rallies by winner, folding 0, None, and a missing 'winner' key
+    into the truncated bucket (key 0). Without this fold, a None winner
+    would silently create a new dict key and distort the printed
+    percentages, since totals were computed from len(rallies) rather than
+    sum(counts).
+    """
+    counts = {0: 0, 1: 0, 2: 0}
+    for r in rallies:
+        w = r.get("winner")
+        counts[w if w in (1, 2) else 0] += 1
+    return counts
 
 
 def main():
@@ -65,9 +78,7 @@ def main():
         raise KeyError("Rally entries missing 'raw_obs' — cannot re-encode from opp perspective")
 
     # Count original winner distribution
-    orig_w = {1: 0, 2: 0, 0: 0}
-    for r in rallies:
-        orig_w[r["winner"]] = orig_w.get(r["winner"], 0) + 1
+    orig_w = count_winners(rallies)
     total = len(rallies)
     print(f"  Original winners: ego={orig_w[1]} ({orig_w[1]/total:.1%})  "
           f"opp={orig_w[2]} ({orig_w[2]/total:.1%})  "
@@ -96,14 +107,12 @@ def main():
             "skill1":  r["skill2"],         # swap
             "skill2":  r["skill1"],
             "states":  flipped_states,
-            "raw_obs": r["raw_obs"],         # raw obs is physical, no change
+            "raw_obs": [np.array(o, dtype=np.float32) for o in r["raw_obs"]],
             "winner":  flip_winner(r["winner"]),
         })
 
     # Report new winner distribution
-    new_w = {1: 0, 2: 0, 0: 0}
-    for r in new_rallies:
-        new_w[r["winner"]] = new_w.get(r["winner"], 0) + 1
+    new_w = count_winners(new_rallies)
     new_total = len(new_rallies)
     print(f"\nAfter symmetrize ({args.mode}):")
     print(f"  Total rallies: {new_total} ({new_total / total:.1f}x original)")

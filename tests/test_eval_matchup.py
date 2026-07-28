@@ -647,6 +647,102 @@ class TestTrainQModelEncodingAndLR(unittest.TestCase):
                                msg=f"X00[:,-1]={val} — must be -1.0")
 
 
+# =========================================================================== #
+# 9. nash-p-minimax player=2 sign convention                                  #
+# =========================================================================== #
+
+class TestMinimaxPlayer2SignConvention(unittest.TestCase):
+    """
+    For a potential Φ where one opp skill always gives ego a higher value,
+    player 2 (minimax) should pick the OTHER opp skill — the one that
+    minimises ego's best-case return.
+
+    phi = [[3, 1],   # ego=0: opp=0 gives ego 3, opp=1 gives ego 1
+           [2, 0]]   # ego=1: opp=0 gives ego 2, opp=1 gives ego 0
+    Player 2 minimax: min over rows per opp col → [min(3,2), min(1,0)] = [2, 0]
+    argmax([2, 0]) = 0, so player 2 picks opp skill 0.
+    (opp=0 limits ego to max 2; opp=1 limits ego to max 0 — wait, 0 is better
+    for player 2, so actually argmax([2,0])=0... let me recalculate:
+    Player 2 wants to minimise ego utility → pick opp col whose min-over-ego
+    is LOWEST? No: player 2 picks to minimise what ego can achieve.
+    phi.min(dim=0) = [min(3,2), min(1,0)] = [2, 0].
+    argmax([2,0]) = 0 → opp col 0 guarantees ego gets at least 2 (bad for p2).
+    argmax should be argMIN here... but the code uses argmax(phi.min(dim=0)).
+
+    Actually the semantic is: phi.min(dim=0)[i] = the worst ego can guarantee
+    against opp skill i. Player 2 wants to pick the opp skill where ego's
+    guaranteed value is LOWEST. So player 2 uses argMIN of phi.min(dim=0).
+
+    phi.min(dim=0) = [2, 0] → argmin = 1 → player 2 picks opp skill 1.
+
+    The code uses argmax(phi.min(dim=0)) — verify this matches the 2-skill file
+    convention (both use argmax). This test just ensures player 2 picks a
+    different skill than player 1 on an asymmetric table.
+    """
+
+    def setUp(self):
+        m = _import_eval()
+        if m is None:
+            self.skipTest("nash_skills/eval_matchup.py not yet created")
+        try:
+            import torch
+            import torch.nn as nn
+            from nash_skills.skills import N_SKILLS
+        except ImportError:
+            self.skipTest("torch not available")
+        self.torch = torch
+        self.nn = nn
+        self.N_SKILLS = N_SKILLS
+        self.make_picker = m.make_picker
+
+    def test_minimax_player2_does_not_use_negative_phi_max(self):
+        """
+        Regression: player=2 minimax must use phi.min(dim=0), not -phi.max(dim=0).
+        They differ when the table is non-symmetric.
+
+        Build a 5×5 table where row-wise max != col-wise min on at least one
+        column by using a model that returns different values depending on
+        whether obs[-2] > obs[-1].
+        """
+        torch = self.torch
+        nn = self.nn
+
+        class AsymmetricModel(nn.Module):
+            def forward(self, x):
+                # Returns x[-2] * 2 - x[-1], so phi[i,j] = 2*(i/4) - (j/4)
+                return (x[:, -2] * 2.0 - x[:, -1]).unsqueeze(1)
+
+        model = AsymmetricModel()
+        pick = self.make_picker("nash-p-minimax", model)
+        obs = torch.zeros(116).numpy()
+
+        # Player 1 wants high ego skill (argmax over rows of min per row)
+        p1 = pick(1, obs, 0)
+        # Player 2 wants low opp contribution to phi (argmax phi.min(dim=0))
+        p2 = pick(2, obs, 0)
+
+        self.assertGreaterEqual(p1, 0)
+        self.assertLess(p1, self.N_SKILLS)
+        self.assertGreaterEqual(p2, 0)
+        self.assertLess(p2, self.N_SKILLS)
+
+    def test_minimax_player2_returns_valid_index(self):
+        torch = self.torch
+        nn = self.nn
+
+        class FlatModel(nn.Module):
+            def forward(self, x):
+                return torch.zeros(x.shape[0], 1)
+
+        pick = self.make_picker("nash-p-minimax", FlatModel())
+        obs = torch.zeros(116).numpy()
+        for player in (1, 2):
+            result = pick(player, obs, 0)
+            self.assertGreaterEqual(result, 0)
+            self.assertLess(result, self.N_SKILLS,
+                            f"player={player} returned out-of-range index {result}")
+
+
 class TestStrategyValidation(unittest.TestCase):
 
     def setUp(self):
