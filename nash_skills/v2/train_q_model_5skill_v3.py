@@ -12,6 +12,8 @@ Compared with train_q_model_5skill_v2.py:
 Run:
     venv/bin/python nash_skills/v2/train_q_model_5skill_v3.py
     venv/bin/python nash_skills/v2/train_q_model_5skill_v3.py --epochs 2000
+    venv/bin/python nash_skills/v2/train_q_model_5skill_v3.py \
+        --gamma 0.99 --output-suffix _g099 --seed 0
 """
 
 import sys
@@ -51,7 +53,7 @@ LOG_P_PATH   = "logs/train_p_5skill_v3.csv"
 # --------------------------------------------------------------------------- #
 
 
-def build_dataset(rallies: list):
+def build_dataset(rallies: list, gamma: float = GAMMA):
     """Convert rally list into (X, Y1, Y2) tensors using discounted returns."""
     x_list = []
     y1_list = []
@@ -63,7 +65,7 @@ def build_dataset(rallies: list):
         if len(states) == 0:
             continue
 
-        g1, g2 = compute_returns(states, gamma=GAMMA, winner=winner)
+        g1, g2 = compute_returns(states, gamma=gamma, winner=winner)
         for state, v1, v2 in zip(states, g1, g2):
             x_list.append(state)
             y1_list.append([v1])
@@ -89,7 +91,34 @@ def sample_base_batch(x: torch.Tensor, batch_size: int) -> torch.Tensor:
     return x[idx]
 
 
-def train(rally_path: str, n_epochs: int, lr: float) -> None:
+def add_output_suffix(path: str, output_suffix: str) -> str:
+    """Insert an experiment suffix immediately before a file extension."""
+    stem, extension = os.path.splitext(path)
+    return f"{stem}{output_suffix}{extension}"
+
+
+def train(
+    rally_path: str,
+    n_epochs: int,
+    lr: float,
+    gamma: float = GAMMA,
+    output_suffix: str = "",
+    seed: int | None = None,
+) -> None:
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(f"gamma must be between 0 and 1, got {gamma}")
+
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    model1_path = add_output_suffix(MODEL1_PATH, output_suffix)
+    model2_path = add_output_suffix(MODEL2_PATH, output_suffix)
+    model_p_path = add_output_suffix(MODEL_P_PATH, output_suffix)
+    log_q_path = add_output_suffix(LOG_Q_PATH, output_suffix)
+    log_p_path = add_output_suffix(LOG_P_PATH, output_suffix)
+
     print(f"Loading {rally_path} ...")
     with open(rally_path, "rb") as f:
         rallies = pkl.load(f)
@@ -101,13 +130,13 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     is_ok, ratio = check_balance(rallies, threshold=5.0)
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
 
-    x, y1, y2 = build_dataset(rallies)
+    x, y1, y2 = build_dataset(rallies, gamma=gamma)
     print(f"  Dataset: X={x.shape}, Y1={y1.shape}")
 
     n_nonzero = (y1.abs() > 1e-6).sum().item()
     print(f"  Non-zero Y1: {n_nonzero}/{len(y1)} = {100*n_nonzero/len(y1):.1f}%"
           f"  (sparse pipeline had ~4%)")
-    print(f"  GAMMA={GAMMA}, STATE_DIM={STATE_DIM}, N_SKILLS={N_SKILLS}")
+    print(f"  GAMMA={gamma}, STATE_DIM={STATE_DIM}, N_SKILLS={N_SKILLS}, SEED={seed}")
 
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
@@ -123,7 +152,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     opt2 = torch.optim.Adam(model2.parameters(), lr=lr)
 
     print(f"\nTraining Q-value models ({n_epochs} epochs) ...")
-    with open(LOG_Q_PATH, "w", newline="") as f:
+    with open(log_q_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["epoch", "loss1", "loss2"])
         for epoch in range(n_epochs):
@@ -140,9 +169,9 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
                 print(f"  Q-epoch {epoch+1}/{n_epochs}  "
                       f"loss1={loss1.item():.5f}  loss2={loss2.item():.5f}")
 
-    torch.save(model1.state_dict(), MODEL1_PATH)
-    torch.save(model2.state_dict(), MODEL2_PATH)
-    print(f"  Saved {MODEL1_PATH} and {MODEL2_PATH}")
+    torch.save(model1.state_dict(), model1_path)
+    torch.save(model2.state_dict(), model2_path)
+    print(f"  Saved {model1_path} and {model2_path}")
 
     # ------------------------------------------------------------------ #
     # Train potential model                                                #
@@ -173,7 +202,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
                     constraints.append(("p2", i, j, i, j2))
 
     print(f"\nTraining potential model ({n_epochs} epochs, {len(constraints)} constraints) ...")
-    with open(LOG_P_PATH, "w", newline="") as f:
+    with open(log_p_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["epoch", "total_loss", "saved"])
 
@@ -216,7 +245,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
             saved = 0
             if total_loss < min_loss:
                 min_loss = total_loss
-                torch.save(model_p.state_dict(), MODEL_P_PATH)
+                torch.save(model_p.state_dict(), model_p_path)
                 saved = 1
                 if (epoch + 1) % CHECKPOINT_EVERY == 0 or epoch < 10:
                     print(f"  [saved] Phi-epoch {epoch+1}  loss={total_loss:.5f}")
@@ -225,7 +254,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
             if (epoch + 1) % CHECKPOINT_EVERY == 0 and not saved:
                 print(f"  Phi-epoch {epoch+1}/{n_epochs}  total_loss={total_loss:.5f}")
 
-    print(f"\nSaved {MODEL_P_PATH}")
+    print(f"\nSaved {model_p_path}")
     print("Done.")
 
 
@@ -239,6 +268,19 @@ if __name__ == "__main__":
                         help=f"Training epochs (default: {N_EPOCHS})")
     parser.add_argument("--lr", type=float, default=LR,
                         help=f"Learning rate (default: {LR})")
+    parser.add_argument("--gamma", type=float, default=GAMMA,
+                        help=f"Discount factor for return labels (default: {GAMMA})")
+    parser.add_argument("--output-suffix", default="",
+                        help="Suffix added to model and CSV filenames (for example: _g099)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducible training (default: unset)")
     args = parser.parse_args()
 
-    train(args.rallies, args.epochs, args.lr)
+    train(
+        args.rallies,
+        args.epochs,
+        args.lr,
+        gamma=args.gamma,
+        output_suffix=args.output_suffix,
+        seed=args.seed,
+    )

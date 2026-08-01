@@ -46,7 +46,10 @@ SKILL_NAMES_2SKILL  = ["left", "right"]   # idx 0 -> left, idx 1 -> right
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
 MAX_STEPS_PER_RALLY = 800
-SHAPING_COEF        = 0.05    # per-crossing reward shaping (helps truncated rallies)
+# Pure zero-sum terminal (winner +1, loser -1). No per-crossing shaping —
+# rally length is not incentivised. Truncated rallies get a symmetric penalty
+# so stalling is strictly worse than either winning or losing.
+TRUNCATED_PENALTY   = -0.5
 # --------------------------------------------------------------------------- #
 
 
@@ -170,16 +173,14 @@ def play_one_rally(env, ppo, ego_policy, opp_policy, device, ego_init_idx=0, opp
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
-    # Per-player shaping: BOTH players get +SHAPING_COEF per crossing (returning
-    # the ball is good for both). Terminal ±1 is zero-sum (only one player wins).
-    shaped = SHAPING_COEF * crossings
     if done:
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
         ego_terminal = 1.0 if winner == "ego" else -1.0
+        ego_reward = ego_terminal
+        opp_reward = -ego_terminal
     else:
-        ego_terminal = 0.0  # truncated
-    ego_reward = shaped + ego_terminal
-    opp_reward = shaped - ego_terminal
+        ego_reward = TRUNCATED_PENALTY
+        opp_reward = TRUNCATED_PENALTY
 
     return (ego_log_probs, opp_log_probs, ego_entropies, opp_entropies,
             ego_reward, opp_reward, opp_uses_current, steps)
@@ -190,7 +191,7 @@ def train(args):
     print(f"Device: {device}"
           + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
     print(f"Loading PPO from {PPO_MODEL_PATH} (on CPU — MlpPolicy is faster there) ...")
     ppo = PPO.load(PPO_MODEL_PATH, device="cpu")
 

@@ -40,7 +40,9 @@ PPO_MODEL_PATH      = "logs/best_model_tracker1/best_model"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
 MAX_STEPS_PER_RALLY = 800
-SHAPING_COEF        = 0.05
+# Pure zero-sum terminal (winner +1, loser -1). No per-crossing shaping.
+# Truncated rallies get a penalty so stalling is strictly worse than losing.
+TRUNCATED_PENALTY   = -0.5
 
 # 2-skill subset (matches selfplay_2skill.py)
 SKILL_NAMES_2SKILL  = ["left", "right"]
@@ -145,13 +147,11 @@ def play_one_rally(env, ppo, trainer_policy, frozen_policy, device,
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
-    shaped = SHAPING_COEF * crossings
     if done:
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
-        ego_terminal = 1.0 if winner == "ego" else -1.0
+        ego_reward = 1.0 if winner == "ego" else -1.0
     else:
-        ego_terminal = 0.0
-    ego_reward = shaped + ego_terminal
+        ego_reward = TRUNCATED_PENALTY
 
     return ego_log_probs, ego_entropies, ego_reward, steps
 
@@ -169,7 +169,7 @@ def train(args):
             torch.cuda.manual_seed_all(args.seed)
         print(f"Seeded with {args.seed}")
 
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
     print(f"Loading PPO from {PPO_MODEL_PATH} (CPU) ...")
     ppo = PPO.load(PPO_MODEL_PATH, device="cpu")
 

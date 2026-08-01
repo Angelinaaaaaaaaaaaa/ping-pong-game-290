@@ -229,7 +229,7 @@ def main():
     print(f"Loading PPO from {PPO_MODEL_PATH} (CPU) ...")
     ppo = PPO.load(PPO_MODEL_PATH, device="cpu")
 
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
 
     print(f"\nEvaluating {args.rallies} rallies vs each opponent\n" + "=" * 100)
     skill_short = [s[:5] for s in SKILL_NAMES]

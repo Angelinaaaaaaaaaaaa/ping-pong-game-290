@@ -510,7 +510,7 @@ def _run_eval_loop(
     """
     from nash_skills.env_wrapper import SkillEnv
 
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
 
     curr_idx1 = _initial_skill_idx("left", 0)
     curr_idx2 = _initial_skill_idx("right", 0)
