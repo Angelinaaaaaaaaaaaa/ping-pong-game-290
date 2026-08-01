@@ -241,19 +241,22 @@ def main():
     env = SkillEnv(proc_id=1, history=HISTORY)
 
     print(f"\nEvaluating {args.rallies} rallies vs each opponent\n" + "=" * 100)
-    skill_short = [s[:5] for s in SKILL_NAMES]
+    # Full names, not truncated: SKILL_NAMES has two 4-char-prefix collisions
+    # (left/left_short, right_short/right) that made earlier abbreviated
+    # columns genuinely ambiguous -- e.g. "right" could mean either skill.
+    skill_col_w = max(len(s) for s in SKILL_NAMES) + 1
     label_w = max(12, max(len(lbl) for lbl, _ in opponents) + 2)
     header = (f"{'opp':<{label_w}} {'real_wr':>8} {'wins':>5} {'loss':>5} {'trunc':>6} "
               f"{'trunc%':>7} {'avg_xs':>7} {'stp_all':>8} {'stp_done':>8}  "
               f"ego skill %: "
-              + " ".join(f"{s:>6}" for s in skill_short))
+              + " ".join(f"{s:>{skill_col_w}}" for s in SKILL_NAMES))
     print(header)
     print("-" * len(header))
 
     all_results = []
     for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng)
-        skill_str = " ".join(f"{p:>5.1%}" for p in r["skill_pct"])
+        skill_str = " ".join(f"{p:>{skill_col_w}.1%}" for p in r["skill_pct"])
         stp_done = f"{r['avg_steps_done']:>8.1f}" if r['avg_steps_done'] == r['avg_steps_done'] else f"{'nan':>8}"
         print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
               f"{r['wins']:>5d} {r['losses']:>5d} {r['trunc']:>6d} "

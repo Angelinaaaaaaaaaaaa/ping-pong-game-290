@@ -242,106 +242,108 @@ def train(args):
         print(f"Baseline pool: {args.baseline_pool}")
     print()
 
-    for it in range(1, args.iterations + 1):
-        all_log_probs = []
-        all_advantages = []
-        all_entropies = []
-        rewards_this_iter = []
-        wins = 0
-        draws = 0
+    try:
+        for it in range(1, args.iterations + 1):
+            all_log_probs = []
+            all_advantages = []
+            all_entropies = []
+            rewards_this_iter = []
+            wins = 0
+            draws = 0
 
-        for _ in range(args.rallies_per_iter):
-            # Opp selection: three independent probability regions
-            #   [0, epsilon_baseline):                    fixed baseline
-            #   [epsilon_baseline, +snapshot_prob):       snapshot buffer
-            #   otherwise:                                current policy (self)
-            r = random.random()
-            if baseline_pool and r < args.epsilon_baseline:
-                opp_policy = random.choice(baseline_pool)
-            elif snapshot_buffer and r < args.epsilon_baseline + args.snapshot_prob:
-                opp_policy = random.choice(snapshot_buffer)
-            else:
-                opp_policy = policy
+            for _ in range(args.rallies_per_iter):
+                # Opp selection: three independent probability regions
+                #   [0, epsilon_baseline):                    fixed baseline
+                #   [epsilon_baseline, +snapshot_prob):       snapshot buffer
+                #   otherwise:                                current policy (self)
+                r = random.random()
+                if baseline_pool and r < args.epsilon_baseline:
+                    opp_policy = random.choice(baseline_pool)
+                elif snapshot_buffer and r < args.epsilon_baseline + args.snapshot_prob:
+                    opp_policy = random.choice(snapshot_buffer)
+                else:
+                    opp_policy = policy
 
-            ego_init = random.randint(0, N_SKILLS - 1)
-            opp_init = random.randint(0, N_SKILLS - 1)
+                ego_init = random.randint(0, N_SKILLS - 1)
+                opp_init = random.randint(0, N_SKILLS - 1)
 
-            (ego_lps, opp_lps, ego_ents, opp_ents,
-             ego_r, opp_r, opp_uses_current, _steps) = play_one_rally(
-                env, ppo, policy, opp_policy, device,
-                ego_init_idx=ego_init, opp_init_idx=opp_init,
-            )
+                (ego_lps, opp_lps, ego_ents, opp_ents,
+                 ego_r, opp_r, opp_uses_current, _steps) = play_one_rally(
+                    env, ppo, policy, opp_policy, device,
+                    ego_init_idx=ego_init, opp_init_idx=opp_init,
+                )
 
-            rewards_this_iter.append(ego_r)
-            ego_terminal = ego_r - opp_r
-            if ego_terminal > 0.5: wins += 1
-            elif abs(ego_terminal) < 0.5: draws += 1
+                rewards_this_iter.append(ego_r)
+                ego_terminal = ego_r - opp_r
+                if ego_terminal > 0.5: wins += 1
+                elif abs(ego_terminal) < 0.5: draws += 1
 
-            ego_adv = ego_r - baseline
-            opp_adv = opp_r - baseline
+                ego_adv = ego_r - baseline
+                opp_adv = opp_r - baseline
 
-            for lp in ego_lps:
-                all_log_probs.append(lp)
-                all_advantages.append(ego_adv)
-            for ent in ego_ents:
-                all_entropies.append(ent)
-            if opp_uses_current:
-                for lp in opp_lps:
+                for lp in ego_lps:
                     all_log_probs.append(lp)
-                    all_advantages.append(opp_adv)
-                for ent in opp_ents:
+                    all_advantages.append(ego_adv)
+                for ent in ego_ents:
                     all_entropies.append(ent)
+                if opp_uses_current:
+                    for lp in opp_lps:
+                        all_log_probs.append(lp)
+                        all_advantages.append(opp_adv)
+                    for ent in opp_ents:
+                        all_entropies.append(ent)
 
-        mean_r = float(np.mean(rewards_this_iter))
-        win_rate = wins / args.rallies_per_iter
-        draw_rate = draws / args.rallies_per_iter
-        baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
+            mean_r = float(np.mean(rewards_this_iter))
+            win_rate = wins / args.rallies_per_iter
+            draw_rate = draws / args.rallies_per_iter
+            baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
 
-        if all_log_probs:
-            log_probs_t = torch.stack(all_log_probs)
-            advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
-            pg_loss = -(log_probs_t * advs_t).mean()
-            ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
-            loss = pg_loss - args.entropy_coef * ent_term
-            optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            optim.step()
-            loss_val = float(loss.item())
-            ent_val = float(ent_term.item())
-        else:
-            loss_val = float('nan')
-            ent_val = float('nan')
+            if all_log_probs:
+                log_probs_t = torch.stack(all_log_probs)
+                advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
+                pg_loss = -(log_probs_t * advs_t).mean()
+                ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
+                loss = pg_loss - args.entropy_coef * ent_term
+                optim.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                optim.step()
+                loss_val = float(loss.item())
+                ent_val = float(ent_term.item())
+            else:
+                loss_val = float('nan')
+                ent_val = float('nan')
 
-        # Probe policy distribution on a zero state
-        with torch.no_grad():
-            probe = torch.zeros(1, STATE_DIM, device=device)
-            p_zero = F.softmax(policy(probe), dim=-1)[0].cpu().numpy()
+            # Probe policy distribution on a zero state
+            with torch.no_grad():
+                probe = torch.zeros(1, STATE_DIM, device=device)
+                p_zero = F.softmax(policy(probe), dim=-1)[0].cpu().numpy()
 
-        log_w.writerow([it, mean_r, win_rate, draw_rate, baseline,
-                        loss_val, ent_val] + list(p_zero))
-        log_f.flush()
+            log_w.writerow([it, mean_r, win_rate, draw_rate, baseline,
+                            loss_val, ent_val] + list(p_zero))
+            log_f.flush()
 
-        if it % args.print_every == 0 or it == 1:
-            p_str = " ".join(f"{s[:4]}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
-            print(f"[iter {it:4d}/{args.iterations}]  "
-                  f"mean_r={mean_r:+.3f}  win={win_rate:.2f}  draw={draw_rate:.2f}  "
-                  f"loss={loss_val:.4f}  ent={ent_val:.3f}  buf={len(snapshot_buffer)}  "
-                  f"P(zero)=[{p_str}]", flush=True)
+            if it % args.print_every == 0 or it == 1:
+                p_str = " ".join(f"{s}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
+                print(f"[iter {it:4d}/{args.iterations}]  "
+                      f"mean_r={mean_r:+.3f}  win={win_rate:.2f}  draw={draw_rate:.2f}  "
+                      f"loss={loss_val:.4f}  ent={ent_val:.3f}  buf={len(snapshot_buffer)}  "
+                      f"P(zero)=[{p_str}]", flush=True)
 
-        if it % args.snapshot_every == 0:
-            snap = deepcopy(policy).eval()
-            for p in snap.parameters():
-                p.requires_grad_(False)
-            snapshot_buffer.append(snap)
-            if len(snapshot_buffer) > args.snapshot_buffer_size:
-                snapshot_buffer.pop(0)
+            if it % args.snapshot_every == 0:
+                snap = deepcopy(policy).eval()
+                for p in snap.parameters():
+                    p.requires_grad_(False)
+                snapshot_buffer.append(snap)
+                if len(snapshot_buffer) > args.snapshot_buffer_size:
+                    snapshot_buffer.pop(0)
 
-        if it % args.save_every == 0 or it == args.iterations:
-            torch.save(policy.state_dict(), args.output)
+            if it % args.save_every == 0 or it == args.iterations:
+                torch.save(policy.state_dict(), args.output)
+    finally:
+        env.close()
+        log_f.close()
 
-    env.close()
-    log_f.close()
     print(f"\nDone. Saved policy to {args.output}, log to {args.log}")
 
 

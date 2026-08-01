@@ -46,7 +46,12 @@ PPO_MODEL_PATH      = "logs/best_model_tracker1/best_model"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
 MAX_STEPS_PER_RALLY = 800
-SHAPING_COEF        = 0.05
+# Per-crossing shaping bonus. Two separate coefficients so truncated (stall)
+# rallies can't out-earn a decisive win -- matches the fix already applied to
+# selfplay_5skill.py: at 50 crossings a truncated rally accumulates
+# 0.001 * 50 = 0.05, well below the +/-1 terminal signal.
+SHAPING_COEF           = 0.005
+TRUNCATED_SHAPING_COEF = 0.001
 # --------------------------------------------------------------------------- #
 
 
@@ -100,6 +105,24 @@ def _swallow_step(env, action):
         return env.step(action)
 
 
+def classify_outcome(ego_terminal: float) -> str:
+    """
+    Classify a rally's raw (un-shaped) terminal reward into 'win'/'draw'/'loss'.
+
+    Operates on ego_terminal directly, never on the shaping-inflated
+    ego_reward -- a long truncated rally's accumulated shaping bonus can
+    never be misread as a decisive outcome this way. Matches the thresholds
+    selfplay_5skill.py already uses (ego_terminal = ego_r - opp_r, which
+    recovers 2 * the raw terminal since shaping cancels out there).
+    """
+    if ego_terminal > 0.5:
+        return "win"
+    elif abs(ego_terminal) < 0.5:
+        return "draw"
+    else:
+        return "loss"
+
+
 def play_one_rally(env, ppo, trainer_policy, frozen_policy, device,
                    ego_init_idx=0, opp_init_idx=0):
     """
@@ -109,6 +132,11 @@ def play_one_rally(env, ppo, trainer_policy, frozen_policy, device,
         ego_log_probs    : list of trainer's log π(a|s) at each decision
         ego_entropies    : list of trainer's entropy at each decision
         ego_reward       : float (with shaping + terminal)
+        ego_terminal     : float -- the raw, un-shaped outcome: +1.0 (win),
+                            -1.0 (loss), 0.0 (truncated). Callers should use
+                            this (via classify_outcome) rather than trying to
+                            infer the outcome from ego_reward, since
+                            ego_reward also contains the shaping term.
         steps            : int
     """
     env.set_skills(skill_from_index(ego_init_idx), skill_from_index(opp_init_idx))
@@ -158,15 +186,18 @@ def play_one_rally(env, ppo, trainer_policy, frozen_policy, device,
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
-    shaped = SHAPING_COEF * crossings
     if done:
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
         ego_terminal = 1.0 if winner == "ego" else -1.0
+        shaped = SHAPING_COEF * crossings
     else:
+        # Truncated: apply the smaller per-crossing coefficient so a stall
+        # can't out-earn a decisive win, and no terminal reward.
         ego_terminal = 0.0
+        shaped = TRUNCATED_SHAPING_COEF * crossings
     ego_reward = shaped + ego_terminal
 
-    return ego_log_probs, ego_entropies, ego_reward, steps
+    return ego_log_probs, ego_entropies, ego_reward, ego_terminal, steps
 
 
 def train(args):
@@ -206,112 +237,118 @@ def train(args):
     log_path = args.log or (args.output_prefix.replace("models/", "logs/") + ".csv")
     log_f = open(log_path, "w", newline="")
     log_w = csv.writer(log_f)
-    log_w.writerow(["iter", "phase", "mean_reward", "win_rate", "draw_rate",
+    log_w.writerow(["iter", "phase", "mean_reward", "win_rate", "draw_rate", "loss_rate",
                     "baseline", "loss", "entropy"] + [f"p_{s}" for s in SKILL_NAMES])
 
     print(f"\nAlternating self-play (5-skill): {args.total_iterations} total iters, "
           f"phase_length={args.phase_length}, {args.rallies_per_iter} rallies/iter, "
           f"entropy_coef={args.entropy_coef}\n")
 
-    # Track which policy is trainer in current phase: 'A' or 'B'
-    for it in range(1, args.total_iterations + 1):
-        # Determine current phase from iter
-        phase_idx = (it - 1) // args.phase_length
-        phase = 'A' if phase_idx % 2 == 0 else 'B'
+    try:
+        # Track which policy is trainer in current phase: 'A' or 'B'
+        for it in range(1, args.total_iterations + 1):
+            # Determine current phase from iter
+            phase_idx = (it - 1) // args.phase_length
+            phase = 'A' if phase_idx % 2 == 0 else 'B'
 
-        if phase == 'A':
-            trainer, frozen = policy_A, policy_B
-            optim, baseline = opt_A, baseline_A
-        else:
-            trainer, frozen = policy_B, policy_A
-            optim, baseline = opt_B, baseline_B
+            if phase == 'A':
+                trainer, frozen = policy_A, policy_B
+                optim, baseline = opt_A, baseline_A
+            else:
+                trainer, frozen = policy_B, policy_A
+                optim, baseline = opt_B, baseline_B
 
-        # Freeze the other policy
-        frozen.eval()
-        for p in frozen.parameters():
-            p.requires_grad_(False)
-        trainer.train()
-        for p in trainer.parameters():
-            p.requires_grad_(True)
+            # Freeze the other policy
+            frozen.eval()
+            for p in frozen.parameters():
+                p.requires_grad_(False)
+            trainer.train()
+            for p in trainer.parameters():
+                p.requires_grad_(True)
 
-        all_log_probs = []
-        all_advantages = []
-        all_entropies = []
-        rewards_this_iter = []
-        wins = 0
-        draws = 0
+            all_log_probs = []
+            all_advantages = []
+            all_entropies = []
+            rewards_this_iter = []
+            wins = 0
+            draws = 0
+            losses = 0
 
-        for _ in range(args.rallies_per_iter):
-            ego_init = random.randint(0, N_SKILLS - 1)
-            opp_init = random.randint(0, N_SKILLS - 1)
+            for _ in range(args.rallies_per_iter):
+                ego_init = random.randint(0, N_SKILLS - 1)
+                opp_init = random.randint(0, N_SKILLS - 1)
 
-            ego_lps, ego_ents, ego_r, _steps = play_one_rally(
-                env, ppo, trainer, frozen, device,
-                ego_init_idx=ego_init, opp_init_idx=opp_init,
-            )
+                ego_lps, ego_ents, ego_r, ego_terminal, _steps = play_one_rally(
+                    env, ppo, trainer, frozen, device,
+                    ego_init_idx=ego_init, opp_init_idx=opp_init,
+                )
 
-            rewards_this_iter.append(ego_r)
-            # Strip shaping to count wins
-            # ego_terminal = ego_r - shaping_for_this_rally  — can't reconstruct
-            # Use ego_r > 0.5 as proxy for "win"
-            if ego_r > 0.5: wins += 1
-            elif abs(ego_r) < 0.5: draws += 1
+                rewards_this_iter.append(ego_r)
+                outcome = classify_outcome(ego_terminal)
+                if outcome == "win":
+                    wins += 1
+                elif outcome == "draw":
+                    draws += 1
+                else:
+                    losses += 1
 
-            adv = ego_r - baseline
-            for lp in ego_lps:
-                all_log_probs.append(lp)
-                all_advantages.append(adv)
-            for ent in ego_ents:
-                all_entropies.append(ent)
+                adv = ego_r - baseline
+                for lp in ego_lps:
+                    all_log_probs.append(lp)
+                    all_advantages.append(adv)
+                for ent in ego_ents:
+                    all_entropies.append(ent)
 
-        mean_r = float(np.mean(rewards_this_iter))
-        win_rate = wins / args.rallies_per_iter
-        draw_rate = draws / args.rallies_per_iter
-        new_baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
-        if phase == 'A':
-            baseline_A = new_baseline
-        else:
-            baseline_B = new_baseline
+            mean_r = float(np.mean(rewards_this_iter))
+            win_rate = wins / args.rallies_per_iter
+            draw_rate = draws / args.rallies_per_iter
+            loss_rate = losses / args.rallies_per_iter
+            new_baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
+            if phase == 'A':
+                baseline_A = new_baseline
+            else:
+                baseline_B = new_baseline
 
-        if all_log_probs:
-            log_probs_t = torch.stack(all_log_probs)
-            advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
-            pg_loss = -(log_probs_t * advs_t).mean()
-            ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
-            loss = pg_loss - args.entropy_coef * ent_term
-            optim.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainer.parameters(), 1.0)
-            optim.step()
-            loss_val = float(loss.item())
-            ent_val = float(ent_term.item())
-        else:
-            loss_val = float('nan')
-            ent_val = float('nan')
+            if all_log_probs:
+                log_probs_t = torch.stack(all_log_probs)
+                advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
+                pg_loss = -(log_probs_t * advs_t).mean()
+                ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
+                loss = pg_loss - args.entropy_coef * ent_term
+                optim.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainer.parameters(), 1.0)
+                optim.step()
+                loss_val = float(loss.item())
+                ent_val = float(ent_term.item())
+            else:
+                loss_val = float('nan')
+                ent_val = float('nan')
 
-        # Probe trainer policy at zero state
-        with torch.no_grad():
-            probe = torch.zeros(1, STATE_DIM, device=device)
-            p_zero = F.softmax(trainer(probe), dim=-1)[0].cpu().numpy()
+            # Probe trainer policy at zero state
+            with torch.no_grad():
+                probe = torch.zeros(1, STATE_DIM, device=device)
+                p_zero = F.softmax(trainer(probe), dim=-1)[0].cpu().numpy()
 
-        log_w.writerow([it, phase, mean_r, win_rate, draw_rate,
-                        new_baseline, loss_val, ent_val] + list(p_zero))
-        log_f.flush()
+            log_w.writerow([it, phase, mean_r, win_rate, draw_rate, loss_rate,
+                            new_baseline, loss_val, ent_val] + list(p_zero))
+            log_f.flush()
 
-        if it % args.print_every == 0 or it == 1 or (it % args.phase_length == 1):
-            p_str = " ".join(f"{s[:4]}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
-            print(f"[iter {it:4d}/{args.total_iterations}]  phase={phase}  "
-                  f"win={win_rate:.2f}  draw={draw_rate:.2f}  "
-                  f"loss={loss_val:.4f}  ent={ent_val:.3f}  "
-                  f"P_zero=[{p_str}]", flush=True)
+            if it % args.print_every == 0 or it == 1 or (it % args.phase_length == 1):
+                p_str = " ".join(f"{s}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
+                print(f"[iter {it:4d}/{args.total_iterations}]  phase={phase}  "
+                      f"win={win_rate:.2f}  draw={draw_rate:.2f}  lossR={loss_rate:.2f}  "
+                      f"loss={loss_val:.4f}  ent={ent_val:.3f}  "
+                      f"P_zero=[{p_str}]", flush=True)
 
-        # Save periodically
-        if it % args.save_every == 0 or it == args.total_iterations:
-            torch.save(policy_A.state_dict(), args.output_prefix + "_A.pth")
-            torch.save(policy_B.state_dict(), args.output_prefix + "_B.pth")
+            # Save periodically
+            if it % args.save_every == 0 or it == args.total_iterations:
+                torch.save(policy_A.state_dict(), args.output_prefix + "_A.pth")
+                torch.save(policy_B.state_dict(), args.output_prefix + "_B.pth")
+    finally:
+        env.close()
+        log_f.close()
 
-    env.close()
-    log_f.close()
     print(f"\nDone. Saved policies to {args.output_prefix}_{{A,B}}.pth, log to {log_path}")
 
 
