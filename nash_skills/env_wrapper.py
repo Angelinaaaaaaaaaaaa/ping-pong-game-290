@@ -19,7 +19,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from mujoco_env_comp import KukaTennisEnv
-from nash_skills.skills import get_skill, SKILL_NAMES, N_SKILLS, skill_index
+from nash_skills.skills import SKILL_PROFILE_NAMES, get_skill, SKILL_NAMES, N_SKILLS, skill_index
 
 
 class SkillEnv:
@@ -34,8 +34,16 @@ class SkillEnv:
     We override those calls at the step boundary to also supply x_target.
     """
 
-    def __init__(self, proc_id: int = 1, history: int = 4):
-        self._env = KukaTennisEnv(proc_id=proc_id, history=history)
+    def __init__(self, proc_id: int = 1, history: int = 4, reset_mode: str = "clean", skill_profile: str = "current", gantry_speed_scale: float = 1.0):
+        if skill_profile not in SKILL_PROFILE_NAMES:
+            raise ValueError(f"Unknown skill_profile '{skill_profile}'. Choose from: {SKILL_PROFILE_NAMES}")
+        self._env = KukaTennisEnv(
+            proc_id=proc_id,
+            history=history,
+            reset_mode=reset_mode,
+            gantry_speed_scale=gantry_speed_scale,
+        )
+        self.skill_profile = skill_profile
         self._skill1 = "left"        # default skill for ego player
         self._skill2 = "right"       # default skill for opponent
         self._x_target1 = None
@@ -57,8 +65,8 @@ class SkillEnv:
         self._apply_skills()
 
     def _apply_skills(self):
-        side1, x1 = get_skill(self._skill1)
-        side2, x2 = get_skill(self._skill2)
+        side1, x1 = get_skill(self._skill1, profile=self.skill_profile)
+        side2, x2 = get_skill(self._skill2, profile=self.skill_profile)
         self._env.side_target     = side1
         self._env.side_target_opp = side2
         self._x_target1 = x1

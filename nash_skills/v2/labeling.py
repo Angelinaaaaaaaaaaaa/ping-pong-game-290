@@ -52,8 +52,8 @@ import numpy as np
 
 from nash_skills.winner_inference import infer_terminal_winner, winner_to_label
 
-# Default discount factor. 0.9 was an earlier proposal; 0.7 is the current
-# default and should be treated as a future ablation candidate, not assumed.
+# Default discount factor. 0.7 is the current setting; gamma=0.9 (and other
+# values) should be evaluated as a future ablation before changing this default.
 GAMMA: float = 0.7
 
 

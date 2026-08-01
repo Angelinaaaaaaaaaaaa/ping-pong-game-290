@@ -99,10 +99,6 @@ def sample_base_batch(x: torch.Tensor, batch_size: int) -> torch.Tensor:
 
 
 def train(rally_path: str, n_epochs: int, lr: float) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}"
-          + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
-
     print(f"Loading {rally_path} ...")
     rallies = pkl.load(open(rally_path, "rb"))
     print(f"  {len(rallies)} rallies loaded")
@@ -111,7 +107,6 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
 
     x, y1, y2 = build_dataset(rallies)
-    x = x.to(device); y1 = y1.to(device); y2 = y2.to(device)
     print(f"  Dataset: X={x.shape}, Y1={y1.shape}")
 
     n_nonzero = (y1.abs() > 1e-6).sum().item()
@@ -132,8 +127,8 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     # ------------------------------------------------------------------ #
     # Train Q-value models                                                #
     # ------------------------------------------------------------------ #
-    model1 = FactoredModel(state_dim=state_dim, skill_dim=SKILL_DIM).to(device)
-    model2 = FactoredModel(state_dim=state_dim, skill_dim=SKILL_DIM).to(device)
+    model1 = FactoredModel(state_dim=state_dim, skill_dim=SKILL_DIM)
+    model2 = FactoredModel(state_dim=state_dim, skill_dim=SKILL_DIM)
     opt1 = torch.optim.Adam(model1.parameters(), lr=lr)
     opt2 = torch.optim.Adam(model2.parameters(), lr=lr)
 
@@ -166,7 +161,7 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
     model2.eval()
 
     model_p = FactoredModel(state_dim=state_dim, skill_dim=SKILL_DIM,
-                            last_layer_activation=None).to(device)
+                            last_layer_activation=None)
     model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
     model_p.batch_norm.running_var  = model1.batch_norm.running_var.clone()
     model_p.batch_norm.momentum     = 0.0

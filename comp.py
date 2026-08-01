@@ -20,6 +20,9 @@ model2.load_state_dict(torch.load("models/model2.pth", weights_only=True))
 # Load model_p weights from logs/model_p.pt
 model_p = SimpleModel(116, [64, 32, 16], 1)
 model_p.load_state_dict(torch.load("models/model_p.pth", weights_only=True))
+model1.eval()
+model2.eval()
+model_p.eval()
 
 env = KukaTennisEnv(proc_id=1)
 model = PPO.load("logs/best_model_tracker1/best_model")
@@ -72,8 +75,6 @@ for i in range(2000000):
             elif STRATEGY2 == 'random':
                 env.side_target_opp = np.random.choice([-1., 1.])
             elif STRATEGY2 == 'nash':
-                env.side_target_opp = -env.side_target_opp
-            elif STRATEGY2 == 'nash-ibr':
                 env.side_target_opp = -env.side_target_opp
             elif STRATEGY2 == 'nash-ibr':
                 curr_side_target = 1.

@@ -8,6 +8,7 @@ Reports per opponent:
   - Real win rate  = wins / (wins + losses)
   - Truncation rate
   - Avg crossings per rally
+  - Avg rally length in env steps (all rallies + decisive-only)
   - Ego skill usage distribution
 
 Run:
@@ -62,7 +63,15 @@ def pick_baseline(name, rng):
 def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
     wins = 0; losses = 0; trunc = 0
     crossings_list = []
+    steps_list_all = []      # every rally (done + trunc)
+    steps_list_done = []     # only decisive rallies
     ego_skill_count = [0] * N_SKILLS
+
+    # Per-(ego_init, opp_init) pair breakdown to diagnose whether high WR
+    # comes from a few short/trunc rallies vs a robust decisive win pattern.
+    from collections import defaultdict
+    pair_stats = defaultdict(lambda: {"n": 0, "wins": 0, "losses": 0, "trunc": 0,
+                                      "steps_all": [], "steps_done": []})
 
     for _ in range(n_rallies):
         ego_init = rng.randint(0, N_SKILLS - 1)
@@ -73,6 +82,7 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
         crossings = 0
         steps = 0
         done = False
+        pair_key = (ego_init, opp_init)
 
         while True:
             ppo1 = _build_ppo_obs(obs, info, 1)
@@ -102,14 +112,22 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
                 break
 
         crossings_list.append(crossings)
+        steps_list_all.append(steps)
+        pair_stats[pair_key]["n"] += 1
+        pair_stats[pair_key]["steps_all"].append(steps)
         if done:
             winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
             if winner == "ego":
                 wins += 1
+                pair_stats[pair_key]["wins"] += 1
             else:
                 losses += 1
+                pair_stats[pair_key]["losses"] += 1
+            steps_list_done.append(steps)
+            pair_stats[pair_key]["steps_done"].append(steps)
         else:
             trunc += 1
+            pair_stats[pair_key]["trunc"] += 1
 
     n_done = wins + losses
     real_wr = wins / n_done if n_done > 0 else float("nan")
@@ -120,7 +138,10 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
         "real_wr": real_wr,
         "trunc_rate": trunc / n_rallies,
         "avg_xs": float(np.mean(crossings_list)),
+        "avg_steps_all": float(np.mean(steps_list_all)),
+        "avg_steps_done": float(np.mean(steps_list_done)) if steps_list_done else float("nan"),
         "skill_pct": [c / total_skills for c in ego_skill_count],
+        "pair_stats": dict(pair_stats),
         # Shared scorecard (nash_skills/v2/scorecard.py, ported from main,
         # meeting note item 19): adds median rally length, skill-usage
         # entropy, and dominant-skill fraction on top of the fields above.
@@ -223,7 +244,8 @@ def main():
     skill_short = [s[:5] for s in SKILL_NAMES]
     label_w = max(12, max(len(lbl) for lbl, _ in opponents) + 2)
     header = (f"{'opp':<{label_w}} {'real_wr':>8} {'wins':>5} {'loss':>5} {'trunc':>6} "
-              f"{'trunc%':>7} {'avg_xs':>7}  ego skill %: "
+              f"{'trunc%':>7} {'avg_xs':>7} {'stp_all':>8} {'stp_done':>8}  "
+              f"ego skill %: "
               + " ".join(f"{s:>6}" for s in skill_short))
     print(header)
     print("-" * len(header))
@@ -231,12 +253,14 @@ def main():
     all_results = []
     for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng)
-        all_results.append((label, r))
         skill_str = " ".join(f"{p:>5.1%}" for p in r["skill_pct"])
+        stp_done = f"{r['avg_steps_done']:>8.1f}" if r['avg_steps_done'] == r['avg_steps_done'] else f"{'nan':>8}"
         print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
               f"{r['wins']:>5d} {r['losses']:>5d} {r['trunc']:>6d} "
-              f"{r['trunc_rate']:>7.1%} {r['avg_xs']:>7.1f}  "
-              f"             {skill_str}")
+              f"{r['trunc_rate']:>7.1%} {r['avg_xs']:>7.1f} "
+              f"{r['avg_steps_all']:>8.1f} {stp_done}  "
+              f"           {skill_str}")
+        all_results.append((label, r))
 
     print("-" * len(header))
 
@@ -246,6 +270,29 @@ def main():
         print(format_scorecard(r["scorecard"], label=f"vs {label}"))
         print()
 
+    # ------------------------------------------------------------------ #
+    # Per-(init ego, init opp) pair breakdown: sanity-check that high WR
+    # is not inflated by a few short/truncated rallies.
+    # ------------------------------------------------------------------ #
+    print("\n" + "=" * 100)
+    print("  PER-INIT-PAIR BREAKDOWN")
+    print("  (grouped by initial skill pair sampled at rally start)")
+    print("=" * 100)
+    for label, r in all_results:
+        print(f"\n--- opponent: {label} ---")
+        print(f"  {'ego_init':<12} {'opp_init':<12} {'n':>4} "
+              f"{'wins':>5} {'loss':>5} {'trunc':>5} {'wr':>7} "
+              f"{'stp_all':>8} {'stp_done':>8}")
+        for (ei, oi), s in sorted(r["pair_stats"].items()):
+            n_done = s["wins"] + s["losses"]
+            wr = s["wins"] / n_done if n_done > 0 else float("nan")
+            wr_str = f"{wr:>6.1%}" if n_done > 0 else "  ---"
+            stp_all = float(np.mean(s["steps_all"])) if s["steps_all"] else float("nan")
+            stp_done = float(np.mean(s["steps_done"])) if s["steps_done"] else float("nan")
+            stp_done_str = f"{stp_done:>8.1f}" if s["steps_done"] else f"{'---':>8}"
+            print(f"  {SKILL_NAMES[ei]:<12} {SKILL_NAMES[oi]:<12} {s['n']:>4d} "
+                  f"{s['wins']:>5d} {s['losses']:>5d} {s['trunc']:>5d} {wr_str} "
+                  f"{stp_all:>8.1f} {stp_done_str}")
     env.close()
 
 

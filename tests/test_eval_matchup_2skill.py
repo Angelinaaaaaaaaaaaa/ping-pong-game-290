@@ -651,5 +651,162 @@ class TestSelfContained(unittest.TestCase):
         )
 
 
+# =========================================================================== #
+# 11. nash-p-2skill player=2 adversarial logic                                #
+# =========================================================================== #
+
+class TestNashP2SkillPlayer2Adversarial(unittest.TestCase):
+    """
+    player=2 with nash-p-2skill must pick adversarially (minimise ego utility),
+    not cooperatively (maximise ego utility via joint argmax).
+    """
+
+    def setUp(self):
+        m = _import()
+        if m is None:
+            self.skipTest("nash_skills/eval_matchup_2skill.py not yet created")
+        self.m = m
+
+    def test_player2_picks_adversarially_not_cooperatively(self):
+        """
+        Build a 2x2 phi table where player 2's cooperative choice differs from
+        the adversarial choice.
+
+        phi = [[10,  0],   # ego=0: opp=0→ego gets 10, opp=1→ego gets 0
+               [ 8,  2]]   # ego=1: opp=0→ego gets  8, opp=1→ego gets 2
+
+        Cooperative (joint argmax): flat index 0 → ego=0, opp=0 → p2 returns 0
+        Adversarial (minimax p2): phi.min(dim=0) = [min(10,8), min(0,2)] = [8, 0]
+                                   argmax([8, 0]) = 0 ... that's still 0.
+
+        Use a clearer table:
+        phi = [[10, 1],
+               [ 2, 8]]
+
+        joint argmax = flat index 0 (val=10) → opp=0
+        phi.min(dim=0) = [min(10,2), min(1,8)] = [2, 1] → argmax = 0 (opp=0)
+        Still same. Use:
+
+        phi = [[1, 10],
+               [8,  2]]
+
+        joint argmax = flat index 1 (val=10) → opp=1
+        phi.min(dim=0) = [min(1,8), min(10,2)] = [1, 2] → argmax = 1 (opp=1)
+        Same again. Need a case where joint argmax gives a different opp col:
+
+        phi = [[5, 9],    flat argmax = index 1 → row=0, col=1 → opp=1
+               [3, 2]]    phi.min(dim=0) = [min(5,3), min(9,2)] = [3, 2] → argmax=0 → opp=0
+
+        Here cooperative picks opp=1, adversarial picks opp=0.
+        """
+        import torch
+        import torch.nn as nn
+
+        target_vals = torch.tensor([5.0, 9.0, 3.0, 2.0])  # phi reshaped (2,2)
+
+        class FixedModel(nn.Module):
+            def forward(self, x):
+                return target_vals[:x.shape[0]].unsqueeze(1)
+
+        pick = self.m.make_picker_2skill("nash-p-2skill", FixedModel(), model_state_dim=116)
+        obs = np.zeros(116, dtype=np.float32)
+
+        # player=1: joint argmax flat=1 → row=0, col=1 → ego skill = 0
+        p1 = pick(1, obs, info=None, other_idx=0)
+        self.assertEqual(p1, 0, f"player=1 should pick ego skill 0, got {p1}")
+
+        # player=2 adversarial: phi.min(dim=0)=[3,2], argmax=0 → opp skill = 0
+        p2 = pick(2, obs, info=None, other_idx=0)
+        self.assertEqual(p2, 0, f"player=2 adversarial should pick opp skill 0, got {p2}")
+
+    def test_player2_returns_valid_index(self):
+        import torch, torch.nn as nn
+
+        class ZeroModel(nn.Module):
+            def forward(self, x):
+                return torch.zeros(x.shape[0], 1)
+
+        pick = self.m.make_picker_2skill("nash-p-2skill", ZeroModel(), model_state_dim=116)
+        obs = np.zeros(116, dtype=np.float32)
+        result = pick(2, obs, info=None, other_idx=0)
+        self.assertIn(result, (0, 1), f"player=2 returned invalid index {result}")
+
+
+# =========================================================================== #
+# 12. Truncated episodes excluded from rally_lengths / episode_steps           #
+# =========================================================================== #
+
+class TestTruncatedEpisodesNotInRallyLengths(unittest.TestCase):
+    """
+    Truncated episodes must NOT be appended to rally_lengths or episode_steps,
+    so avg_rally_length is computed only over completed (done) episodes —
+    matching the 5-skill evaluator's behaviour.
+    """
+
+    def setUp(self):
+        m = _import()
+        if m is None:
+            self.skipTest("nash_skills/eval_matchup_2skill.py not yet created")
+        self.m = m
+
+    def test_truncated_episode_not_in_rally_lengths(self):
+        """
+        When all episodes truncate (done=False always), rally_lengths must stay empty.
+        """
+        import numpy as np
+        from unittest.mock import MagicMock, patch
+        import torch, torch.nn as nn
+
+        class ZeroModel(nn.Module):
+            def forward(self, x):
+                return torch.zeros(x.shape[0], 1)
+
+        fake_obs = np.zeros(116, dtype=np.float32)
+        fake_obs[36] = 1.6
+        fake_info = {
+            "diff_pos":      np.zeros(3,  dtype=np.float32),
+            "diff_quat":     np.zeros(4,  dtype=np.float32),
+            "target":        np.zeros(7,  dtype=np.float32),
+            "diff_pos_opp":  np.zeros(3,  dtype=np.float32),
+            "diff_quat_opp": np.zeros(4,  dtype=np.float32),
+            "target_opp":    np.zeros(7,  dtype=np.float32),
+        }
+
+        m = self.m
+
+        class FakeTwoSkillEnv:
+            def __init__(self, proc_id=1): pass
+            def set_skills(self, _i1, _i2): pass
+            def reset(self, seed=None): return fake_obs.copy(), fake_info
+            def step(self, _action): return fake_obs.copy(), 0.0, False, False, fake_info
+            def close(self): pass
+
+        fake_ppo = MagicMock()
+        fake_ppo.predict.return_value = (np.zeros(9), None)
+
+        with patch.object(m, '_TwoSkillEnv', FakeTwoSkillEnv), \
+             patch.object(m, '_capture_env_step',
+                          lambda env, action: (
+                              (fake_obs.copy(), 0.0, False, False, fake_info), []
+                          )):
+            result = m.run_matchup_2skill(
+                strategy1='left',
+                strategy2='right',
+                ppo=fake_ppo,
+                model_p=ZeroModel(),
+                n_episodes=3,
+                max_steps_per_episode=2,
+                warmup_steps=0,
+                max_total_steps=None,
+            )
+
+        self.assertEqual(result.rally_lengths, [],
+            "rally_lengths must be empty when all episodes truncate")
+        self.assertEqual(result.episode_steps, [],
+            "episode_steps must be empty when all episodes truncate")
+        self.assertGreater(result.truncated_episodes, 0,
+            "truncated_episodes counter must be incremented")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

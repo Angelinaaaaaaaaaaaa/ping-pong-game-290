@@ -43,7 +43,12 @@ DEFAULT_LOG         = "logs/selfplay_5skill.csv"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
 MAX_STEPS_PER_RALLY = 800
-SHAPING_COEF        = 0.05
+# Per-crossing shaping bonus. Two separate coefficients so truncated (stall)
+# rallies can't out-earn a decisive win: at 50 crossings a truncated rally
+# accumulates 0.001 * 50 = 0.05, well below the ±1 terminal signal, while
+# a decisive rally still gets a modest per-crossing bonus (0.005 * ~7 = 0.035).
+SHAPING_COEF           = 0.005
+TRUNCATED_SHAPING_COEF = 0.001
 # --------------------------------------------------------------------------- #
 
 
@@ -70,6 +75,34 @@ class MetaPolicy(nn.Module):
         probs = F.softmax(logits, dim=-1)
         idx = int(torch.multinomial(probs, 1).item())
         return idx, probs.detach().cpu().numpy()
+
+
+class FixedSkillPolicy:
+    """Stateless opp for epsilon-baseline exploration. Implements only the
+    interface used in the `not opp_uses_current` branch of play_one_rally:
+    `.sample(state, device) -> (skill_idx, probs)`. `state` is ignored.
+
+    Modes:
+      - "random":   uniform over N_SKILLS every call
+      - a valid skill name (e.g. "left", "center_safe"): always that skill
+    """
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self._uniform_probs = np.full(N_SKILLS, 1.0 / N_SKILLS, dtype=np.float32)
+        if mode == "random":
+            self._fixed_idx = None
+        elif mode in SKILL_NAMES:
+            self._fixed_idx = SKILL_NAMES.index(mode)
+        else:
+            raise ValueError(f"Unknown FixedSkillPolicy mode: {mode!r}")
+
+    def sample(self, _state_np, _device):
+        if self._fixed_idx is None:
+            idx = random.randint(0, N_SKILLS - 1)
+        else:
+            idx = self._fixed_idx
+        return idx, self._uniform_probs
 
 
 def _build_ppo_obs(obs, info, player):
@@ -152,11 +185,14 @@ def play_one_rally(env, ppo, ego_policy, opp_policy, device,
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
-    shaped = SHAPING_COEF * crossings
     if done:
+        shaped = SHAPING_COEF * crossings
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
         ego_terminal = 1.0 if winner == "ego" else -1.0
     else:
+        # Truncated: apply the smaller per-crossing coefficient so a stall
+        # can't out-earn a decisive win, and no terminal reward.
+        shaped = TRUNCATED_SHAPING_COEF * crossings
         ego_terminal = 0.0
     ego_reward = shaped + ego_terminal
     opp_reward = shaped - ego_terminal
@@ -191,6 +227,7 @@ def train(args):
     baseline = 0.0
 
     snapshot_buffer = []
+    baseline_pool = [FixedSkillPolicy(m) for m in args.baseline_pool] if args.epsilon_baseline > 0 else []
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
     log_f = open(args.log, "w", newline="")
@@ -199,7 +236,11 @@ def train(args):
                     "baseline", "loss", "entropy"] + [f"p_{s}" for s in SKILL_NAMES])
 
     print(f"\nSelf-play (5-skill): {args.iterations} iters × {args.rallies_per_iter} rallies/iter "
-          f"(entropy_coef={args.entropy_coef}, snapshot_prob={args.snapshot_prob})\n")
+          f"(entropy_coef={args.entropy_coef}, snapshot_prob={args.snapshot_prob}, "
+          f"epsilon_baseline={args.epsilon_baseline})")
+    if baseline_pool:
+        print(f"Baseline pool: {args.baseline_pool}")
+    print()
 
     for it in range(1, args.iterations + 1):
         all_log_probs = []
@@ -210,7 +251,14 @@ def train(args):
         draws = 0
 
         for _ in range(args.rallies_per_iter):
-            if snapshot_buffer and random.random() < args.snapshot_prob:
+            # Opp selection: three independent probability regions
+            #   [0, epsilon_baseline):                    fixed baseline
+            #   [epsilon_baseline, +snapshot_prob):       snapshot buffer
+            #   otherwise:                                current policy (self)
+            r = random.random()
+            if baseline_pool and r < args.epsilon_baseline:
+                opp_policy = random.choice(baseline_pool)
+            elif snapshot_buffer and r < args.epsilon_baseline + args.snapshot_prob:
                 opp_policy = random.choice(snapshot_buffer)
             else:
                 opp_policy = policy
@@ -309,6 +357,14 @@ if __name__ == "__main__":
     parser.add_argument("--snapshot-prob", type=float, default=0.5)
     parser.add_argument("--snapshot-every", type=int, default=25)
     parser.add_argument("--snapshot-buffer-size", type=int, default=10)
+    parser.add_argument("--epsilon-baseline", type=float, default=0.0,
+                        help="Probability of sampling opp from the fixed-baseline pool "
+                             "instead of snapshot/current (default: 0.0 = disabled). "
+                             "Try 0.2 to expose the policy to interpretable fixed strategies.")
+    parser.add_argument("--baseline-pool", nargs="+",
+                        default=["random"] + list(SKILL_NAMES),
+                        help="Fixed strategies to sample from when epsilon-baseline fires. "
+                             "Each entry must be 'random' or a valid skill name.")
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)

@@ -23,7 +23,7 @@ import numpy as np
 
 from nash_skills.skills import skill_index, N_SKILLS
 
-__all__ = ["mirror_skill", "flip_rally", "augment_with_flip"]
+__all__ = ["mirror_skill", "flip_winner", "flip_rally", "augment_with_flip"]
 
 _RAW_OBS_DIM = 116
 
@@ -39,6 +39,24 @@ _MIRROR_MAP: dict[str, str] = {
 def mirror_skill(skill: str) -> str:
     """Return the laterally-mirrored counterpart of a skill name."""
     return _MIRROR_MAP[skill]  # raises KeyError for unknown skills
+
+
+def flip_winner(w) -> Optional[int]:
+    """
+    Flip a rally winner label from ego's perspective to opp's perspective.
+
+    1 → 2 (ego won → opp won in flipped rally)
+    2 → 1 (opp won → ego won in flipped rally)
+    0 / None → unchanged (truncated rallies have no winner to flip)
+
+    Used by both augment.py (76-dim encoder) and symmetrize_rallies.py
+    (12-dim gantry encoder). Kept here as the single source of truth.
+    """
+    if w == 1:
+        return 2
+    if w == 2:
+        return 1
+    return w  # preserves 0 or None — do not coerce between the two
 
 
 def flip_rally(rally: dict) -> Optional[dict]:
@@ -57,10 +75,11 @@ def flip_rally(rally: dict) -> Optional[dict]:
 
     flip_skill1 = mirror_skill(rally["skill2"])
     flip_skill2 = mirror_skill(rally["skill1"])
-    flip_winner = 3 - winner  # 1 → 2, 2 → 1
+    flipped_winner = flip_winner(winner)  # 1 → 2, 2 → 1
 
     flip_states = []
     flip_raw = []
+    flip_skill_pairs = []
     for obs_raw in rally["raw_obs"]:
         obs_raw = np.asarray(obs_raw, dtype=np.float32)
         if obs_raw.shape[0] < _RAW_OBS_DIM:
@@ -92,13 +111,19 @@ def flip_rally(rally: dict) -> Optional[dict]:
         flip_states.append(s)
         flip_raw.append(obs_raw.copy())  # deep copy: isolate from original
 
-    return {
+    for skill1, skill2 in rally.get("skill_pairs", []):
+        flip_skill_pairs.append((mirror_skill(skill2), mirror_skill(skill1)))
+
+    flipped = {
         "skill1": flip_skill1,
         "skill2": flip_skill2,
         "states": flip_states,
         "raw_obs": flip_raw,
-        "winner": flip_winner,
+        "winner": flipped_winner,
     }
+    if flip_skill_pairs:
+        flipped["skill_pairs"] = flip_skill_pairs
+    return flipped
 
 
 def augment_with_flip(rallies: list) -> list:
