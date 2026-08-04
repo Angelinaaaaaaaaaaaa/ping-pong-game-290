@@ -38,6 +38,7 @@ import torch
 
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_index
 from nash_skills.winner_inference import infer_terminal_winner
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 
 
 # --------------------------------------------------------------------------- #
@@ -779,6 +780,36 @@ def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
     if total == 0:
         return None
     return max(result.skill_usage.values()) / total
+
+
+# --------------------------------------------------------------------------- #
+# Shared scorecard (nash_skills/v2/scorecard.py, meeting note item 19)         #
+# --------------------------------------------------------------------------- #
+
+def matchup_scorecard(result: MatchupResult) -> dict:
+    """
+    Adapt a MatchupResult into the shared scorecard metric set: adds median
+    rally length, skill-usage entropy, and dominant-skill fraction on top of
+    what print_summary/save_csv already report.
+    """
+    return compute_scorecard(
+        wins=result.ego_wins,
+        losses=result.opp_wins,
+        truncated=result.truncated_episodes,
+        rally_lengths=result.rally_lengths,
+        skill_usage=result.skill_usage,
+    )
+
+
+def print_full_scorecards(results: List[MatchupResult], file=None) -> None:
+    """Print the full shared scorecard for every matchup result, one block each."""
+    if file is None:
+        file = sys.stdout
+    for r in results:
+        label = f"{r.strategy1} vs {r.strategy2}"
+        sc = matchup_scorecard(r)
+        print(format_scorecard(sc, label=label), file=file)
+        print(file=file)
 
 
 # --------------------------------------------------------------------------- #

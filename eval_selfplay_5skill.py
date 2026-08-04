@@ -32,6 +32,7 @@ from stable_baselines3 import PPO
 from nash_skills.env_wrapper import SkillEnv
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_from_index
 from nash_skills.v2.state_encoder import encode_ego, encode_opp
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 from nash_skills.winner_inference import infer_terminal_winner
 from selfplay_5skill import (
     MetaPolicy, _build_ppo_obs,
@@ -131,6 +132,7 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
     n_done = wins + losses
     real_wr = wins / n_done if n_done > 0 else float("nan")
     total_skills = max(sum(ego_skill_count), 1)
+    skill_usage = dict(zip(SKILL_NAMES, ego_skill_count))
     return {
         "wins": wins, "losses": losses, "trunc": trunc,
         "real_wr": real_wr,
@@ -140,6 +142,13 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
         "avg_steps_done": float(np.mean(steps_list_done)) if steps_list_done else float("nan"),
         "skill_pct": [c / total_skills for c in ego_skill_count],
         "pair_stats": dict(pair_stats),
+        # Shared scorecard (nash_skills/v2/scorecard.py, ported from main,
+        # meeting note item 19): adds median rally length, skill-usage
+        # entropy, and dominant-skill fraction on top of the fields above.
+        "scorecard": compute_scorecard(
+            wins=wins, losses=losses, truncated=trunc,
+            rally_lengths=crossings_list, skill_usage=skill_usage,
+        ),
     }
 
 
@@ -232,19 +241,22 @@ def main():
     env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
 
     print(f"\nEvaluating {args.rallies} rallies vs each opponent\n" + "=" * 100)
-    skill_short = [s[:5] for s in SKILL_NAMES]
+    # Full names, not truncated: SKILL_NAMES has two 4-char-prefix collisions
+    # (left/left_short, right_short/right) that made earlier abbreviated
+    # columns genuinely ambiguous -- e.g. "right" could mean either skill.
+    skill_col_w = max(len(s) for s in SKILL_NAMES) + 1
     label_w = max(12, max(len(lbl) for lbl, _ in opponents) + 2)
     header = (f"{'opp':<{label_w}} {'real_wr':>8} {'wins':>5} {'loss':>5} {'trunc':>6} "
               f"{'trunc%':>7} {'avg_xs':>7} {'stp_all':>8} {'stp_done':>8}  "
               f"ego skill %: "
-              + " ".join(f"{s:>6}" for s in skill_short))
+              + " ".join(f"{s:>{skill_col_w}}" for s in SKILL_NAMES))
     print(header)
     print("-" * len(header))
 
     all_results = []
     for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng)
-        skill_str = " ".join(f"{p:>5.1%}" for p in r["skill_pct"])
+        skill_str = " ".join(f"{p:>{skill_col_w}.1%}" for p in r["skill_pct"])
         stp_done = f"{r['avg_steps_done']:>8.1f}" if r['avg_steps_done'] == r['avg_steps_done'] else f"{'nan':>8}"
         print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
               f"{r['wins']:>5d} {r['losses']:>5d} {r['trunc']:>6d} "
@@ -254,6 +266,12 @@ def main():
         all_results.append((label, r))
 
     print("-" * len(header))
+
+    print("\nFull scorecards (nash_skills/v2/scorecard.py)")
+    print("=" * len(header))
+    for label, r in all_results:
+        print(format_scorecard(r["scorecard"], label=f"vs {label}"))
+        print()
 
     # ------------------------------------------------------------------ #
     # Per-(init ego, init opp) pair breakdown: sanity-check that high WR

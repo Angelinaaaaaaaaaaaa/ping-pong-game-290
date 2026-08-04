@@ -284,186 +284,187 @@ def train(args):
         print(f"Rally JSONL: {args.log_rallies}")
     print()
 
-    for it in range(1, args.iterations + 1):
-        iter_start_t = time.time()
-        all_log_probs = []
-        all_advantages = []
-        all_entropies = []
-        rewards_this_iter = []
-        wins = 0
-        losses = 0
-        truncs = 0
-        crossings_this_iter = []
-        steps_this_iter = []
-        skill_usage = [0] * N_SKILLS
+    try:
+        for it in range(1, args.iterations + 1):
+            iter_start_t = time.time()
+            all_log_probs = []
+            all_advantages = []
+            all_entropies = []
+            rewards_this_iter = []
+            wins = 0
+            losses = 0
+            truncs = 0
+            crossings_this_iter = []
+            steps_this_iter = []
+            skill_usage = [0] * N_SKILLS
 
-        for _ in range(args.rallies_per_iter):
-            # Opp selection: three independent probability regions
-            #   [0, epsilon_baseline):                    fixed baseline
-            #   [epsilon_baseline, +snapshot_prob):       snapshot buffer
-            #   otherwise:                                current policy (self)
-            r = random.random()
-            if baseline_pool and r < args.epsilon_baseline:
-                opp_policy = random.choice(baseline_pool)
-                opp_type = "baseline"
-            elif snapshot_buffer and r < args.epsilon_baseline + args.snapshot_prob:
-                opp_policy = random.choice(snapshot_buffer)
-                opp_type = "snapshot"
-            else:
-                opp_policy = policy
-                opp_type = "self"
+            for _ in range(args.rallies_per_iter):
+                # Opp selection: three independent probability regions
+                #   [0, epsilon_baseline):                    fixed baseline
+                #   [epsilon_baseline, +snapshot_prob):       snapshot buffer
+                #   otherwise:                                current policy (self)
+                r = random.random()
+                if baseline_pool and r < args.epsilon_baseline:
+                    opp_policy = random.choice(baseline_pool)
+                    opp_type = "baseline"
+                elif snapshot_buffer and r < args.epsilon_baseline + args.snapshot_prob:
+                    opp_policy = random.choice(snapshot_buffer)
+                    opp_type = "snapshot"
+                else:
+                    opp_policy = policy
+                    opp_type = "self"
 
-            ego_init = random.randint(0, N_SKILLS - 1)
-            opp_init = random.randint(0, N_SKILLS - 1)
+                ego_init = random.randint(0, N_SKILLS - 1)
+                opp_init = random.randint(0, N_SKILLS - 1)
 
-            rally = play_one_rally(
-                env, ppo, policy, opp_policy, device,
-                ego_init_idx=ego_init, opp_init_idx=opp_init,
-            )
+                rally = play_one_rally(
+                    env, ppo, policy, opp_policy, device,
+                    ego_init_idx=ego_init, opp_init_idx=opp_init,
+                )
 
-            ego_r = rally["ego_reward"]
-            opp_r = rally["opp_reward"]
-            rewards_this_iter.append(ego_r)
-            crossings_this_iter.append(rally["crossings"])
-            steps_this_iter.append(rally["steps"])
-            for sk in rally["ego_skills"]:
-                skill_usage[sk] += 1
+                ego_r = rally["ego_reward"]
+                opp_r = rally["opp_reward"]
+                rewards_this_iter.append(ego_r)
+                crossings_this_iter.append(rally["crossings"])
+                steps_this_iter.append(rally["steps"])
+                for sk in rally["ego_skills"]:
+                    skill_usage[sk] += 1
 
-            if not rally["done"]:
-                truncs += 1
-            elif rally["winner"] == "ego":
-                wins += 1
-            else:
-                losses += 1
+                if not rally["done"]:
+                    truncs += 1
+                elif rally["winner"] == "ego":
+                    wins += 1
+                else:
+                    losses += 1
 
-            ego_adv = ego_r - baseline
-            opp_adv = opp_r - baseline
+                ego_adv = ego_r - baseline
+                opp_adv = opp_r - baseline
 
-            for lp in rally["ego_log_probs"]:
-                all_log_probs.append(lp)
-                all_advantages.append(ego_adv)
-            for ent in rally["ego_entropies"]:
-                all_entropies.append(ent)
-            if rally["opp_uses_current"]:
-                for lp in rally["opp_log_probs"]:
+                for lp in rally["ego_log_probs"]:
                     all_log_probs.append(lp)
-                    all_advantages.append(opp_adv)
-                for ent in rally["opp_entropies"]:
+                    all_advantages.append(ego_adv)
+                for ent in rally["ego_entropies"]:
                     all_entropies.append(ent)
+                if rally["opp_uses_current"]:
+                    for lp in rally["opp_log_probs"]:
+                        all_log_probs.append(lp)
+                        all_advantages.append(opp_adv)
+                    for ent in rally["opp_entropies"]:
+                        all_entropies.append(ent)
 
+                if rally_log_f is not None:
+                    rally_log_id += 1
+                    json.dump({
+                        "iter": it,
+                        "rally_id": rally_log_id,
+                        "opp_type": opp_type,
+                        "ego_init": ego_init,
+                        "opp_init": opp_init,
+                        "crossings": rally["crossings"],
+                        "steps": rally["steps"],
+                        "done": rally["done"],
+                        "winner": rally["winner"],
+                        "ego_reward": ego_r,
+                        "opp_reward": opp_r,
+                        "ego_skills": rally["ego_skills"],
+                        "opp_skills": rally["opp_skills"],
+                        "ego_probs_at_pick": rally["ego_probs_at_pick"],
+                        "opp_probs_at_pick": rally["opp_probs_at_pick"],
+                    }, rally_log_f)
+                    rally_log_f.write("\n")
+
+            n = args.rallies_per_iter
+            mean_r = float(np.mean(rewards_this_iter))
+            reward_std = float(np.std(rewards_this_iter))
+            win_rate = wins / n
+            loss_rate = losses / n
+            trunc_rate = truncs / n
+            draw_rate = trunc_rate
+            mean_crossings = float(np.mean(crossings_this_iter))
+            mean_steps = float(np.mean(steps_this_iter))
+            baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
+
+            total_usage = sum(skill_usage)
+            if total_usage > 0:
+                usage_probs = np.array(skill_usage, dtype=np.float64) / total_usage
+                dominant_fraction_usage = float(usage_probs.max())
+                usage_ent = float(-np.sum(usage_probs * np.log(usage_probs + 1e-12)))
+            else:
+                dominant_fraction_usage = 0.0
+                usage_ent = 0.0
+            effective_n_skills = float(np.exp(usage_ent))
+
+            if all_log_probs:
+                log_probs_t = torch.stack(all_log_probs)
+                advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
+                adv_mean = float(advs_t.mean().item())
+                adv_std = float(advs_t.std().item()) if advs_t.numel() > 1 else 0.0
+                pg_loss = -(log_probs_t * advs_t).mean()
+                ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
+                loss = pg_loss - args.entropy_coef * ent_term
+                optim.zero_grad()
+                loss.backward()
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0).item())
+                optim.step()
+                loss_val = float(loss.item())
+                pg_loss_val = float(pg_loss.item())
+                ent_val = float(ent_term.item())
+                ent_bonus = float(args.entropy_coef * ent_val)
+            else:
+                loss_val = float('nan')
+                pg_loss_val = float('nan')
+                ent_val = float('nan')
+                ent_bonus = float('nan')
+                grad_norm = float('nan')
+                adv_mean = float('nan')
+                adv_std = float('nan')
+
+            # Probe policy distribution on a zero state
+            with torch.no_grad():
+                probe = torch.zeros(1, STATE_DIM, device=device)
+                p_zero = F.softmax(policy(probe), dim=-1)[0].cpu().numpy()
+            dominant_fraction_probe = float(p_zero.max())
+
+            wall_time = time.time() - iter_start_t
+
+            log_w.writerow([
+                it,
+                mean_r, reward_std,
+                win_rate, loss_rate, trunc_rate, draw_rate,
+                mean_crossings, mean_steps,
+            ] + list(skill_usage) + [
+                dominant_fraction_usage, dominant_fraction_probe, effective_n_skills,
+            ] + list(p_zero) + [
+                baseline, loss_val, pg_loss_val, ent_bonus, ent_val,
+                grad_norm, adv_mean, adv_std, wall_time,
+            ])
+            log_f.flush()
             if rally_log_f is not None:
-                rally_log_id += 1
-                json.dump({
-                    "iter": it,
-                    "rally_id": rally_log_id,
-                    "opp_type": opp_type,
-                    "ego_init": ego_init,
-                    "opp_init": opp_init,
-                    "crossings": rally["crossings"],
-                    "steps": rally["steps"],
-                    "done": rally["done"],
-                    "winner": rally["winner"],
-                    "ego_reward": ego_r,
-                    "opp_reward": opp_r,
-                    "ego_skills": rally["ego_skills"],
-                    "opp_skills": rally["opp_skills"],
-                    "ego_probs_at_pick": rally["ego_probs_at_pick"],
-                    "opp_probs_at_pick": rally["opp_probs_at_pick"],
-                }, rally_log_f)
-                rally_log_f.write("\n")
+                rally_log_f.flush()
 
-        n = args.rallies_per_iter
-        mean_r = float(np.mean(rewards_this_iter))
-        reward_std = float(np.std(rewards_this_iter))
-        win_rate = wins / n
-        loss_rate = losses / n
-        trunc_rate = truncs / n
-        draw_rate = trunc_rate
-        mean_crossings = float(np.mean(crossings_this_iter))
-        mean_steps = float(np.mean(steps_this_iter))
-        baseline = (1 - args.baseline_ema) * baseline + args.baseline_ema * mean_r
+            if it % args.print_every == 0 or it == 1:
+                p_str = " ".join(f"{s}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
+                print(f"[iter {it:4d}/{args.iterations}]  "
+                      f"mean_r={mean_r:+.3f}  win={win_rate:.2f}  loss={loss_rate:.2f}  trunc={trunc_rate:.2f}  "
+                      f"cross={mean_crossings:.1f}  dom={dominant_fraction_usage:.2f}  "
+                      f"pg={pg_loss_val:+.3f}  ent={ent_val:.3f}  grad={grad_norm:.2f}  "
+                      f"buf={len(snapshot_buffer)}  P(zero)=[{p_str}]", flush=True)
 
-        total_usage = sum(skill_usage)
-        if total_usage > 0:
-            usage_probs = np.array(skill_usage, dtype=np.float64) / total_usage
-            dominant_fraction_usage = float(usage_probs.max())
-            usage_ent = float(-np.sum(usage_probs * np.log(usage_probs + 1e-12)))
-        else:
-            dominant_fraction_usage = 0.0
-            usage_ent = 0.0
-        effective_n_skills = float(np.exp(usage_ent))
+            if it % args.snapshot_every == 0:
+                snap = deepcopy(policy).eval()
+                for p in snap.parameters():
+                    p.requires_grad_(False)
+                snapshot_buffer.append(snap)
+                if len(snapshot_buffer) > args.snapshot_buffer_size:
+                    snapshot_buffer.pop(0)
 
-        if all_log_probs:
-            log_probs_t = torch.stack(all_log_probs)
-            advs_t = torch.tensor(all_advantages, dtype=torch.float32, device=device)
-            adv_mean = float(advs_t.mean().item())
-            adv_std = float(advs_t.std().item()) if advs_t.numel() > 1 else 0.0
-            pg_loss = -(log_probs_t * advs_t).mean()
-            ent_term = torch.stack(all_entropies).mean() if all_entropies else torch.tensor(0.0, device=device)
-            loss = pg_loss - args.entropy_coef * ent_term
-            optim.zero_grad()
-            loss.backward()
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0).item())
-            optim.step()
-            loss_val = float(loss.item())
-            pg_loss_val = float(pg_loss.item())
-            ent_val = float(ent_term.item())
-            ent_bonus = float(args.entropy_coef * ent_val)
-        else:
-            loss_val = float('nan')
-            pg_loss_val = float('nan')
-            ent_val = float('nan')
-            ent_bonus = float('nan')
-            grad_norm = float('nan')
-            adv_mean = float('nan')
-            adv_std = float('nan')
-
-        # Probe policy distribution on a zero state
-        with torch.no_grad():
-            probe = torch.zeros(1, STATE_DIM, device=device)
-            p_zero = F.softmax(policy(probe), dim=-1)[0].cpu().numpy()
-        dominant_fraction_probe = float(p_zero.max())
-
-        wall_time = time.time() - iter_start_t
-
-        log_w.writerow([
-            it,
-            mean_r, reward_std,
-            win_rate, loss_rate, trunc_rate, draw_rate,
-            mean_crossings, mean_steps,
-        ] + list(skill_usage) + [
-            dominant_fraction_usage, dominant_fraction_probe, effective_n_skills,
-        ] + list(p_zero) + [
-            baseline, loss_val, pg_loss_val, ent_bonus, ent_val,
-            grad_norm, adv_mean, adv_std, wall_time,
-        ])
-        log_f.flush()
+            if it % args.save_every == 0 or it == args.iterations:
+                torch.save(policy.state_dict(), args.output)
+    finally:
+        env.close()
+        log_f.close()
         if rally_log_f is not None:
-            rally_log_f.flush()
-
-        if it % args.print_every == 0 or it == 1:
-            p_str = " ".join(f"{s[:4]}={p:.2f}" for s, p in zip(SKILL_NAMES, p_zero))
-            print(f"[iter {it:4d}/{args.iterations}]  "
-                  f"mean_r={mean_r:+.3f}  win={win_rate:.2f}  loss={loss_rate:.2f}  trunc={trunc_rate:.2f}  "
-                  f"cross={mean_crossings:.1f}  dom={dominant_fraction_usage:.2f}  "
-                  f"pg={pg_loss_val:+.3f}  ent={ent_val:.3f}  grad={grad_norm:.2f}  "
-                  f"buf={len(snapshot_buffer)}  P(zero)=[{p_str}]", flush=True)
-
-        if it % args.snapshot_every == 0:
-            snap = deepcopy(policy).eval()
-            for p in snap.parameters():
-                p.requires_grad_(False)
-            snapshot_buffer.append(snap)
-            if len(snapshot_buffer) > args.snapshot_buffer_size:
-                snapshot_buffer.pop(0)
-
-        if it % args.save_every == 0 or it == args.iterations:
-            torch.save(policy.state_dict(), args.output)
-
-    env.close()
-    log_f.close()
-    if rally_log_f is not None:
-        rally_log_f.close()
+            rally_log_f.close()
     print(f"\nDone. Saved policy to {args.output}, log to {args.log}"
           + (f", rallies to {args.log_rallies}" if args.log_rallies else ""))
 
