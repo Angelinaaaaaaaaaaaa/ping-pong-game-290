@@ -44,7 +44,7 @@ DEFAULT_OUTPUT      = "models/selfplay_5skill.pth"
 DEFAULT_LOG         = "logs/selfplay_5skill.csv"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
-MAX_STEPS_PER_RALLY = 800
+MAX_STEPS_PER_RALLY = 1000
 # Pure zero-sum terminal (winner +1, loser -1). No per-crossing shaping —
 # rally length is not incentivised, avoiding the common-bonus that would
 # corrupt the zero-sum structure. Truncated rallies get a symmetric penalty

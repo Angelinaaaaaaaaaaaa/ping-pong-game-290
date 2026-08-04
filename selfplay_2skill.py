@@ -45,7 +45,7 @@ DEFAULT_LOG         = "logs/selfplay_2skill.csv"
 SKILL_NAMES_2SKILL  = ["left", "right"]   # idx 0 -> left, idx 1 -> right
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
-MAX_STEPS_PER_RALLY = 800
+MAX_STEPS_PER_RALLY = 1000
 # Pure zero-sum terminal (winner +1, loser -1). No per-crossing shaping —
 # rally length is not incentivised. Truncated rallies get a symmetric penalty
 # so stalling is strictly worse than either winning or losing.

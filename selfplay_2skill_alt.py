@@ -39,7 +39,7 @@ from nash_skills.winner_inference import infer_terminal_winner
 PPO_MODEL_PATH      = "logs/best_model_tracker1/best_model"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
-MAX_STEPS_PER_RALLY = 800
+MAX_STEPS_PER_RALLY = 1000
 # Pure zero-sum terminal (winner +1, loser -1). No per-crossing shaping.
 # Truncated rallies get a penalty so stalling is strictly worse than losing.
 TRUNCATED_PENALTY   = -0.5
