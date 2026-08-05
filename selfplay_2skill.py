@@ -35,6 +35,7 @@ import torch.nn.functional as F
 from stable_baselines3 import PPO
 
 from nash_skills.env_wrapper import SkillEnv
+from nash_skills.v2.reward import rally_rewards
 from nash_skills.v2.state_encoder import encode_ego, encode_opp, STATE_DIM
 from nash_skills.winner_inference import infer_terminal_winner
 
@@ -104,7 +105,9 @@ def _swallow_step(env, action):
     return out
 
 
-def play_one_rally(env, ppo, ego_policy, opp_policy, device, ego_init_idx=0, opp_init_idx=0):
+def play_one_rally(env, ppo, ego_policy, opp_policy, device, ego_init_idx=0, opp_init_idx=0,
+                   trunc_penalty=TRUNCATED_PENALTY,
+                   shaping_coef=0.0, trunc_shaping_coef=0.0):
     """
     Roll out a single rally with both players' skills chosen by a meta-policy at
     each net crossing. Returns:
@@ -173,14 +176,15 @@ def play_one_rally(env, ppo, ego_policy, opp_policy, device, ego_init_idx=0, opp
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
+    winner = None
     if done:
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
-        ego_terminal = 1.0 if winner == "ego" else -1.0
-        ego_reward = ego_terminal
-        opp_reward = -ego_terminal
-    else:
-        ego_reward = TRUNCATED_PENALTY
-        opp_reward = TRUNCATED_PENALTY
+    ego_reward, opp_reward = rally_rewards(
+        done, winner == "ego", crossings,
+        trunc_penalty=trunc_penalty,
+        shaping_coef=shaping_coef,
+        trunc_shaping_coef=trunc_shaping_coef,
+    )
 
     return (ego_log_probs, opp_log_probs, ego_entropies, opp_entropies,
             ego_reward, opp_reward, opp_uses_current, steps)
@@ -236,6 +240,9 @@ def train(args):
              ego_r, opp_r, opp_uses_current, _steps) = play_one_rally(
                 env, ppo, policy, opp_policy, device,
                 ego_init_idx=ego_init, opp_init_idx=opp_init,
+                trunc_penalty=args.trunc_penalty,
+                shaping_coef=args.shaping_coef,
+                trunc_shaping_coef=args.trunc_shaping_coef,
             )
 
             rewards_this_iter.append(ego_r)
@@ -332,6 +339,14 @@ if __name__ == "__main__":
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--log", default=DEFAULT_LOG)
+    parser.add_argument("--trunc-penalty", type=float, default=TRUNCATED_PENALTY,
+                        help=f"Reward to BOTH players on a truncated rally (default: {TRUNCATED_PENALTY}). "
+                             "0.0 is strictly zero-sum and matches labeling.py's offline convention.")
+    parser.add_argument("--shaping-coef", type=float, default=0.0,
+                        help="Per-crossing bonus to BOTH players on decisive rallies (default: 0.0 = off). "
+                             "0.005 reproduces the pre-2026-07 design; it breaks zero-sum and rewards long rallies.")
+    parser.add_argument("--trunc-shaping-coef", type=float, default=0.0,
+                        help="Per-crossing bonus to BOTH players on truncated rallies (default: 0.0 = off).")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing --output checkpoint if it exists")
     args = parser.parse_args()

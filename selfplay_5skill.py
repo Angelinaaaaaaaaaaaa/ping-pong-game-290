@@ -35,6 +35,7 @@ from stable_baselines3 import PPO
 
 from nash_skills.env_wrapper import SkillEnv
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_from_index
+from nash_skills.v2.reward import rally_rewards
 from nash_skills.v2.state_encoder import encode_ego, encode_opp, STATE_DIM
 from nash_skills.winner_inference import infer_terminal_winner
 
@@ -132,7 +133,9 @@ def _swallow_step(env, action):
 
 
 def play_one_rally(env, ppo, ego_policy, opp_policy, device,
-                   ego_init_idx=0, opp_init_idx=0):
+                   ego_init_idx=0, opp_init_idx=0,
+                   trunc_penalty=TRUNCATED_PENALTY,
+                   shaping_coef=0.0, trunc_shaping_coef=0.0):
     env.set_skills(skill_from_index(ego_init_idx), skill_from_index(opp_init_idx))
     obs, info = env.reset()
     prev_ball_x = float(obs[36])
@@ -198,15 +201,15 @@ def play_one_rally(env, ppo, ego_policy, opp_policy, device,
         if done or steps >= MAX_STEPS_PER_RALLY:
             break
 
+    winner = None
     if done:
         winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
-        ego_terminal = 1.0 if winner == "ego" else -1.0
-        ego_reward = ego_terminal
-        opp_reward = -ego_terminal
-    else:
-        winner = None
-        ego_reward = TRUNCATED_PENALTY
-        opp_reward = TRUNCATED_PENALTY
+    ego_reward, opp_reward = rally_rewards(
+        done, winner == "ego", crossings,
+        trunc_penalty=trunc_penalty,
+        shaping_coef=shaping_coef,
+        trunc_shaping_coef=trunc_shaping_coef,
+    )
 
     return {
         "ego_log_probs": ego_log_probs,
@@ -320,6 +323,9 @@ def train(args):
                 rally = play_one_rally(
                     env, ppo, policy, opp_policy, device,
                     ego_init_idx=ego_init, opp_init_idx=opp_init,
+                    trunc_penalty=args.trunc_penalty,
+                    shaping_coef=args.shaping_coef,
+                    trunc_shaping_coef=args.trunc_shaping_coef,
                 )
 
                 ego_r = rally["ego_reward"]
@@ -496,6 +502,20 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for random/numpy/torch (default: None = OS entropy)")
+    parser.add_argument("--trunc-penalty", type=float, default=TRUNCATED_PENALTY,
+                        help="Reward given to BOTH players when a rally hits the step cap "
+                             f"(default: {TRUNCATED_PENALTY}). 0.0 makes the game strictly "
+                             "zero-sum on every episode and matches labeling.py's convention "
+                             "for the offline Q/Phi pipeline; the negative default instead "
+                             "discourages stalling at the cost of that symmetry.")
+    parser.add_argument("--shaping-coef", type=float, default=0.0,
+                        help="Per-crossing bonus paid to BOTH players on decisive rallies "
+                             "(default: 0.0 = off). Set 0.005 to reproduce the pre-2026-07 "
+                             "shaping design. Note this is a common term: it breaks zero-sum "
+                             "and rewards keeping the rally alive.")
+    parser.add_argument("--trunc-shaping-coef", type=float, default=0.0,
+                        help="Per-crossing bonus to BOTH players on truncated rallies "
+                             "(default: 0.0 = off). 0.001 reproduces the old two-coefficient split.")
     parser.add_argument("--log-rallies", default=None,
                         help="Optional path to per-rally JSONL log. If set, each rally emits a JSON "
                              "line with skills, probs, outcome. Enables post-hoc analysis of skill "
