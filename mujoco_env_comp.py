@@ -29,25 +29,111 @@ t_shift = 0.12
 DT = 0.01
 
 
-def infer_terminal_state(ball_pos, ball_vel, ego_racket_x, opp_racket_x):
+def new_rally_state():
+    return {
+        "last_hitter": None,
+        "last_table_bounce_side": None,
+        "ego_table_bounces": 0,
+        "opp_table_bounces": 0,
+        "receiver_had_return_opportunity": False,
+        "bounce_history": [],
+    }
+
+
+def _receiver_for_hitter(hitter):
+    if hitter == "ego":
+        return "opp"
+    if hitter == "opp":
+        return "ego"
+    return None
+
+
+def _winner_from_receiver_miss_context(default_winner, default_reason, rally_state):
+    if not rally_state:
+        return default_winner, default_reason
+
+    last_hitter = rally_state.get("last_hitter")
+    receiver = _receiver_for_hitter(last_hitter)
+    if receiver is None:
+        return default_winner, default_reason
+
+    if rally_state.get("receiver_had_return_opportunity"):
+        return last_hitter, f"missed_{receiver}_return_after_valid_bounce"
+
+    return receiver, f"{last_hitter}_shot_out_before_valid_{receiver}_bounce"
+
+
+def _record_racket_hit(rally_state, hitter):
+    rally_state["last_hitter"] = hitter
+    rally_state["receiver_had_return_opportunity"] = False
+
+
+def _record_table_bounce(rally_state, ball_pos):
+    side = "opp" if float(ball_pos[0]) >= TABLE_SHIFT else "ego"
+    rally_state["last_table_bounce_side"] = side
+    rally_state[f"{side}_table_bounces"] += 1
+    rally_state["bounce_history"].append({
+        "side": side,
+        "x": float(ball_pos[0]),
+        "y": float(ball_pos[1]),
+        "z": float(ball_pos[2]),
+        "last_hitter": rally_state.get("last_hitter"),
+    })
+
+    receiver = _receiver_for_hitter(rally_state.get("last_hitter"))
+    if side == receiver:
+        rally_state["receiver_had_return_opportunity"] = True
+
+
+def infer_terminal_state(ball_pos, ball_vel, ego_racket_x, opp_racket_x, rally_state=None):
     """Return (done, winner, reason) for terminal ball states."""
     ball_pos = np.asarray(ball_pos, dtype=float)
     ball_vel = np.asarray(ball_vel, dtype=float)
 
     if ball_pos[0] < ego_racket_x - TERMINAL_X_MARGIN:
-        return True, "opp", "ball_past_ego_racket"
+        winner, reason = _winner_from_receiver_miss_context(
+            "opp",
+            "ball_past_ego_racket",
+            rally_state,
+        )
+        return True, winner, reason
     if ball_pos[0] > opp_racket_x + TERMINAL_X_MARGIN:
-        return True, "ego", "ball_past_opp_racket"
+        winner, reason = _winner_from_receiver_miss_context(
+            "ego",
+            "ball_past_opp_racket",
+            rally_state,
+        )
+        return True, winner, reason
 
     lateral_limit = TABLE_HALF_WIDTH + TERMINAL_LATERAL_MARGIN
     if abs(ball_pos[1]) > lateral_limit:
         if ball_vel[0] > 0:
-            return True, "opp", "ball_lateral_out_toward_opp"
+            winner, reason = _winner_from_receiver_miss_context(
+                "opp",
+                "ball_lateral_out_toward_opp",
+                rally_state,
+            )
+            return True, winner, reason
         if ball_vel[0] < 0:
-            return True, "ego", "ball_lateral_out_toward_ego"
+            winner, reason = _winner_from_receiver_miss_context(
+                "ego",
+                "ball_lateral_out_toward_ego",
+                rally_state,
+            )
+            return True, winner, reason
         if ball_pos[0] >= TABLE_SHIFT:
-            return True, "opp", "ball_lateral_out_on_opp_side"
-        return True, "ego", "ball_lateral_out_on_ego_side"
+            winner, reason = _winner_from_receiver_miss_context(
+                "opp",
+                "ball_lateral_out_on_opp_side",
+                rally_state,
+            )
+            return True, winner, reason
+        winner, reason = _winner_from_receiver_miss_context(
+            "ego",
+            "ball_lateral_out_on_ego_side",
+            rally_state,
+        )
+        return True, winner, reason
 
     return False, None, None
 
@@ -139,6 +225,8 @@ class KukaTennisEnv(gym.Env):
         self.last_qpos = np.zeros(3)
         self.side_target = 1.
         self.side_target_opp = 1.
+        self.rally_state = new_rally_state()
+        self._last_table_bounce_step = -1
         z_axis = np.array([1.,0.,0.])
         x_axis = np.array([0.,0.,1.])
         y_axis = np.cross(z_axis, x_axis)
@@ -452,14 +540,21 @@ class KukaTennisEnv(gym.Env):
                 geom2 = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, geom2)
                 if geom2 is None or geom1 is None:
                     continue
+
+                is_ball_contact = geom1 == "ball_geom" or geom2 == "ball_geom"
+                is_table_contact = is_ball_contact and (geom1 == "table_top" or geom2 == "table_top")
                 
-                if geom1 == "ball_geom" or geom2 == "ball_geom":
+                if is_ball_contact:
                     ball_vel = np.array(self.last_qvel)
                     ball_vel[2] = -ball_vel[2]
                     self.data.qpos[-7:-4] = self.last_qpos + DT*ball_vel
                     self.data.qvel[-6:-3] = ball_vel
+                    if is_table_contact and self._last_table_bounce_step != self.current_step:
+                        _record_table_bounce(self.rally_state, self.data.body('ball').xpos)
+                        self._last_table_bounce_step = self.current_step
                 
                 if (geom1 == "racket" and geom2=="ball_geom") or (geom2 == "racket" and geom1=="ball_geom"):
+                    _record_racket_hit(self.rally_state, "ego")
                     ball_vel = np.array(self.last_qvel)
                     racket_rot = R.from_quat(self.data.body('tennis_racket').xquat[[1,2,3,0]]).as_matrix()
                     racket_pos = np.array(self.data.body('tennis_racket').xpos)
@@ -479,6 +574,7 @@ class KukaTennisEnv(gym.Env):
                         print("Returned successfully by ego", x_table, y_table)
                     
                 if (geom1 == "racket_opp" and geom2=="ball_geom") or (geom2 == "racket_opp" and geom1=="ball_geom"):
+                    _record_racket_hit(self.rally_state, "opp")
                     ball_vel = np.array(self.last_qvel)
                     racket_rot = R.from_quat(self.data.body('tennis_racket_opp').xquat[[1,2,3,0]]).as_matrix()
                     racket_pos = np.array(self.data.body('tennis_racket_opp').xpos)
@@ -512,6 +608,7 @@ class KukaTennisEnv(gym.Env):
             ball_vel,
             racket_pos[0],
             racket_pos_opp[0],
+            self.rally_state,
         )
         # reward, done_ = self._calculate_reward()
         # if done_ :
@@ -552,6 +649,12 @@ class KukaTennisEnv(gym.Env):
             info.update({
                 'winner': winner,
                 'termination_reason': termination_reason,
+                'last_hitter': self.rally_state.get("last_hitter"),
+                'last_table_bounce_side': self.rally_state.get("last_table_bounce_side"),
+                'ego_table_bounces': int(self.rally_state.get("ego_table_bounces", 0)),
+                'opp_table_bounces': int(self.rally_state.get("opp_table_bounces", 0)),
+                'receiver_had_return_opportunity': bool(self.rally_state.get("receiver_had_return_opportunity", False)),
+                'bounce_history': list(self.rally_state.get("bounce_history", [])),
                 'ball_x': float(ball_pos[0]),
                 'ball_y': float(ball_pos[1]),
                 'ball_z': float(ball_pos[2]),
@@ -589,6 +692,8 @@ class KukaTennisEnv(gym.Env):
         self.current_step = 0
         self.prev_actions = np.zeros((self.history,9))
         self.prev_actions_opp = np.zeros((self.history,9))
+        self.rally_state = new_rally_state()
+        self._last_table_bounce_step = -1
         prev_robot_pos = np.array(self.data.qpos[:9])
         prev_robot_pos_opp = np.array(self.data.qpos[9:18])
         mj.mj_resetData(self.model, self.data)
