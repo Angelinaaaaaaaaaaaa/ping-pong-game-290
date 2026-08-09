@@ -1,45 +1,31 @@
 """
 Data collection for the v2 high-level Nash pipeline.
 
-Key differences from the old collect_data_5skill.py
-====================================================
-
-OLD (bugs / design flaws):
-  - Collected a fixed number of SIMULATION STEPS per skill pair, not rallies.
-    → Short-rally pairs (e.g. right_short vs right_short) produced 78x more
-      entries than long-rally pairs (center_safe vs center_safe).
-  - Stored only the ball-crossing obs (one state per crossing).
-    → Fine for the 68-dim PPO slice but lost joint-angle info needed for v2.
-  - Did not store the episode `done` flag or rally winner.
-    → Labeling could not distinguish won from truncated rallies.
-  - Used the old 116-dim raw obs as the state.
-    → The v2 pipeline uses a richer 76-dim encoded state via state_encoder.py.
-
-NEW design:
-  - Collect exactly TARGET_RALLIES complete rallies per skill pair.
-    This guarantees a balanced dataset regardless of rally length.
-  - Store both the encoded state (76-dim) and the raw obs (116-dim, for inspection).
-  - Record winner (1/2) at episode end; discard truncated episodes.
-  - Print a balance summary after collection.
-  - Cap maximum steps per episode to avoid degenerate infinite rallies.
+Merged version: teammate's mode-based architecture (grid/random/fixed_random,
+metadata tracking, env config) + hailey's sharding and atomic checkpoint/resume.
 
 Output format (pickle list of dicts)
 --------------------------------------
 Each entry:
     {
-        'skill1' : str,                  # ego skill name
-        'skill2' : str,                  # opp skill name
+        'skill1' : str,                  # ego skill name (initial in random modes)
+        'skill2' : str,                  # opp skill name (initial in random modes)
+        'skill_pairs': list[tuple],      # per-crossing (skill1, skill2) history
         'states' : list[np.ndarray],     # encoded states, shape (76,) each
         'raw_obs': list[np.ndarray],     # raw 116-dim obs (for debugging)
         'winner' : int,                  # 1=ego, 2=opp (truncated episodes discarded)
     }
 
 Run:
-    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
-        venv/bin/python nash_skills/v2/collect_data.py
-    MUJOCO_GL=egl MPLCONFIGDIR=/tmp/matplotlib \
-        venv/bin/python nash_skills/v2/collect_data.py \
-        --rallies 50 --output data/rallies_5skill_v2.pkl
+    # Grid mode with sharding + resume (for parallel data collection):
+    python nash_skills/v2/collect_data.py \\
+        --rallies 1000 --num-shards 5 --shard-index 0 \\
+        --checkpoint-every 100 \\
+        --output data/chunks/rallies_shard0.pkl
+
+    # Teammate's other modes still work:
+    python nash_skills/v2/collect_data.py --mode random --rallies 100
+    python nash_skills/v2/collect_data.py --mode fixed_random --fixed-player 1 --fixed-skill left
 """
 
 import sys
@@ -55,7 +41,7 @@ import statistics
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -77,6 +63,76 @@ MAX_STEPS_PER_EPISODE = 800   # step cap per episode (headless, no real-time)
 HISTORY               = 4
 # --------------------------------------------------------------------------- #
 
+
+# --------------------------------------------------------------------------- #
+# Sharding + checkpoint helpers (hailey's additions)                          #
+# --------------------------------------------------------------------------- #
+
+def _validate_skill(name: str) -> str:
+    if name not in SKILL_NAMES:
+        raise ValueError(f"Unknown skill '{name}'. Valid: {', '.join(SKILL_NAMES)}")
+    return name
+
+
+def _selected_pairs(
+    skill1: Optional[str] = None,
+    skill2: Optional[str] = None,
+    num_shards: int = 1,
+    shard_index: int = 0,
+) -> List[Tuple[str, str]]:
+    """
+    Return the (ego, opp) skill pairs assigned to this collector run (grid mode).
+
+    Defaults to all 25 pairs. --skill1/--skill2 restrict the Cartesian product.
+    --num-shards/--shard-index partition the ordered pair list so multiple
+    processes collect DIFFERENT pairs in parallel (partition, not replication).
+    """
+    if num_shards < 1:
+        raise ValueError("--num-shards must be >= 1")
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= shard_index < num_shards")
+    skills1: Sequence[str] = [_validate_skill(skill1)] if skill1 else SKILL_NAMES
+    skills2: Sequence[str] = [_validate_skill(skill2)] if skill2 else SKILL_NAMES
+    pairs = list(itertools.product(skills1, skills2))
+    return [pair for idx, pair in enumerate(pairs) if idx % num_shards == shard_index]
+
+
+def _save_rallies_atomic(rallies: list, output_path: str, label: str) -> None:
+    """Atomic write: tmp file + rename so a crash never corrupts the pickle."""
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".",
+                exist_ok=True)
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "wb") as f:
+        pkl.dump(rallies, f)
+    os.replace(tmp_path, output_path)
+    print(f"  [checkpoint:{label}] saved {len(rallies)} rallies to {output_path}",
+          flush=True)
+
+
+def _load_existing_rallies(output_path: str) -> list:
+    """Load existing pickle if present; return [] otherwise."""
+    if not os.path.exists(output_path):
+        return []
+    with open(output_path, "rb") as f:
+        rallies = pkl.load(f)
+    if not isinstance(rallies, list):
+        raise ValueError(f"Expected a list in existing output {output_path}")
+    print(f"Resuming from {output_path}: loaded {len(rallies)} existing rallies")
+    return rallies
+
+
+def _count_pairs(rallies: list) -> Counter:
+    """Count rallies per (skill1, skill2) pair in the loaded list."""
+    counts: Counter = Counter()
+    for entry in rallies:
+        if "skill1" in entry and "skill2" in entry:
+            counts[(entry["skill1"], entry["skill2"])] += 1
+    return counts
+
+
+# --------------------------------------------------------------------------- #
+# Teammate's core (mode/setting logic, PPO obs, RNG)                          #
+# --------------------------------------------------------------------------- #
 
 def _build_ppo_obs(obs, info, player: int) -> np.ndarray:
     """Build the PPO input using the same helper as diagnostics."""
@@ -312,11 +368,25 @@ def collect(
     seed: int = 0,
     quiet: bool = False,
     accepted_progress_callback=None,
+    # NEW (hailey): sharding + checkpoint + resume
+    skill1_filter: str | None = None,
+    skill2_filter: str | None = None,
+    num_shards: int = 1,
+    shard_index: int = 0,
+    checkpoint_every: int = 100,
+    resume: bool = True,
 ) -> list:
     """
     Collect `target_rallies` complete rallies for each of the 25 skill pairs.
 
     Returns the full list of rally dicts (also saved to output_path).
+
+    Sharding (grid mode only): --num-shards/--shard-index partition the 25
+    pairs so N processes collect DIFFERENT pairs in parallel.
+
+    Checkpoint/resume: atomic writes every `checkpoint_every` accepted rallies
+    per setting; resume=True (default) loads existing output_path on start and
+    skips settings already at target.
     """
     global SkillEnv
     if SkillEnv is None:
@@ -336,17 +406,49 @@ def collect(
         PPO = _PPO
     model = PPO.load(ppo_path)
 
-    all_rallies = []
     pair_summaries = []
     incomplete_pairs = []
     attempt_rows = []
     mode_index = {"fixed_random": 0, "random": 1, "grid": 2}[mode]
     settings = settings_for_mode(mode, fixed_player, fixed_skill)
 
+    # NEW: Shard filter (grid mode only)
+    if mode == "grid" and (num_shards > 1 or skill1_filter is not None or skill2_filter is not None):
+        selected = _selected_pairs(skill1_filter, skill2_filter, num_shards, shard_index)
+        selected_set = set(selected)
+        settings = [s for s in settings if (s.get("skill1"), s.get("skill2")) in selected_set]
+        _log(f"Sharded to {len(settings)} pairs (num_shards={num_shards}, shard_index={shard_index})",
+             quiet=quiet)
+        for s in settings:
+            _log(f"  {s['skill1']} vs {s['skill2']}", quiet=quiet)
+
+    # NEW: Resume (load existing pickle, count per-pair progress)
+    if resume:
+        all_rallies = _load_existing_rallies(output_path)
+    else:
+        all_rallies = []
+    existing_counts = _count_pairs(all_rallies)
+
     try:
         for setting_index, setting in enumerate(settings):
+            # NEW: skip pairs already at target (grid mode with resume)
+            if mode == "grid":
+                pair_key = (setting.get("skill1"), setting.get("skill2"))
+                already = existing_counts.get(pair_key, 0)
+                if already >= target_rallies:
+                    _log(f"\n=== Skipping: {setting['setting']} "
+                         f"({already}/{target_rallies} already collected) ===",
+                         quiet=quiet, flush=True)
+                    continue
+            else:
+                already = 0
+
             _log(f"\n=== Collecting: {mode} {setting['setting']} ===", quiet=quiet, flush=True)
-            completed = 0
+            if already > 0:
+                _log(f"  Resume: {already}/{target_rallies} already collected; "
+                     f"collecting {target_rallies - already} more", quiet=quiet)
+
+            completed = already   # start from resume count
             attempts = 0
             discarded = 0
             steps_this_combo = 0
@@ -419,6 +521,14 @@ def collect(
                     completed += 1
                     accepted = True
                     last_reason = "accepted-done"
+
+                    # NEW: periodic atomic checkpoint
+                    if checkpoint_every > 0 and completed % checkpoint_every == 0:
+                        _save_rallies_atomic(
+                            all_rallies, output_path,
+                            label=f"{setting['setting']}_{completed}",
+                        )
+
                     if accepted_progress_callback is not None:
                         accepted_progress_callback({
                             "mode": mode,
@@ -517,13 +627,17 @@ def collect(
                 quiet=quiet,
                 flush=True,
             )
+
+            # NEW: per-setting checkpoint (always, regardless of checkpoint_every)
+            _save_rallies_atomic(
+                all_rallies, output_path,
+                label=f"{setting['setting']}_done",
+            )
     finally:
         env.close()
 
-    # Save
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-    with open(output_path, "wb") as f:
-        pkl.dump(all_rallies, f)
+    # Final save (same content as last checkpoint; kept for grep on "Saved N rallies")
+    _save_rallies_atomic(all_rallies, output_path, label="final")
     _log(f"\nSaved {len(all_rallies)} rallies to {output_path}", quiet=quiet)
 
     _log("\nDiagnostic pair summary:", quiet=quiet)
@@ -649,6 +763,20 @@ if __name__ == "__main__":
                         help="Gantry movement speed multiplier")
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed used for deterministic high-level skill sampling")
+    # NEW (hailey): sharding + checkpoint + resume
+    parser.add_argument("--skill1", default=None,
+                        help="Restrict ego skill in grid mode (default: all 5)")
+    parser.add_argument("--skill2", default=None,
+                        help="Restrict opp skill in grid mode (default: all 5)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Split selected pairs across this many shards (grid mode, partition)")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Collect pairs whose ordered index mod num_shards equals this value")
+    parser.add_argument("--checkpoint-every", type=int, default=100,
+                        help="Atomic save every N accepted rallies per setting (0 disables periodic; per-setting save still happens)")
+    parser.add_argument("--no-resume", dest="resume", action="store_false",
+                        help="Ignore any existing output file and start from scratch")
+    parser.set_defaults(resume=True)
     args = parser.parse_args()
 
     collect(
@@ -665,4 +793,10 @@ if __name__ == "__main__":
         skill_profile=args.skill_profile,
         gantry_speed_scale=args.gantry_speed_scale,
         seed=args.seed,
+        skill1_filter=args.skill1,
+        skill2_filter=args.skill2,
+        num_shards=args.num_shards,
+        shard_index=args.shard_index,
+        checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
     )

@@ -1,13 +1,9 @@
 """
 Revised headless evaluation for the 5-skill Nash pipeline.
 
-What this version fixes:
-1. Evaluates until a target number of COMPLETED episodes.
-2. Uses a one-time warmup before counting results.
-3. Adds per-episode timeout and reset.
-4. Uses safe stdout capture for env.step().
-5. Keeps the 5-skill evaluator pure 5-skill only.
-   Do NOT mix the 2-skill baseline into this file.
+Merged version: teammate's probabilistic selection modes (softmax / epsilon_argmax /
+epsilon_softmax + per-matchup RNGs + --model-dir override) + hailey's dual-model
+head-to-head (--dual-* flags) + CUDA→CPU checkpoint fix.
 
 Run from the project root:
     MUJOCO_GL=cgl venv/bin/python nash_skills/eval_matchup.py
@@ -15,6 +11,14 @@ Run from the project root:
         --episodes 60 --steps 600 \
         --output-csv  skill_eval/matchup_results_5skill.csv \
         --output-json skill_eval/matchup_results_5skill.json
+
+    # Dual head-to-head (hailey): player 1 uses model set A, player 2 uses set B
+    MUJOCO_GL=cgl venv/bin/python nash_skills/eval_matchup.py \
+        --v3-5skill --dual-model-p-a models/model_p_5skill_v3_tie.pth \
+        --dual-model1-b models/model1_5skill_v3_discard.pth \
+        --dual-model2-b models/model2_5skill_v3_discard.pth \
+        --dual-model-p-b models/model_p_5skill_v3_discard.pth \
+        --dual-strategy1 nash-p-hard --dual-strategy2 nash-p-hard --dual-swap
 """
 
 import sys
@@ -34,6 +38,7 @@ import torch
 
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_index
 from nash_skills.winner_inference import infer_terminal_winner
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 
 
 # --------------------------------------------------------------------------- #
@@ -57,12 +62,10 @@ MODEL1_5SK_V3_PATH    = "models/model1_5skill_v3.pth"
 MODEL2_5SK_V3_PATH    = "models/model2_5skill_v3.pth"
 MODEL_P_5SK_V3_PATH   = "models/model_p_5skill_v3.pth"
 # FactoredModel weights for the 5-skill v2 pipeline (116-dim).
-# Trained by nash_skills/v2/train_q_model_5skill_factored.py.
 MODEL1_5SK_FACTORED_PATH  = "models/model1_5skill_factored.pth"
 MODEL2_5SK_FACTORED_PATH  = "models/model2_5skill_factored.pth"
 MODEL_P_5SK_FACTORED_PATH = "models/model_p_5skill_factored.pth"
-# FactoredModel weights for the 5-skill v3 pipeline (same-state per-sample
-# potential training). Trained by train_q_model_5skill_v3_factored.py.
+# FactoredModel weights for the 5-skill v3 pipeline.
 MODEL1_5SK_V3_FACTORED_PATH  = "models/model1_5skill_v3_factored.pth"
 MODEL2_5SK_V3_FACTORED_PATH  = "models/model2_5skill_v3_factored.pth"
 MODEL_P_5SK_V3_FACTORED_PATH = "models/model_p_5skill_v3_factored.pth"
@@ -172,24 +175,10 @@ class MatchupResult:
 
     @property
     def done_episodes(self) -> int:
-        """
-        Episodes that ended with a real done signal.
-
-        After the done-only evaluation fix, ``episodes`` already counts only
-        non-truncated terminal episodes. ``truncated_episodes`` is tracked
-        separately as a diagnostic counter and must not be subtracted here.
-        """
         return self.episodes
 
     @property
     def win_rate_clean(self) -> Optional[float]:
-        """
-        Win rate over done-only episodes.
-
-        This is currently identical to ``win_rate`` because truncated episodes
-        are not included in ``episodes``. The property is kept for compatibility
-        with the 2-skill evaluator and older analysis scripts.
-        """
         if self.done_episodes == 0:
             return None
         return self.ego_wins / self.done_episodes
@@ -228,17 +217,15 @@ def _build_obs2(obs, info):
 def _safe_load_state_dict(path: str):
     """
     Load a PyTorch checkpoint and support older torch versions.
+    Maps storages to CPU so checkpoints saved on CUDA load on CPU-only machines.
     """
     try:
-        return torch.load(path, weights_only=True)
+        return torch.load(path, weights_only=True, map_location="cpu")
     except TypeError:
-        return torch.load(path)
+        return torch.load(path, map_location="cpu")
 
 
 def _capture_env_step(env, action):
-    """
-    Run env.step(action) and capture printed contact lines.
-    """
     buf = io.StringIO()
     with redirect_stdout(buf):
         result = env.step(action)
@@ -246,14 +233,6 @@ def _capture_env_step(env, action):
 
 
 def _parse_contact_lines(lines):
-    """
-    Parse env print lines like:
-      Returned successfully by ego 1.876 0.198
-      Returned successfully by opp 1.019 -0.249
-
-    Returns:
-        ego_contacts, opp_contacts, ego_successes, opp_successes
-    """
     ego_contacts = 0
     opp_contacts = 0
     ego_successes = 0
@@ -284,25 +263,14 @@ def _parse_contact_lines(lines):
 
 
 def _infer_winner(obs, info):
-    """
-    Infer which player won from the terminal observation.
-
-    Preference:
-    1. Use explicit winner keys in info if present.
-    2. Reconstruct the env's terminal racket-boundary condition from info.
-    3. Fall back to ball VELOCITY x-component (obs[39]):
-         ball_vel_x > 0  → ball heading toward opp side → opp missed → EGO wins
-         ball_vel_x < 0  → ball heading toward ego side → ego missed → OPP wins
-    4. Last resort: ball position relative to the net only when the previous
-       signals are unavailable or exactly ambiguous.
-    """
+    # Delegates to the shared inference: explicit env winner (info['winner']) ->
+    # racket-boundary reconstruction -> ball x-velocity -> position fallback.
+    # Without this active return the function yielded None and run_matchup scored
+    # EVERY completed episode as an opp win (win_rate flat 0.0 for all matchups).
     return infer_terminal_winner(obs, info, fallback="position") or "opp"
 
 
 def _initial_skill_idx(name: str, fallback: int = 0) -> int:
-    """
-    Get a skill index safely.
-    """
     try:
         return skill_index(name)
     except Exception:
@@ -314,12 +282,6 @@ def _initial_skill_idx(name: str, fallback: int = 0) -> int:
 # --------------------------------------------------------------------------- #
 
 def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
-    """
-    Evaluate Φ(s, ego_s, opp_s) for all N×N skill pairs and return a
-    (N_SKILLS, N_SKILLS) tensor where rows = ego skills, cols = opp skills.
-
-    Batched: builds N² inputs in one forward pass. Encodes state once.
-    """
     if state_encoder_fn is not None and info is not None:
         base_vec = state_encoder_fn(obs_vec, info, player)
     else:
@@ -331,10 +293,10 @@ def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
             base[-2] = ego_s / (N_SKILLS - 1)
             base[-1] = opp_s / (N_SKILLS - 1)
             rows.append(base)
-    batch = torch.stack(rows)                    # (N*N, state_dim)
+    batch = torch.stack(rows)
     with torch.no_grad():
-        vals = model_p(batch)[:, 0]              # (N*N,)
-    return vals.reshape(N_SKILLS, N_SKILLS)      # [ego_skill, opp_skill]
+        vals = model_p(batch)[:, 0]
+    return vals.reshape(N_SKILLS, N_SKILLS)
 
 
 def _pick_with_softmax_fallback(
@@ -342,12 +304,6 @@ def _pick_with_softmax_fallback(
     tau: float,
     confidence_margin: float,
 ) -> int:
-    """
-    Pick argmax unless the top two scores are too close, then sample softmax.
-
-    This avoids deterministic tie-breaking artifacts on flat Φ surfaces while
-    preserving argmax behavior when the model expresses a clear preference.
-    """
     action_scores = action_scores.reshape(-1)
     if action_scores.numel() == 1:
         return 0
@@ -371,38 +327,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
     """
     Return pick_fn(player, obs_vec, other_skill_idx, info=None) -> skill_idx.
 
-    Five learned strategies
-    -----------------------
-    nash-p-hard      Joint argmax over the full Φ table (optimistic: assumes
-                     both players coordinate on the global best joint action).
-                     Falls back to softmax over optimistic ego-skill scores
-                     when the top-2 gap is below `confidence_margin`.
-    nash-p-br        Conditional best response: argmax_ego Φ(s, ego, opp_current).
-                     Reactive — reads the opponent's currently-observed skill.
-                     Falls back to softmax over conditional response scores
-                     when the top-2 gap is below `confidence_margin`.
-                     (Alias: "nash-p" for backwards compatibility.)
-    nash-p-minimax   Worst-case-safe: for each ego skill take min over opponent
-                     responses, then deterministically pick the ego skill with
-                     the best worst-case score.
-    nash-p-adaptive  Same minimax scores, but uses softmax when the top-2 gap
-                     is below `confidence_margin`; argmax otherwise.
-    ibr              Q-based alternating best response (Φ-independent).
-                     Requires model1 and model2 Q-value models.
-                     Alternates argmax_ego Q1 / argmax_opp Q2 for ibr_steps
-                     rounds and returns the converged ego skill.
-    ibr-q            Q-based empirical-mix best response.
-                     Tracks the opponent's observed skill frequencies and best
-                     responds to that mixture using model1 / model2.
-
-    Parameters
-    ----------
-    model_p           : nn.Module — learned potential Φ (required for all Φ strategies)
-    model1            : nn.Module or None — ego Q-value model (required for ibr / ibr-q)
-    model2            : nn.Module or None — opp Q-value model (required for ibr / ibr-q)
-    state_encoder_fn  : callable or None — maps (obs, info, player) -> encoded vector
-    tau               : float — softmax temperature for Φ-strategy fallbacks
-    confidence_margin : float — gap threshold for Φ argmax/softmax switch
+    See docstring in original file for strategy descriptions.
     """
     if strategy in SKILL_NAMES:
         fixed_idx = skill_index(strategy)
@@ -436,23 +361,13 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 rng=rng,
             )
 
-    # ------------------------------------------------------------------ #
-    # nash-p-hard: joint argmax over full Φ table                         #
-    # ------------------------------------------------------------------ #
     if strategy == "nash-p-hard":
         def pick_hard(player, obs_vec, _other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
-            # Preserve the optimistic joint-argmax semantics, but compare the
-            # best achievable value for each ego skill so fallback samples over
-            # ego actions rather than over N*N joint pairs.
             action_scores = phi.max(dim=1).values
             return _dispatch(action_scores)
         return pick_hard
 
-    # ------------------------------------------------------------------ #
-    # nash-p-br: best response fixing opp's current skill                 #
-    # (original "nash-p" — kept as alias too)                             #
-    # ------------------------------------------------------------------ #
     if strategy in ("nash-p-br", "nash-p"):
         def pick_br(player, obs_vec, other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
@@ -463,35 +378,26 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             return _dispatch(action_scores)
         return pick_br
 
-    # ------------------------------------------------------------------ #
-    # nash-p-minimax: worst-case-safe argmax                               #
-    # ------------------------------------------------------------------ #
     if strategy == "nash-p-minimax":
         def pick_minimax(player, obs_vec, other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
             if player == 1:
-                action_scores = phi.min(dim=1).values   # worst opp response per ego skill
+                action_scores = phi.min(dim=1).values
             else:
-                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
+                action_scores = phi.min(dim=0).values
             return _dispatch(action_scores)
         return pick_minimax
 
-    # ------------------------------------------------------------------ #
-    # nash-p-adaptive: minimax + softmax fallback when surface is flat    #
-    # ------------------------------------------------------------------ #
     if strategy == "nash-p-adaptive":
         def pick_adaptive(player, obs_vec, other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
             if player == 1:
                 action_scores = phi.min(dim=1).values
             else:
-                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
+                action_scores = phi.min(dim=0).values
             return _dispatch(action_scores)
         return pick_adaptive
 
-    # ------------------------------------------------------------------ #
-    # ibr: Q-based alternating best response (Φ-independent)              #
-    # ------------------------------------------------------------------ #
     if strategy == "ibr":
         if model1 is None or model2 is None:
             raise ValueError(
@@ -499,7 +405,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 "Pass them to make_picker(model1=..., model2=...)."
             )
 
-        IBR_STEPS = 10   # alternating rounds before returning
+        IBR_STEPS = 10
 
         def pick_ibr(player, obs_vec, other_skill_idx, info=None):
             if state_encoder_fn is not None and info is not None:
@@ -513,7 +419,6 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             s2 = other_skill_idx
 
             for _ in range(IBR_STEPS):
-                # Ego best-responds to s2 using Q1
                 q1_vals = []
                 for ego_s in range(N_SKILLS):
                     x = base_enc.clone().unsqueeze(0)
@@ -523,7 +428,6 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                         q1_vals.append(model1(x).item())
                 s1 = int(np.argmax(q1_vals))
 
-                # Opp best-responds to s1 using Q2 (opp minimises Q2 = maximises -Q2)
                 q2_vals = []
                 for opp_s in range(N_SKILLS):
                     x = base_enc.clone().unsqueeze(0)
@@ -531,7 +435,6 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                     x[0, -1] = opp_s / (N_SKILLS - 1)
                     with torch.no_grad():
                         q2_vals.append(model2(x).item())
-                # opp minimises Q2 (it's the ego-perspective value, opp wants it low)
                 s2 = int(np.argmin(q2_vals))
 
             return s1 if player == 1 else s2
@@ -585,61 +488,30 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
 
 
 # --------------------------------------------------------------------------- #
-# Single matchup runner
+# Core eval loop (hailey's refactor for dual-model support)
 # --------------------------------------------------------------------------- #
 
-def run_matchup(
+def _run_eval_loop(
+    pick1,
+    pick2,
     strategy1: str,
     strategy2: str,
     ppo,
-    model_p,
     n_episodes: int,
     max_steps_per_episode: int,
     warmup_steps: int = 300,
     max_total_steps: Optional[int] = None,
-    state_encoder_fn=None,
-    tau: float = 0.2,
-    confidence_margin: float = 0.05,
-    model1=None,
-    model2=None,
-    selection_mode: str = "argmax",
-    temperature: float = 1.0,
-    epsilon: float = 0.0,
-    rng1=None,
-    rng2=None,
 ) -> MatchupResult:
     """
-    Run one 5-skill matchup headlessly.
+    Core headless eval loop. Takes pre-built pickers, runs `n_episodes`
+    completed rallies, returns a MatchupResult.
 
-    Important:
-    - One-time global warmup.
-    - After warmup, keep running until we complete n_episodes.
-    - If an episode hits max_steps_per_episode, truncate and reset it.
-    - max_total_steps is an optional absolute safety valve. By default there
-      is no total-step cap, so heavy truncation cannot silently reduce the
-      number of completed episodes.
-    - model1 / model2: Q-value models required when strategy1 or strategy2 is
-      'ibr' or 'ibr-q'.
-    - rng1 / rng2: independent numpy Generators for player 1 / player 2
-      probabilistic skill selection. Passing the same generator to both
-      players would couple their stochastic draws; keep them separate so
-      each player's sampling is reproducible but not correlated with the
-      other's.
+    Used by both `run_matchup` (single model set) and `run_matchup_dual`
+    (player A and player B use different model sets).
     """
     from nash_skills.env_wrapper import SkillEnv
 
-    pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2,
-                        selection_mode=selection_mode, temperature=temperature,
-                        epsilon=epsilon, rng=rng1)
-    pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
-                        tau=tau, confidence_margin=confidence_margin,
-                        model1=model1, model2=model2,
-                        selection_mode=selection_mode, temperature=temperature,
-                        epsilon=epsilon, rng=rng2)
-
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    env = SkillEnv(proc_id=1, history=HISTORY, skill_profile="aggressive")
 
     curr_idx1 = _initial_skill_idx("left", 0)
     curr_idx2 = _initial_skill_idx("right", 0)
@@ -796,6 +668,98 @@ def run_matchup(
     )
 
 
+def run_matchup(
+    strategy1: str,
+    strategy2: str,
+    ppo,
+    model_p,
+    n_episodes: int,
+    max_steps_per_episode: int,
+    warmup_steps: int = 300,
+    max_total_steps: Optional[int] = None,
+    state_encoder_fn=None,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
+    model1=None,
+    model2=None,
+    selection_mode: str = "argmax",
+    temperature: float = 1.0,
+    epsilon: float = 0.0,
+    rng1=None,
+    rng2=None,
+) -> MatchupResult:
+    """
+    Run one 5-skill matchup headlessly. Both players use the same model set.
+
+    - rng1 / rng2: independent numpy Generators for player 1 / player 2
+      probabilistic skill selection. Keep them separate so each player's
+      sampling is reproducible but not correlated with the other's.
+    """
+    pick1 = make_picker(strategy1, model_p, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng1)
+    pick2 = make_picker(strategy2, model_p, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1, model2=model2,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng2)
+    return _run_eval_loop(
+        pick1, pick2, strategy1, strategy2, ppo,
+        n_episodes=n_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        warmup_steps=warmup_steps,
+        max_total_steps=max_total_steps,
+    )
+
+
+def run_matchup_dual(
+    strategy1: str,
+    strategy2: str,
+    ppo,
+    model_p_a,
+    model_p_b,
+    n_episodes: int,
+    max_steps_per_episode: int,
+    warmup_steps: int = 300,
+    max_total_steps: Optional[int] = None,
+    state_encoder_fn=None,
+    tau: float = 0.2,
+    confidence_margin: float = 0.05,
+    model1_a=None, model2_a=None,
+    model1_b=None, model2_b=None,
+    selection_mode: str = "argmax",
+    temperature: float = 1.0,
+    epsilon: float = 0.0,
+    rng1=None,
+    rng2=None,
+) -> MatchupResult:
+    """
+    Head-to-head: player 1 uses model set A, player 2 uses model set B.
+
+    Lets you compare two trained pipelines (e.g. tie-trained Q+Phi vs
+    discard-trained Q+Phi) by having them play each other directly.
+    """
+    pick1 = make_picker(strategy1, model_p_a, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1_a, model2=model2_a,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng1)
+    pick2 = make_picker(strategy2, model_p_b, state_encoder_fn=state_encoder_fn,
+                        tau=tau, confidence_margin=confidence_margin,
+                        model1=model1_b, model2=model2_b,
+                        selection_mode=selection_mode, temperature=temperature,
+                        epsilon=epsilon, rng=rng2)
+    return _run_eval_loop(
+        pick1, pick2, strategy1, strategy2, ppo,
+        n_episodes=n_episodes,
+        max_steps_per_episode=max_steps_per_episode,
+        warmup_steps=warmup_steps,
+        max_total_steps=max_total_steps,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Skill usage helpers
 # --------------------------------------------------------------------------- #
@@ -803,23 +767,49 @@ def run_matchup(
 def most_used_skill(result: MatchupResult) -> Optional[str]:
     if not result.skill_usage:
         return None
-
     total = sum(result.skill_usage.values())
     if total == 0:
         return None
-
     return max(result.skill_usage, key=result.skill_usage.get)
 
 
 def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
     if not result.skill_usage:
         return None
-
     total = sum(result.skill_usage.values())
     if total == 0:
         return None
-
     return max(result.skill_usage.values()) / total
+
+
+# --------------------------------------------------------------------------- #
+# Shared scorecard (nash_skills/v2/scorecard.py, meeting note item 19)         #
+# --------------------------------------------------------------------------- #
+
+def matchup_scorecard(result: MatchupResult) -> dict:
+    """
+    Adapt a MatchupResult into the shared scorecard metric set: adds median
+    rally length, skill-usage entropy, and dominant-skill fraction on top of
+    what print_summary/save_csv already report.
+    """
+    return compute_scorecard(
+        wins=result.ego_wins,
+        losses=result.opp_wins,
+        truncated=result.truncated_episodes,
+        rally_lengths=result.rally_lengths,
+        skill_usage=result.skill_usage,
+    )
+
+
+def print_full_scorecards(results: List[MatchupResult], file=None) -> None:
+    """Print the full shared scorecard for every matchup result, one block each."""
+    if file is None:
+        file = sys.stdout
+    for r in results:
+        label = f"{r.strategy1} vs {r.strategy2}"
+        sc = matchup_scorecard(r)
+        print(format_scorecard(sc, label=label), file=file)
+        print(file=file)
 
 
 # --------------------------------------------------------------------------- #
@@ -828,7 +818,6 @@ def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
 
 def save_csv(results: List[MatchupResult], path: str):
     rows = []
-
     for r in results:
         row = {
             "strategy1": r.strategy1,
@@ -850,10 +839,8 @@ def save_csv(results: List[MatchupResult], path: str):
             "most_used_skill": most_used_skill(r) or "",
             "dominant_fraction": round(dominant_skill_fraction(r), 4) if dominant_skill_fraction(r) is not None else "",
         }
-
         for skill_name in SKILL_NAMES:
             row[f"usage_{skill_name}"] = r.skill_usage.get(skill_name, 0)
-
         rows.append(row)
 
     if not rows:
@@ -912,7 +899,6 @@ def print_summary(results: List[MatchupResult], file=None,
     if scored:
         best = max(scored, key=lambda x: x[0])
         worst = min(scored, key=lambda x: x[0])
-
         print(
             f"\nBest matchup:  {best[1].strategy1} vs {best[1].strategy2} "
             f"— {best[0]:.0%}",
@@ -994,139 +980,58 @@ def main():
     parser = argparse.ArgumentParser(
         description="5-skill Nash matchup evaluator (5-skill v1 or v2 pipeline)"
     )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=60,
-        help="Number of COMPLETED episodes per matchup (default: 60)",
-    )
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=600,
-        help="Maximum steps per episode before truncation/reset (default: 600)",
-    )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=300,
-        help="One-time warmup steps before counting results (default: 300)",
-    )
-    parser.add_argument(
-        "--max-total-steps",
-        type=int,
-        default=None,
-        help=(
-            "Optional safety cap on total simulator steps per matchup. "
-            "Default None means keep running until --episodes done episodes are collected."
-        ),
-    )
-    parser.add_argument(
-        "--output-csv",
-        default="skill_eval/matchup_results_5skill.csv",
-    )
-    parser.add_argument(
-        "--output-json",
-        default="skill_eval/matchup_results_5skill.json",
-    )
-    parser.add_argument(
-        "--v2",
-        action="store_true",
-        default=False,
-        help=(
-            "Use the 4-skill v2 pipeline: load model_p_v2.pth (76-dim state encoder, "
-            "discounted-return training). Default: v1 5-skill pipeline."
-        ),
-    )
-    parser.add_argument(
-        "--v2-5skill",
-        action="store_true",
-        default=False,
-        dest="v2_5skill",
-        help=(
-            "Use the 5-skill v2 pipeline: load model_p_5skill_v2.pth (76-dim state "
-            "encoder, discounted-return labels, all 5 skills). Trained by "
-            "train_q_model_5skill_v2.py."
-        ),
-    )
-    parser.add_argument(
-        "--v3-5skill",
-        action="store_true",
-        default=False,
-        dest="v3_5skill",
-        help=(
-            "Use the 5-skill v3 pipeline: load model_p_5skill_v3.pth (76-dim state "
-            "encoder, discounted-return labels, all 5 skills, same-state per-sample "
-            "potential training). Trained by train_q_model_5skill_v3.py."
-        ),
-    )
-    parser.add_argument(
-        "--arch",
-        choices=["simple", "factored"],
-        default="simple",
-        help=(
-            "Estimator architecture (§3.6 ablation):\n"
-            "  simple   — SimpleModel (flat-concat MLP; default)\n"
-            "  factored — FactoredModel (separate state/skill encoders + fusion).\n"
-            "             Requires --v2-5skill or --v3-5skill. Loads\n"
-            "             model{1,2,p}_5skill_factored.pth   (with --v2-5skill) or\n"
-            "             model{1,2,p}_5skill_v3_factored.pth (with --v3-5skill)."
-        ),
-    )
-    parser.add_argument(
-        "--tau",
-        type=float,
-        default=0.2,
-        help="Softmax temperature for flat-surface fallback in nash-p-hard/br/adaptive (default: 0.2)",
-    )
-    parser.add_argument(
-        "--confidence-margin",
-        type=float,
-        default=0.05,
-        dest="confidence_margin",
-        help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax instead of argmax (default: 0.05)",
-    )
-    parser.add_argument(
-        "--selection-mode",
-        default="argmax",
-        dest="selection_mode",
+    parser.add_argument("--episodes", type=int, default=60,
+        help="Number of COMPLETED episodes per matchup (default: 60)")
+    parser.add_argument("--steps", type=int, default=600,
+        help="Maximum steps per episode before truncation/reset (default: 600)")
+    parser.add_argument("--warmup", type=int, default=300,
+        help="One-time warmup steps before counting results (default: 300)")
+    parser.add_argument("--max-total-steps", type=int, default=None,
+        help="Optional safety cap on total simulator steps per matchup.")
+    parser.add_argument("--output-csv", default="skill_eval/matchup_results_5skill.csv")
+    parser.add_argument("--output-json", default="skill_eval/matchup_results_5skill.json")
+    parser.add_argument("--v2", action="store_true", default=False,
+        help="Use the 4-skill v2 pipeline.")
+    parser.add_argument("--v2-5skill", action="store_true", default=False, dest="v2_5skill",
+        help="Use the 5-skill v2 pipeline.")
+    parser.add_argument("--v3-5skill", action="store_true", default=False, dest="v3_5skill",
+        help="Use the 5-skill v3 pipeline.")
+    parser.add_argument("--arch", choices=["simple", "factored"], default="simple",
+        help="Estimator architecture: simple or factored")
+    parser.add_argument("--tau", type=float, default=0.2,
+        help="Softmax temperature for flat-surface fallback (default: 0.2)")
+    parser.add_argument("--confidence-margin", type=float, default=0.05, dest="confidence_margin",
+        help="Top-2 score gap below which nash-p-hard/br/adaptive use softmax (default: 0.05)")
+    parser.add_argument("--selection-mode", default="argmax", dest="selection_mode",
         choices=["argmax", "softmax", "epsilon_argmax", "epsilon_softmax"],
-        help=(
-            "Skill-selection mode applied after computing action scores from Φ:\n"
-            "  argmax          — deterministic argmax (default; preserves original behavior)\n"
-            "  softmax         — sample from softmax(scores / --temperature)\n"
-            "  epsilon_argmax  — argmax with ε-greedy uniform exploration\n"
-            "  epsilon_softmax — softmax with ε-uniform mixing\n"
-            "Note: 'argmax' still uses the existing confidence-margin softmax fallback."
-        ),
-    )
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=1.0,
-        help="Softmax temperature for --selection-mode softmax/epsilon_softmax (default: 1.0)",
-    )
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=0.0,
-        help="Exploration rate in [0,1] for --selection-mode epsilon_argmax/epsilon_softmax (default: 0.0)",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="RNG seed for probabilistic selection modes (default: None = non-reproducible)",
-    )
-    parser.add_argument(
-        "--model-dir",
-        default=None,
-        dest="model_dir",
-        help=(
-            "Override the directory from which model .pth files are loaded "
-            "(default: 'models/'). Example: --model-dir models_new"
-        ),
-    )
+        help="Skill-selection mode after computing action scores from Φ.")
+    parser.add_argument("--temperature", type=float, default=1.0,
+        help="Softmax temperature for --selection-mode softmax/epsilon_softmax (default: 1.0)")
+    parser.add_argument("--epsilon", type=float, default=0.0,
+        help="Exploration rate in [0,1] for --selection-mode epsilon_argmax/epsilon_softmax")
+    parser.add_argument("--seed", type=int, default=None,
+        help="RNG seed for probabilistic selection modes")
+    parser.add_argument("--model-dir", default=None, dest="model_dir",
+        help="Override the directory from which model .pth files are loaded")
+    # ----------------------------- Dual mode --------------------------------
+    parser.add_argument("--dual-model1-a", default=None,
+        help="Override Q model 1 path for player A")
+    parser.add_argument("--dual-model2-a", default=None,
+        help="Override Q model 2 path for player A")
+    parser.add_argument("--dual-model-p-a", default=None,
+        help="Override potential model path for player A")
+    parser.add_argument("--dual-model1-b", default=None,
+        help="Q model 1 path for player B (enables dual mode)")
+    parser.add_argument("--dual-model2-b", default=None,
+        help="Q model 2 path for player B")
+    parser.add_argument("--dual-model-p-b", default=None,
+        help="Potential model path for player B")
+    parser.add_argument("--dual-strategy1", default="nash-p-hard",
+        help="Strategy for player 1 in dual mode (default: nash-p-hard)")
+    parser.add_argument("--dual-strategy2", default="nash-p-hard",
+        help="Strategy for player 2 in dual mode (default: nash-p-hard)")
+    parser.add_argument("--dual-swap", action="store_true",
+        help="Also run swapped match (B as p1, A as p2)")
     args = parser.parse_args()
 
     from stable_baselines3 import PPO
@@ -1138,13 +1043,9 @@ def main():
     def _model_path(default_path: str) -> str:
         if args.model_dir is None:
             return default_path
-        import os
         return os.path.join(args.model_dir, os.path.basename(default_path))
 
     if args.arch == "factored":
-        # FactoredModel weights trained on 116-dim raw obs.
-        # Pick v2 (minibatch-mean) or v3 (same-state per-sample) trained weights
-        # based on the pipeline flag. One of --v2-5skill / --v3-5skill is required.
         if args.v3_5skill:
             model_p_path = _model_path(MODEL_P_5SK_V3_FACTORED_PATH)
             pipeline_tag = "v3-5skill-factored"
@@ -1153,12 +1054,8 @@ def main():
             pipeline_tag = "v2-5skill-factored"
         else:
             raise SystemExit(
-                "--arch factored requires --v2-5skill or --v3-5skill (the "
-                "factored ablation is only trained for the 5-skill pipelines)."
+                "--arch factored requires --v2-5skill or --v3-5skill."
             )
-        # FactoredModel splits state vs skill internally. After re-collecting
-        # 5-skill data via nash_skills/v2/collect_data.py, rallies store 76-dim
-        # encoded states (74 state dims + 2 skill dims).
         model_p = FactoredModel(state_dim=74, skill_dim=2, last_layer_activation=None)
     elif args.v3_5skill:
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
@@ -1166,23 +1063,23 @@ def main():
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v3-5skill"
     elif args.v2_5skill:
-        # 5-skill v2: 76-dim encoded states, all 5 skills, discounted-return training
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = _model_path(MODEL_P_5SK_V2_PATH)
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v2-5skill"
     elif args.v2:
-        # 4-skill v2: 76-dim encoded states (original v2 diagnostic)
         from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
         model_p_path = _model_path(MODEL_P_V2_PATH)
         model_p = SimpleModel(V2_STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v2-4skill"
     else:
-        # v1: original 116-dim raw obs
         model_p_path = _model_path(MODEL_P_5SK_PATH)
         model_p = SimpleModel(116, [64, 32, 16], 1, last_layer_activation=None)
         pipeline_tag = "v1-5skill"
 
+    # Dual mode: optionally override player-A potential path
+    if args.dual_model_p_a:
+        model_p_path = args.dual_model_p_a
     model_p.load_state_dict(_safe_load_state_dict(model_p_path))
     model_p.eval()
 
@@ -1192,50 +1089,48 @@ def main():
     )
     model1 = model2 = None
     if needs_q:
-        # Architecture branch first: under --arch factored we construct
-        # FactoredModel and skip the SimpleModel construction below.
         if args.arch == "factored":
             if args.v3_5skill:
-                _q1_path = MODEL1_5SK_V3_FACTORED_PATH
-                _q2_path = MODEL2_5SK_V3_FACTORED_PATH
-            else:  # args.v2_5skill (the model_p branch above already enforced this)
-                _q1_path = MODEL1_5SK_FACTORED_PATH
-                _q2_path = MODEL2_5SK_FACTORED_PATH
-            # 76-dim encoded data: 74 state dims + 2 skill dims (see model_p above).
+                _q1_path = _model_path(MODEL1_5SK_V3_FACTORED_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V3_FACTORED_PATH)
+            else:
+                _q1_path = _model_path(MODEL1_5SK_FACTORED_PATH)
+                _q2_path = _model_path(MODEL2_5SK_FACTORED_PATH)
             model1 = FactoredModel(state_dim=74, skill_dim=2)
             model2 = FactoredModel(state_dim=74, skill_dim=2)
         else:
             if args.v3_5skill:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_5SK_V3_PATH
-                _q2_path = MODEL2_5SK_V3_PATH
+                _q1_path = _model_path(MODEL1_5SK_V3_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V3_PATH)
             elif args.v2_5skill:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_5SK_V2_PATH
-                _q2_path = MODEL2_5SK_V2_PATH
+                _q1_path = _model_path(MODEL1_5SK_V2_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V2_PATH)
             elif args.v2:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_V2_PATH
-                _q2_path = MODEL2_V2_PATH
+                _q1_path = _model_path(MODEL1_V2_PATH)
+                _q2_path = _model_path(MODEL2_V2_PATH)
             else:
                 _sdim = 116
-                _q1_path = MODEL1_5SK_PATH
-                _q2_path = MODEL2_5SK_PATH
+                _q1_path = _model_path(MODEL1_5SK_PATH)
+                _q2_path = _model_path(MODEL2_5SK_PATH)
             model1 = SimpleModel(_sdim, [64, 32, 16], 1)
             model2 = SimpleModel(_sdim, [64, 32, 16], 1)
+        # Dual mode: optionally override player-A Q paths
+        if args.dual_model1_a:
+            _q1_path = args.dual_model1_a
+        if args.dual_model2_a:
+            _q2_path = args.dual_model2_a
         model1.load_state_dict(_safe_load_state_dict(_q1_path))
         model2.load_state_dict(_safe_load_state_dict(_q2_path))
         model1.eval()
         model2.eval()
         print(f"  Loaded Q-models:    {_q1_path}, {_q2_path}")
 
-    # v2 state encoder: wraps encode_ego/encode_opp so make_picker can call it.
-    # After re-collecting 5-skill data via nash_skills/v2/collect_data.py, ALL
-    # v2/v3 models (simple AND factored) are trained on 76-dim encoded state,
-    # so all of them need the encoder at eval time.
     if args.v3_5skill or args.v2_5skill or args.v2:
         from nash_skills.v2.state_encoder import encode_ego, encode_opp
 
@@ -1251,6 +1146,102 @@ def main():
 
     print(f"  Loaded PPO:         {PPO_MODEL_PATH}")
     print(f"  Loaded potential:   {model_p_path}  ({pipeline_tag})")
+
+    # ------------------------------------------------------------------ #
+    # Dual mode: head-to-head model A (loaded above) vs model B          #
+    # ------------------------------------------------------------------ #
+    dual_paths = (args.dual_model1_b, args.dual_model2_b, args.dual_model_p_b)
+    if any(dual_paths):
+        if not all(dual_paths):
+            raise SystemExit(
+                "Dual mode requires all three: --dual-model1-b, --dual-model2-b, "
+                "--dual-model-p-b. Got " + repr(dual_paths)
+            )
+        if args.arch == "factored":
+            raise SystemExit("Dual mode currently only supports --arch simple.")
+
+        sdim_a = model_p.batch_norm.num_features
+        print(f"\nLoading model set B (state_dim={sdim_a}) ...")
+        model1_b = SimpleModel(sdim_a, [64, 32, 16], 1)
+        model2_b = SimpleModel(sdim_a, [64, 32, 16], 1)
+        model_p_b = SimpleModel(sdim_a, [64, 32, 16], 1, last_layer_activation=None)
+        model1_b.load_state_dict(_safe_load_state_dict(args.dual_model1_b))
+        model2_b.load_state_dict(_safe_load_state_dict(args.dual_model2_b))
+        model_p_b.load_state_dict(_safe_load_state_dict(args.dual_model_p_b))
+        model1_b.eval(); model2_b.eval(); model_p_b.eval()
+        print(f"  Loaded {args.dual_model1_b}")
+        print(f"  Loaded {args.dual_model2_b}")
+        print(f"  Loaded {args.dual_model_p_b}")
+
+        if model1 is None or model2 is None:
+            needs_q_dual = {args.dual_strategy1, args.dual_strategy2} & {"ibr", "ibr-q"}
+            if needs_q_dual:
+                raise SystemExit(
+                    f"Dual strategy {needs_q_dual} requires player-A Q models."
+                )
+
+        # Independent seeds for dual mode RNGs
+        if args.seed is not None:
+            dual_rng1 = np.random.default_rng(args.seed)
+            dual_rng2 = np.random.default_rng(args.seed + 1)
+            dual_rng1_swap = np.random.default_rng(args.seed + 2)
+            dual_rng2_swap = np.random.default_rng(args.seed + 3)
+        else:
+            dual_rng1 = dual_rng2 = dual_rng1_swap = dual_rng2_swap = None
+
+        def _run_one(label, p1_strategy, p2_strategy,
+                     mp1, m1_1, m2_1, mp2, m1_2, m2_2, r1, r2):
+            print(f"\n=== {label}: P1={p1_strategy} (A)  vs  P2={p2_strategy} (B) ===")
+            res = run_matchup_dual(
+                strategy1=p1_strategy, strategy2=p2_strategy,
+                ppo=ppo,
+                model_p_a=mp1, model_p_b=mp2,
+                model1_a=m1_1, model2_a=m2_1,
+                model1_b=m1_2, model2_b=m2_2,
+                n_episodes=args.episodes,
+                max_steps_per_episode=args.steps,
+                warmup_steps=args.warmup,
+                max_total_steps=args.max_total_steps,
+                state_encoder_fn=state_encoder_fn,
+                tau=args.tau,
+                confidence_margin=args.confidence_margin,
+                selection_mode=args.selection_mode,
+                temperature=args.temperature,
+                epsilon=args.epsilon,
+                rng1=r1, rng2=r2,
+            )
+            wr = res.ego_wins / res.episodes if res.episodes else 0.0
+            print(f"  ego_wins={res.ego_wins}/{res.episodes} = {wr:.1%}  "
+                  f"truncated={res.truncated_episodes}")
+            return wr
+
+        wr_a_p1 = _run_one("Match 1 (A as P1)",
+                           args.dual_strategy1, args.dual_strategy2,
+                           model_p,  model1,  model2,
+                           model_p_b, model1_b, model2_b,
+                           dual_rng1, dual_rng2)
+
+        if args.dual_swap:
+            wr_b_p1 = _run_one("Match 2 (B as P1, swapped)",
+                               args.dual_strategy1, args.dual_strategy2,
+                               model_p_b, model1_b, model2_b,
+                               model_p,  model1,  model2,
+                               dual_rng1_swap, dual_rng2_swap)
+            print(f"\n=== Dual summary (ego-side controlled) ===")
+            print(f"  A as P1 win rate: {wr_a_p1:.1%}")
+            print(f"  B as P1 win rate: {wr_b_p1:.1%}")
+            a_total = wr_a_p1 + (1 - wr_b_p1)
+            b_total = (1 - wr_a_p1) + wr_b_p1
+            print(f"  A net (both directions): {a_total:.2f}  vs  B net: {b_total:.2f}")
+            if a_total > b_total + 0.05:
+                print(f"  → A stronger by {a_total - b_total:.2f}")
+            elif b_total > a_total + 0.05:
+                print(f"  → B stronger by {b_total - a_total:.2f}")
+            else:
+                print(f"  → roughly equal")
+
+        return  # skip DEFAULT_MATCHUPS loop
+
     print(
         f"\nRunning {len(DEFAULT_MATCHUPS)} matchups "
         f"to {args.episodes} completed episodes each "
@@ -1262,9 +1253,7 @@ def main():
     for matchup_idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS):
         print(f"  [{s1} vs {s2}] ...")
 
-        # Independent, per-matchup, per-player seeds: player 1 and player 2
-        # must not share a generator (coupled stochastic draws), and each
-        # matchup must not replay the same draws as the previous one.
+        # Independent, per-matchup, per-player seeds
         if args.seed is not None:
             rng1 = np.random.default_rng(args.seed + 2 * matchup_idx)
             rng2 = np.random.default_rng(args.seed + 2 * matchup_idx + 1)
@@ -1319,7 +1308,6 @@ def main():
         total_picks = sum(r.skill_usage.values())
         if total_picks == 0:
             continue
-
         usage_str = "  ".join(
             f"{k}={v}({v / total_picks:.0%})"
             for k, v in r.skill_usage.items()
