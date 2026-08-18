@@ -26,14 +26,24 @@ import csv
 import dataclasses
 import io
 import json
+from pathlib import Path
 from contextlib import redirect_stdout
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
 
-from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_index, skill_from_index
+from nash_skills.skills import SKILL_NAMES, SKILL_PROFILE_NAMES, N_SKILLS, skill_index, skill_from_index
 from nash_skills.winner_inference import infer_terminal_winner
+from diagnostic_rendering import (
+    EpisodeVideoRecorder,
+    encode_np_random_state,
+    decode_np_random_state,
+    manual_render_requested,
+    prompt_manual_replays,
+    render_episode_limit,
+    replay_selected_episodes,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +66,9 @@ MODEL_P_5SK_V2_PATH   = "models/model_p_5skill_v2.pth"
 MODEL1_5SK_V3_PATH    = "models/model1_5skill_v3.pth"
 MODEL2_5SK_V3_PATH    = "models/model2_5skill_v3.pth"
 MODEL_P_5SK_V3_PATH   = "models/model_p_5skill_v3.pth"
+# MODEL1_5SK_V3_PATH    = "models/model1_5skill_v3_updated.pth"
+# MODEL2_5SK_V3_PATH    = "models/model2_5skill_v3_updated.pth"
+# MODEL_P_5SK_V3_PATH   = "models/model_p_5skill_v3_updated.pth"
 # FactoredModel weights for the 5-skill v2 pipeline (116-dim).
 # Trained by nash_skills/v2/train_q_model_5skill_factored.py.
 MODEL1_5SK_FACTORED_PATH  = "models/model1_5skill_factored.pth"
@@ -75,10 +88,10 @@ TABLE_X_MAX = TABLE_SHIFT + 1.37
 TABLE_Y_ABS_MAX = 0.75
 
 VALID_STRATEGIES = [
-    "nash-p-hard",      # joint argmax over full Φ table (optimistic)
-    "nash-p-br",        # conditional best response fixing opp's current skill
-    "nash-p-minimax",   # worst-case-safe: argmax over per-ego min-over-opp Φ
-    "nash-p-adaptive",  # minimax scores + softmax when gap < margin
+    "nash-p-hard",      # optimistic heuristic over Φ rows/columns
+    "nash-p-br",        # conditional best response fixing other player's skill
+    "nash-p-minimax",   # heuristic: maximin over Φ rows/columns
+    "nash-p-adaptive",  # heuristic: maximin + softmax when gap < margin
     "ibr",              # Q-based alternating best response (Φ-independent)
     "ibr-q",            # Q-based empirical-mix best response
     "nash-p",           # alias for nash-p-br (backwards compat)
@@ -193,6 +206,181 @@ class MatchupResult:
         if self.done_episodes == 0:
             return None
         return self.ego_wins / self.done_episodes
+
+
+def select_player1_loss_replays(
+    rows: List[Dict[str, Any]],
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    selected = [row for row in rows if row.get("winner") == "opp"]
+    if limit is not None:
+        return selected[:limit]
+    return selected
+
+
+def _render_options_requested(args: argparse.Namespace) -> bool:
+    return bool(
+        args.render_losses_only
+        or args.render_truncated_only
+        or args.render_episodes is not None
+        or args.save_video
+        or args.experimental_post_eval_replay
+    )
+
+
+def _original_capture_requested(args: argparse.Namespace) -> bool:
+    return bool(args.matchup is not None and args.render_losses_only)
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value)
+
+
+def _json_loads(value: Any, default: Any = None) -> Any:
+    if value in ("", None):
+        return default
+    return json.loads(str(value))
+
+
+def _float_list(values: Any) -> List[float]:
+    if values is None:
+        return []
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    return [float(x) for x in arr]
+
+
+def _softmax_probs(values: np.ndarray, temperature: float) -> np.ndarray:
+    v = np.asarray(values, dtype=float)
+    if temperature <= 0:
+        probs = np.zeros(len(v), dtype=float)
+        probs[int(np.argmax(v))] = 1.0
+        return probs
+    z = (v - np.max(v)) / temperature
+    exp = np.exp(z)
+    return exp / exp.sum()
+
+
+def _selection_probabilities(
+    values: np.ndarray,
+    selection_mode: str,
+    tau: float,
+    confidence_margin: float,
+    temperature: float,
+    epsilon: float,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float).reshape(-1)
+    n = len(values)
+    uniform = np.ones(n, dtype=float) / n
+    argmax_idx = int(np.argmax(values))
+    argmax_probs = np.zeros(n, dtype=float)
+    argmax_probs[argmax_idx] = 1.0
+
+    if selection_mode == "argmax":
+        if n <= 1:
+            return argmax_probs
+        sorted_values = np.sort(values)[::-1]
+        gap = float(sorted_values[0] - sorted_values[1])
+        if gap >= confidence_margin or tau <= 0:
+            return argmax_probs
+        return _softmax_probs(values, tau)
+    if selection_mode == "softmax":
+        return _softmax_probs(values, temperature)
+    if selection_mode == "epsilon_argmax":
+        return (1.0 - epsilon) * argmax_probs + epsilon * uniform
+    if selection_mode == "epsilon_softmax":
+        return (1.0 - epsilon) * _softmax_probs(values, temperature) + epsilon * uniform
+    return argmax_probs
+
+
+def _encode_generator_state(rng) -> str:
+    if rng is None:
+        return ""
+    return json.dumps(rng.bit_generator.state)
+
+
+def _decode_generator_state(value: Any) -> Optional[np.random.Generator]:
+    state = _json_loads(value)
+    if not state:
+        return None
+    bitgen_name = state.get("bit_generator", "PCG64")
+    bitgen_cls = getattr(np.random, bitgen_name, np.random.PCG64)
+    rng = np.random.Generator(bitgen_cls())
+    rng.bit_generator.state = state
+    return rng
+
+
+def _skill_sequence_from_decisions(decisions: List[Dict[str, Any]], player_key: str) -> List[str]:
+    return [str(decision[player_key]) for decision in decisions]
+
+
+def _warn_if_replay_differs(original: Dict[str, Any], replayed: Dict[str, Any]) -> None:
+    checks = [
+        ("winner", original.get("winner"), replayed.get("winner")),
+        ("truncated", bool(original.get("truncated")), bool(replayed.get("truncated"))),
+        ("physics_steps", int(original.get("physics_steps", 0)), int(replayed.get("physics_steps", 0))),
+        ("rally_length", int(original.get("rally_length", 0)), int(replayed.get("rally_length", 0))),
+        ("p1_skill_sequence", original.get("p1_skill_sequence"), replayed.get("p1_skill_sequence")),
+        ("p2_skill_sequence", original.get("p2_skill_sequence"), replayed.get("p2_skill_sequence")),
+    ]
+    mismatches = [
+        f"{name}: original={expected!r} replay={actual!r}"
+        for name, expected, actual in checks
+        if expected != actual
+    ]
+    if mismatches:
+        episode_id = original.get("episode_id", "")
+        print(
+            f"WARNING: replay mismatch for episode {episode_id}: "
+            + "; ".join(mismatches),
+            flush=True,
+        )
+
+
+def _final_ball_state(obs, info: Optional[dict] = None) -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "position": np.asarray(obs[36:39], dtype=float).tolist(),
+        "velocity": np.asarray(obs[39:42], dtype=float).tolist(),
+    }
+    if isinstance(info, dict):
+        for key in (
+            "termination_reason",
+            "ball_x",
+            "ball_y",
+            "ball_z",
+            "ball_vx",
+            "ball_vy",
+            "ball_vz",
+            "ego_racket_x",
+            "opp_racket_x",
+        ):
+            if key in info:
+                state[key] = info[key]
+    return state
+
+
+def _write_video_metadata(path: Path, row: Dict[str, Any]) -> None:
+    metadata = {
+        "episode_id": row.get("episode_id"),
+        "strategy1": row.get("strategy1"),
+        "strategy2": row.get("strategy2"),
+        "winner": row.get("winner"),
+        "truncated": row.get("truncated"),
+        "termination_reason": row.get("termination_reason"),
+        "physics_steps": row.get("physics_steps"),
+        "rally_length": row.get("rally_length"),
+        "p1_initial_skill": row.get("p1_initial_skill"),
+        "p2_initial_skill": row.get("p2_initial_skill"),
+        "p1_skill_sequence": row.get("p1_skill_sequence"),
+        "p2_skill_sequence": row.get("p2_skill_sequence"),
+        "decision_steps": _json_loads(row.get("decision_steps"), []),
+        "final_ball_state": row.get("final_ball_state"),
+        "reset_mode": row.get("reset_mode"),
+        "skill_profile": row.get("skill_profile"),
+        "gantry_speed_scale": row.get("gantry_speed_scale"),
+        "policy_selection_settings": _json_loads(row.get("policy_selection_settings"), {}),
+    }
+    with open(path.with_suffix(".json"), "w") as f:
+        json.dump(metadata, f, indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -315,8 +503,15 @@ def _initial_skill_idx(name: str, fallback: int = 0) -> int:
 
 def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
     """
-    Evaluate Φ(s, ego_s, opp_s) for all N×N skill pairs and return a
-    (N_SKILLS, N_SKILLS) tensor where rows = ego skills, cols = opp skills.
+    Evaluate Φ(s, p1_skill, p2_skill) for all N×N skill pairs.
+
+    Table convention:
+        rows    = Player 1 skills
+        columns = Player 2 skills
+
+    Model input convention:
+        input[-2] = Player 1 skill, normalized to [0, 1]
+        input[-1] = Player 2 skill, normalized to [0, 1]
 
     Batched: builds N² inputs in one forward pass. Encodes state once.
     """
@@ -334,7 +529,206 @@ def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
     batch = torch.stack(rows)                    # (N*N, state_dim)
     with torch.no_grad():
         vals = model_p(batch)[:, 0]              # (N*N,)
-    return vals.reshape(N_SKILLS, N_SKILLS)      # [ego_skill, opp_skill]
+    return vals.reshape(N_SKILLS, N_SKILLS)      # [p1_skill, p2_skill]
+
+
+def _encoded_policy_state(obs_vec, info, player, state_encoder_fn):
+    if state_encoder_fn is not None and info is not None:
+        return np.asarray(state_encoder_fn(obs_vec, info, player), dtype=np.float32)
+    return np.asarray(obs_vec, dtype=np.float32)
+
+
+def _q_values_for_player(base_enc, player: int, other_skill_idx: int, model1, model2) -> List[float]:
+    if model1 is None or model2 is None:
+        return []
+    model = model1 if player == 1 else model2
+    values = []
+    for candidate in range(N_SKILLS):
+        x = torch.tensor(base_enc, dtype=torch.float32).clone().unsqueeze(0)
+        if player == 1:
+            x[0, -2] = candidate / (N_SKILLS - 1)
+            x[0, -1] = other_skill_idx / (N_SKILLS - 1)
+        else:
+            x[0, -2] = other_skill_idx / (N_SKILLS - 1)
+            x[0, -1] = candidate / (N_SKILLS - 1)
+        with torch.no_grad():
+            values.append(float(model(x).item()))
+    return values
+
+
+def _phi_values_for_player(base_enc, player: int, other_skill_idx: int, model_p) -> List[float]:
+    if model_p is None:
+        return []
+    rows = []
+    for candidate in range(N_SKILLS):
+        x = torch.tensor(base_enc, dtype=torch.float32).clone()
+        if player == 1:
+            x[-2] = candidate / (N_SKILLS - 1)
+            x[-1] = other_skill_idx / (N_SKILLS - 1)
+        else:
+            x[-2] = other_skill_idx / (N_SKILLS - 1)
+            x[-1] = candidate / (N_SKILLS - 1)
+        rows.append(x)
+    with torch.no_grad():
+        return _float_list(model_p(torch.stack(rows))[:, 0])
+
+
+def _policy_action_values(
+    strategy: str,
+    base_enc,
+    player: int,
+    other_skill_idx: int,
+    model_p,
+    model1,
+    model2,
+    observed_opp_mix: Optional[List[float]] = None,
+) -> tuple[str, List[float]]:
+    if strategy in SKILL_NAMES:
+        values = [0.0] * N_SKILLS
+        values[skill_index(strategy)] = 1.0
+        return "fixed", values
+    if strategy == "random":
+        return "random", [1.0 / N_SKILLS] * N_SKILLS
+
+    if strategy == "ibr":
+        if model1 is None or model2 is None:
+            return "q", []
+        s1 = other_skill_idx
+        s2 = other_skill_idx
+        q1_vals: List[float] = []
+        q2_vals: List[float] = []
+        for _ in range(4):
+            q1_vals = _q_values_for_player(base_enc, 1, s2, model1, model2)
+            s1 = int(np.argmax(q1_vals))
+            q2_vals = _q_values_for_player(base_enc, 2, s1, model1, model2)
+            s2 = int(np.argmax(q2_vals))
+        return "q", q1_vals if player == 1 else q2_vals
+
+    if strategy == "ibr-q":
+        if model1 is None or model2 is None:
+            return "q", []
+        mix = observed_opp_mix or [1.0 / N_SKILLS] * N_SKILLS
+        q_model = model1 if player == 1 else model2
+        values = []
+        for candidate in range(N_SKILLS):
+            val = 0.0
+            for opp_s, prob in enumerate(mix):
+                x = torch.tensor(base_enc, dtype=torch.float32).clone().unsqueeze(0)
+                if player == 1:
+                    x[0, -2] = candidate / (N_SKILLS - 1)
+                    x[0, -1] = opp_s / (N_SKILLS - 1)
+                else:
+                    x[0, -2] = opp_s / (N_SKILLS - 1)
+                    x[0, -1] = candidate / (N_SKILLS - 1)
+                with torch.no_grad():
+                    val += float(prob) * float(q_model(x).item())
+            values.append(val)
+        return "q", values
+
+    if strategy in {"nash-p-hard", "nash-p-br", "nash-p", "nash-p-minimax", "nash-p-adaptive"}:
+        phi = _build_phi_table(base_enc, None, player, model_p, None)
+        if strategy == "nash-p-hard":
+            values = phi.max(dim=1).values if player == 1 else phi.max(dim=0).values
+        elif strategy in {"nash-p-br", "nash-p"}:
+            values = phi[:, other_skill_idx] if player == 1 else phi[other_skill_idx, :]
+        else:
+            values = phi.min(dim=1).values if player == 1 else phi.min(dim=0).values
+        return "phi", _float_list(values)
+
+    return "unknown", []
+
+
+def build_decision_diagnostic_row(
+    *,
+    strategy: str,
+    strategy1: str,
+    strategy2: str,
+    matchup_index: int,
+    episode_id: int,
+    player: int,
+    obs,
+    info,
+    state_encoder_fn,
+    model_p,
+    model1,
+    model2,
+    other_skill_idx: int,
+    selected_idx: int,
+    decision_index: int,
+    physics_step: int,
+    selection_mode: str,
+    tau: float,
+    confidence_margin: float,
+    temperature: float,
+    epsilon: float,
+) -> Dict[str, Any]:
+    base_enc = _encoded_policy_state(obs, info, player, state_encoder_fn)
+    score_type, action_values = _policy_action_values(
+        strategy,
+        base_enc,
+        player,
+        other_skill_idx,
+        model_p,
+        model1,
+        model2,
+    )
+    q_values = _q_values_for_player(base_enc, player, other_skill_idx, model1, model2)
+    phi_values = _phi_values_for_player(base_enc, player, other_skill_idx, model_p)
+
+    if score_type in {"fixed", "random"}:
+        if score_type == "fixed":
+            probs = np.zeros(N_SKILLS, dtype=float)
+            probs[selected_idx] = 1.0
+        else:
+            probs = np.ones(N_SKILLS, dtype=float) / N_SKILLS
+    else:
+        probs = _selection_probabilities(
+            np.asarray(action_values, dtype=float),
+            selection_mode,
+            tau,
+            confidence_margin,
+            temperature,
+            epsilon,
+        ) if action_values else np.full(N_SKILLS, np.nan)
+
+    row = {
+        "matchup_index": matchup_index,
+        "strategy1": strategy1,
+        "strategy2": strategy2,
+        "strategy": strategy,
+        "episode_id": episode_id,
+        "player": player,
+        "player_label": "P1" if player == 1 else "P2",
+        "decision_index": decision_index,
+        "physics_step": physics_step,
+        "opponent_skill": skill_from_index(other_skill_idx),
+        "selected_skill": skill_from_index(selected_idx),
+        "selected_skill_idx": selected_idx,
+        "score_type": score_type,
+        "action_values_json": _json_dumps(action_values),
+        "q_values_json": _json_dumps(q_values),
+        "phi_values_json": _json_dumps(phi_values),
+        "selection_probabilities_json": _json_dumps(_float_list(probs)),
+        "selected_probability": float(probs[selected_idx]) if len(probs) > selected_idx else "",
+        "state_json": _json_dumps(_float_list(base_enc)),
+        "ball_x": float(obs[36]),
+        "ball_y": float(obs[37]),
+        "ball_z": float(obs[38]),
+        "ball_vx": float(obs[39]),
+        "ball_vy": float(obs[40]),
+        "ball_vz": float(obs[41]),
+        "next_state_json": "",
+        "next_action_values_json": "",
+        "next_q_values_json": "",
+        "next_phi_values_json": "",
+        "final_winner": "",
+        "player_won": "",
+        "truncated": "",
+        "termination_reason": "",
+        "final_rally_length": "",
+        "final_physics_steps": "",
+    }
+    return row
 
 
 def _pick_with_softmax_fallback(
@@ -373,19 +767,17 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
 
     Five learned strategies
     -----------------------
-    nash-p-hard      Joint argmax over the full Φ table (optimistic: assumes
-                     both players coordinate on the global best joint action).
-                     Falls back to softmax over optimistic ego-skill scores
-                     when the top-2 gap is below `confidence_margin`.
-    nash-p-br        Conditional best response: argmax_ego Φ(s, ego, opp_current).
-                     Reactive — reads the opponent's currently-observed skill.
+    nash-p-hard      Optimistic Φ heuristic. Player 1 chooses the row whose best
+                     column is largest; Player 2 chooses the column whose best
+                     row is largest. This is not a true Nash solver.
+    nash-p-br        Conditional best response under the v3 potential convention:
+                     both players maximize Φ while fixing the other player's
+                     currently observed skill.
                      Falls back to softmax over conditional response scores
                      when the top-2 gap is below `confidence_margin`.
                      (Alias: "nash-p" for backwards compatibility.)
-    nash-p-minimax   Worst-case-safe: for each ego skill take min over opponent
-                     responses, then deterministically pick the ego skill with
-                     the best worst-case score.
-    nash-p-adaptive  Same minimax scores, but uses softmax when the top-2 gap
+    nash-p-minimax   Heuristic: maximin over Φ rows/columns.
+    nash-p-adaptive  Heuristic: maximin scores, with softmax when the top-2 gap
                      is below `confidence_margin`; argmax otherwise.
     ibr              Q-based alternating best response (Φ-independent).
                      Requires model1 and model2 Q-value models.
@@ -437,15 +829,15 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             )
 
     # ------------------------------------------------------------------ #
-    # nash-p-hard: joint argmax over full Φ table                         #
+    # nash-p-hard: optimistic heuristic over Φ rows/columns                #
     # ------------------------------------------------------------------ #
     if strategy == "nash-p-hard":
         def pick_hard(player, obs_vec, _other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
-            # Preserve the optimistic joint-argmax semantics, but compare the
-            # best achievable value for each ego skill so fallback samples over
-            # ego actions rather than over N*N joint pairs.
-            action_scores = phi.max(dim=1).values
+            if player == 1:
+                action_scores = phi.max(dim=1).values  # best column per P1 row
+            else:
+                action_scores = phi.max(dim=0).values  # best row per P2 column
             return _dispatch(action_scores)
         return pick_hard
 
@@ -459,36 +851,75 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             if player == 1:
                 action_scores = phi[:, other_skill_idx]
             else:
-                action_scores = -phi[other_skill_idx, :]
+                action_scores = phi[other_skill_idx, :]
             return _dispatch(action_scores)
         return pick_br
 
     # ------------------------------------------------------------------ #
-    # nash-p-minimax: worst-case-safe argmax                               #
+    # nash-p-minimax: maximin heuristic                                    #
     # ------------------------------------------------------------------ #
     if strategy == "nash-p-minimax":
         def pick_minimax(player, obs_vec, other_skill_idx, info=None):
             phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
             if player == 1:
-                action_scores = phi.min(dim=1).values   # worst opp response per ego skill
+                action_scores = phi.min(dim=1).values   # worst column per P1 row
             else:
-                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
+                action_scores = phi.min(dim=0).values   # worst row per P2 column
             return _dispatch(action_scores)
         return pick_minimax
 
     # ------------------------------------------------------------------ #
-    # nash-p-adaptive: minimax + softmax fallback when surface is flat    #
+    # nash-p-adaptive: maximin heuristic + softmax fallback when flat      #
     # ------------------------------------------------------------------ #
+    # if strategy == "nash-p-adaptive":
+    #     def pick_adaptive(player, obs_vec, other_skill_idx, info=None):
+    #         phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
+    #         if player == 1:
+    #             action_scores = phi.min(dim=1).values
+    #         else:
+    #             action_scores = phi.min(dim=0).values   # worst row per P2 column
+    #         return _dispatch(action_scores)
+    #     return pick_adaptive
     if strategy == "nash-p-adaptive":
-        def pick_adaptive(player, obs_vec, other_skill_idx, info=None):
-            phi = _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn)
-            if player == 1:
-                action_scores = phi.min(dim=1).values
-            else:
-                action_scores = phi.min(dim=0).values   # worst ego response per opp skill
-            return _dispatch(action_scores)
-        return pick_adaptive
+        # Separate opponent-skill counts for each player.
+        # P1 tracks P2's observed skills.
+        # P2 tracks P1's observed skills.
+        opponent_counts = {
+            1: np.full(N_SKILLS, 0.1, dtype=np.float64),
+            2: np.full(N_SKILLS, 0.1, dtype=np.float64),
+        }
 
+        def pick_adaptive(player, obs_vec, other_skill_idx, info=None):
+            phi = _build_phi_table(
+                obs_vec,
+                info,
+                player,
+                model_p,
+                state_encoder_fn,
+            )  # shape (5, 5): rows=P1 skills, cols=P2 skills
+
+            # Observe the opponent's current/incoming skill.
+            opponent_counts[player][other_skill_idx] += 1.0
+
+            probs_np = opponent_counts[player] / opponent_counts[player].sum()
+            probs = torch.tensor(
+                probs_np,
+                dtype=phi.dtype,
+                device=phi.device,
+            )
+
+            if player == 1:
+                # For each P1 action, expected Phi over P2 skill distribution.
+                # phi shape: [P1_action, P2_action]
+                action_scores = phi @ probs
+
+            else:
+                # For each P2 action, expected Phi over P1 skill distribution.
+                action_scores = probs @ phi
+
+            return _dispatch(action_scores)
+
+        return pick_adaptive
     # ------------------------------------------------------------------ #
     # ibr: Q-based alternating best response (Φ-independent)              #
     # ------------------------------------------------------------------ #
@@ -499,7 +930,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 "Pass them to make_picker(model1=..., model2=...)."
             )
 
-        IBR_STEPS = 10   # alternating rounds before returning
+        IBR_STEPS = 4   # alternating rounds before returning
 
         def pick_ibr(player, obs_vec, other_skill_idx, info=None):
             if state_encoder_fn is not None and info is not None:
@@ -523,7 +954,8 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                         q1_vals.append(model1(x).item())
                 s1 = int(np.argmax(q1_vals))
 
-                # Opp best-responds to s1 using Q2 (opp minimises Q2 = maximises -Q2)
+                # Player 2 best-responds to s1 by maximizing Q2, its own
+                # discounted utility target.
                 q2_vals = []
                 for opp_s in range(N_SKILLS):
                     x = base_enc.clone().unsqueeze(0)
@@ -531,8 +963,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                     x[0, -1] = opp_s / (N_SKILLS - 1)
                     with torch.no_grad():
                         q2_vals.append(model2(x).item())
-                # opp minimises Q2 (it's the ego-perspective value, opp wants it low)
-                s2 = int(np.argmin(q2_vals))
+                s2 = int(np.argmax(q2_vals))
 
             return s1 if player == 1 else s2
 
@@ -607,6 +1038,20 @@ def run_matchup(
     epsilon: float = 0.0,
     rng1=None,
     rng2=None,
+    reset_mode: str = "ready",
+    skill_profile: str = "aggressive",
+    gantry_speed_scale: float = 1.0,
+    collect_replay_metadata: bool = False,
+    replay_metadata: Optional[List[Dict[str, Any]]] = None,
+    matchup_index: int = 0,
+    capture_original_videos: bool = False,
+    original_video_dir: str = "data/rendered_rallies",
+    original_video_fps: int = 60,
+    original_capture_every: int = 1,
+    original_video_limit: Optional[int] = None,
+    original_render_truncated_only: bool = False,
+    saved_video_metadata: Optional[List[Dict[str, Any]]] = None,
+    decision_log_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> MatchupResult:
     """
     Run one 5-skill matchup headlessly.
@@ -639,7 +1084,15 @@ def run_matchup(
                         selection_mode=selection_mode, temperature=temperature,
                         epsilon=epsilon, rng=rng2)
 
-    env = SkillEnv(proc_id=1, history=HISTORY)
+    # env = SkillEnv(proc_id=1, history=HISTORY)
+    # Use ready-reset mode to avoid the initial "serve" phase and start with a rally. Align with the updated env wrapper that supports ready-reset mode.
+    env = SkillEnv(
+        proc_id=1,
+        history=HISTORY,
+        reset_mode=reset_mode,
+        skill_profile=skill_profile,
+        gantry_speed_scale=gantry_speed_scale,
+    )
 
     curr_idx1 = _initial_skill_idx("left", 0)
     curr_idx2 = _initial_skill_idx("right", 0)
@@ -698,6 +1151,153 @@ def run_matchup(
 
     curr_rally_len = 0
     steps_in_episode = 0
+    attempted_episodes = 0
+    active_replay_row: Optional[Dict[str, Any]] = None
+    active_decisions: List[Dict[str, Any]] = []
+    active_recorder: Optional[EpisodeVideoRecorder] = None
+    saved_original_videos = 0
+    decision_rows_for_episode: List[int] = []
+    last_decision_row_by_player: Dict[int, int] = {}
+
+    policy_settings = {
+        "tau": tau,
+        "confidence_margin": confidence_margin,
+        "selection_mode": selection_mode,
+        "temperature": temperature,
+        "epsilon": epsilon,
+        "seeded_generators": rng1 is not None or rng2 is not None,
+    }
+
+    def _begin_replay_attempt() -> None:
+        nonlocal obs, info, prev_ball_x, steps_in_episode, curr_rally_len
+        nonlocal attempted_episodes, active_replay_row, active_decisions
+        nonlocal active_recorder, saved_original_videos
+        nonlocal decision_rows_for_episode, last_decision_row_by_player
+        env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
+        active_replay_row = {
+            "episode_id": attempted_episodes,
+            "matchup_index": matchup_index,
+            "strategy1": strategy1,
+            "strategy2": strategy2,
+            "p1_initial_skill": skill_from_index(curr_idx1),
+            "p2_initial_skill": skill_from_index(curr_idx2),
+            "np_random_state": encode_np_random_state(np.random.get_state()),
+            "rng1_state": _encode_generator_state(rng1),
+            "rng2_state": _encode_generator_state(rng2),
+            "reset_mode": reset_mode,
+            "skill_profile": skill_profile,
+            "gantry_speed_scale": gantry_speed_scale,
+            "policy_selection_settings": _json_dumps(policy_settings),
+            "max_steps": max_steps_per_episode,
+            "warmup_steps": warmup_steps,
+        }
+        obs, info = env.reset()
+        prev_ball_x = float(obs[36])
+        steps_in_episode = 0
+        curr_rally_len = 0
+        active_decisions = [{
+            "step": 0,
+            "rally_length": 0,
+            "p1_skill": skill_from_index(curr_idx1),
+            "p2_skill": skill_from_index(curr_idx2),
+        }]
+        decision_rows_for_episode = []
+        last_decision_row_by_player = {}
+        if (
+            capture_original_videos
+            and (original_video_limit is None or saved_original_videos < original_video_limit)
+        ):
+            active_recorder = EpisodeVideoRecorder(
+                env,
+                original_video_dir,
+                original_video_fps,
+                original_capture_every,
+            )
+        else:
+            active_recorder = None
+        attempted_episodes += 1
+
+    def _finish_replay_attempt(winner: str, truncated: bool, termination_reason: str) -> None:
+        nonlocal active_replay_row, active_decisions, active_recorder, saved_original_videos
+        if active_replay_row is None or replay_metadata is None:
+            row = active_replay_row
+        else:
+            row = active_replay_row
+        if row is None:
+            if active_recorder is not None:
+                active_recorder.cleanup()
+                active_recorder = None
+            return
+        active_replay_row.update({
+            "winner": winner,
+            "truncated": truncated,
+            "termination_reason": termination_reason,
+            "physics_steps": steps_in_episode,
+            "rally_length": curr_rally_len,
+            "decision_steps": _json_dumps(active_decisions),
+            "p1_skill_sequence": _skill_sequence_from_decisions(active_decisions, "p1_skill"),
+            "p2_skill_sequence": _skill_sequence_from_decisions(active_decisions, "p2_skill"),
+            "final_ball_state": _final_ball_state(obs, info),
+        })
+        if replay_metadata is not None:
+            replay_metadata.append(active_replay_row)
+        if active_recorder is not None:
+            qualifies = winner == "opp" and (not original_render_truncated_only or truncated)
+            if qualifies and (original_video_limit is None or saved_original_videos < original_video_limit):
+                final_path = Path(original_video_dir) / f"{matchup_replay_stem(active_replay_row)}.mp4"
+                saved_path = active_recorder.finish(True, final_path)
+                if saved_path is not None:
+                    _write_video_metadata(saved_path, active_replay_row)
+                    saved_original_videos += 1
+                    if saved_video_metadata is not None:
+                        saved_video_metadata.append(dict(active_replay_row, video_path=str(saved_path)))
+                    print(f"Saved original episode video: {saved_path}", flush=True)
+            else:
+                active_recorder.finish(False, Path(original_video_dir) / "discarded.mp4")
+            active_recorder = None
+        active_replay_row = None
+        active_decisions = []
+
+    def _finish_decision_log_attempt(winner: str, truncated: bool, termination_reason: str) -> None:
+        if decision_log_rows is None:
+            return
+        player_winner = 1 if winner == "ego" else 2 if winner == "opp" else 0
+        for row_index in decision_rows_for_episode:
+            row = decision_log_rows[row_index]
+            row["final_winner"] = winner
+            row["player_won"] = (
+                int(row["player"]) == player_winner
+                if player_winner in (1, 2)
+                else ""
+            )
+            row["truncated"] = bool(truncated)
+            row["termination_reason"] = termination_reason
+            row["final_rally_length"] = curr_rally_len
+            row["final_physics_steps"] = steps_in_episode
+
+    def _append_decision_log_row(row: Dict[str, Any]) -> None:
+        if decision_log_rows is None:
+            return
+        player = int(row["player"])
+        previous_index = last_decision_row_by_player.get(player)
+        if previous_index is not None:
+            previous = decision_log_rows[previous_index]
+            previous["next_state_json"] = row["state_json"]
+            previous["next_action_values_json"] = row["action_values_json"]
+            previous["next_q_values_json"] = row["q_values_json"]
+            previous["next_phi_values_json"] = row["phi_values_json"]
+        decision_log_rows.append(row)
+        row_index = len(decision_log_rows) - 1
+        decision_rows_for_episode.append(row_index)
+        last_decision_row_by_player[player] = row_index
+
+    track_attempt_metadata = collect_replay_metadata or capture_original_videos
+
+    if track_attempt_metadata:
+        _begin_replay_attempt()
+    else:
+        decision_rows_for_episode = []
+        last_decision_row_by_player = {}
 
     while completed_episodes < n_episodes:
         if max_total_steps is not None and total_steps >= max_total_steps:
@@ -722,6 +1322,8 @@ def run_matchup(
 
         total_steps += 1
         steps_in_episode += 1
+        if active_recorder is not None:
+            active_recorder.capture(steps_in_episode)
 
         e_c, o_c, e_s, o_s = _parse_contact_lines(lines)
         ego_contacts += e_c
@@ -733,9 +1335,83 @@ def run_matchup(
 
         if (prev_ball_x - TABLE_SHIFT) * (curr_ball_x - TABLE_SHIFT) < 0:
             curr_rally_len += 1
-            curr_idx1 = pick1(1, obs, curr_idx2, info)
-            curr_idx2 = pick2(2, obs, curr_idx1, info)
+            pre_idx1 = curr_idx1
+            pre_idx2 = curr_idx2
+            selected_idx1 = pick1(1, obs, pre_idx2, info)
+            if decision_log_rows is not None:
+                episode_id = (
+                    int(active_replay_row["episode_id"])
+                    if active_replay_row is not None
+                    else attempted_episodes
+                )
+                _append_decision_log_row(
+                    build_decision_diagnostic_row(
+                        strategy=strategy1,
+                        strategy1=strategy1,
+                        strategy2=strategy2,
+                        matchup_index=matchup_index,
+                        episode_id=episode_id,
+                        player=1,
+                        obs=obs,
+                        info=info,
+                        state_encoder_fn=state_encoder_fn,
+                        model_p=model_p,
+                        model1=model1,
+                        model2=model2,
+                        other_skill_idx=pre_idx2,
+                        selected_idx=selected_idx1,
+                        decision_index=curr_rally_len,
+                        physics_step=steps_in_episode,
+                        selection_mode=selection_mode,
+                        tau=tau,
+                        confidence_margin=confidence_margin,
+                        temperature=temperature,
+                        epsilon=epsilon,
+                    )
+                )
+            curr_idx1 = selected_idx1
+
+            selected_idx2 = pick2(2, obs, curr_idx1, info)
+            if decision_log_rows is not None:
+                episode_id = (
+                    int(active_replay_row["episode_id"])
+                    if active_replay_row is not None
+                    else attempted_episodes
+                )
+                _append_decision_log_row(
+                    build_decision_diagnostic_row(
+                        strategy=strategy2,
+                        strategy1=strategy1,
+                        strategy2=strategy2,
+                        matchup_index=matchup_index,
+                        episode_id=episode_id,
+                        player=2,
+                        obs=obs,
+                        info=info,
+                        state_encoder_fn=state_encoder_fn,
+                        model_p=model_p,
+                        model1=model1,
+                        model2=model2,
+                        other_skill_idx=curr_idx1,
+                        selected_idx=selected_idx2,
+                        decision_index=curr_rally_len,
+                        physics_step=steps_in_episode,
+                        selection_mode=selection_mode,
+                        tau=tau,
+                        confidence_margin=confidence_margin,
+                        temperature=temperature,
+                        epsilon=epsilon,
+                    )
+                )
+            curr_idx2 = selected_idx2
             env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
+            if track_attempt_metadata:
+                active_decisions.append({
+                    "step": steps_in_episode,
+                    "rally_length": curr_rally_len,
+                    "p1_skill": skill_from_index(curr_idx1),
+                    "p2_skill": skill_from_index(curr_idx2),
+                })
 
             if strategy1 in _LEARNED_STRATEGIES:
                 skill_usage[skill_from_index(curr_idx1)] += 1
@@ -744,6 +1420,11 @@ def run_matchup(
 
         if done:
             winner = _infer_winner(obs, info)
+            termination_reason = (
+                str(info.get("termination_reason"))
+                if isinstance(info, dict) and info.get("termination_reason") is not None
+                else "done"
+            )
             if winner == "ego":
                 ego_wins += 1
             else:
@@ -752,23 +1433,43 @@ def run_matchup(
             rally_lengths.append(curr_rally_len)
             episode_steps.append(steps_in_episode)
             completed_episodes += 1
+            _finish_decision_log_attempt(winner, False, termination_reason)
+            _finish_replay_attempt(winner, False, termination_reason)
 
             curr_rally_len = 0
             steps_in_episode = 0
 
             env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
-            obs, info = env.reset()
-            prev_ball_x = float(obs[36])
+            if track_attempt_metadata:
+                if completed_episodes < n_episodes:
+                    _begin_replay_attempt()
+            else:
+                obs, info = env.reset()
+                prev_ball_x = float(obs[36])
+                attempted_episodes += 1
+                decision_rows_for_episode = []
+                last_decision_row_by_player = {}
             continue
 
         if steps_in_episode >= max_steps_per_episode:
             truncated_episodes += 1
+            _finish_decision_log_attempt("truncated", True, "max_steps")
+            _finish_replay_attempt("truncated", True, "max_steps")
             curr_rally_len = 0
             steps_in_episode = 0
 
             env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
-            obs, info = env.reset()
-            prev_ball_x = float(obs[36])
+            if track_attempt_metadata:
+                _begin_replay_attempt()
+            else:
+                obs, info = env.reset()
+                prev_ball_x = float(obs[36])
+                attempted_episodes += 1
+                decision_rows_for_episode = []
+                last_decision_row_by_player = {}
+
+    if active_recorder is not None:
+        active_recorder.cleanup()
 
     env.close()
 
@@ -794,6 +1495,190 @@ def run_matchup(
         skill_usage=skill_usage,
         total_steps=total_steps,
     )
+
+
+def replay_matchup_episode(env, bundle: Dict[str, Any], row: Dict[str, Any], recorder: EpisodeVideoRecorder) -> None:
+    ppo = bundle["ppo"]
+    model_p = bundle["model_p"]
+    model1 = bundle["model1"]
+    model2 = bundle["model2"]
+    state_encoder_fn = bundle["state_encoder_fn"]
+    settings = _json_loads(row.get("policy_selection_settings"), {})
+
+    np.random.set_state(decode_np_random_state(str(row["np_random_state"])))
+    rng1 = _decode_generator_state(row.get("rng1_state"))
+    rng2 = _decode_generator_state(row.get("rng2_state"))
+    pick1 = make_picker(
+        str(row["strategy1"]),
+        model_p,
+        state_encoder_fn=state_encoder_fn,
+        tau=float(settings.get("tau", 0.2)),
+        confidence_margin=float(settings.get("confidence_margin", 0.05)),
+        model1=model1,
+        model2=model2,
+        selection_mode=str(settings.get("selection_mode", "argmax")),
+        temperature=float(settings.get("temperature", 1.0)),
+        epsilon=float(settings.get("epsilon", 0.0)),
+        rng=rng1,
+    )
+    pick2 = make_picker(
+        str(row["strategy2"]),
+        model_p,
+        state_encoder_fn=state_encoder_fn,
+        tau=float(settings.get("tau", 0.2)),
+        confidence_margin=float(settings.get("confidence_margin", 0.05)),
+        model1=model1,
+        model2=model2,
+        selection_mode=str(settings.get("selection_mode", "argmax")),
+        temperature=float(settings.get("temperature", 1.0)),
+        epsilon=float(settings.get("epsilon", 0.0)),
+        rng=rng2,
+    )
+
+    curr_idx1 = skill_index(str(row["p1_initial_skill"]))
+    curr_idx2 = skill_index(str(row["p2_initial_skill"]))
+    env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
+    obs, info = env.reset()
+    prev_ball_x = float(obs[36])
+    max_steps = int(row["max_steps"])
+    decisions = [{
+        "step": 0,
+        "rally_length": 0,
+        "p1_skill": skill_from_index(curr_idx1),
+        "p2_skill": skill_from_index(curr_idx2),
+    }]
+    rally_length = 0
+    physics_steps = 0
+    winner = "truncated"
+    truncated = True
+    termination_reason = "max_steps"
+
+    for step in range(1, max_steps + 1):
+        obs1 = _build_obs1(obs, info)
+        obs2 = _build_obs2(obs, info)
+        action1, _ = ppo.predict(obs1, deterministic=True)
+        action2, _ = ppo.predict(obs2, deterministic=True)
+        action = np.zeros(18)
+        action[:9] = action1[:9]
+        action[9:] = action2[:9]
+
+        (obs, _, done, _, info), _lines = _capture_env_step(env, action)
+        physics_steps = step
+        recorder.capture(step)
+
+        curr_ball_x = float(obs[36])
+        if (prev_ball_x - TABLE_SHIFT) * (curr_ball_x - TABLE_SHIFT) < 0:
+            rally_length += 1
+            curr_idx1 = pick1(1, obs, curr_idx2, info)
+            curr_idx2 = pick2(2, obs, curr_idx1, info)
+            env.set_skills(skill_from_index(curr_idx1), skill_from_index(curr_idx2))
+            decisions.append({
+                "step": step,
+                "rally_length": rally_length,
+                "p1_skill": skill_from_index(curr_idx1),
+                "p2_skill": skill_from_index(curr_idx2),
+            })
+        prev_ball_x = curr_ball_x
+
+        if done:
+            winner = _infer_winner(obs, info)
+            termination_reason = (
+                str(info.get("termination_reason"))
+                if isinstance(info, dict) and info.get("termination_reason") is not None
+                else "done"
+            )
+            truncated = False
+            break
+
+    replayed = {
+        "winner": winner,
+        "truncated": truncated,
+        "physics_steps": physics_steps,
+        "rally_length": rally_length,
+        "termination_reason": termination_reason if not truncated else "max_steps",
+        "final_ball_state": _final_ball_state(obs, info),
+        "p1_skill_sequence": _skill_sequence_from_decisions(decisions, "p1_skill"),
+        "p2_skill_sequence": _skill_sequence_from_decisions(decisions, "p2_skill"),
+    }
+    _warn_if_replay_differs(row, replayed)
+
+
+def matchup_replay_stem(row: Dict[str, Any]) -> str:
+    winner = str(row["winner"])
+    outcome = "opp_win" if winner == "opp" else "ego_win" if winner == "ego" else "truncated"
+    return (
+        f"{row['strategy1']}_vs_{row['strategy2']}_"
+        f"ep{row['episode_id']}_{outcome}_{row['physics_steps']}steps"
+    )
+
+
+def select_targeted_replays(args: argparse.Namespace, rows: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str]:
+    video_dir = args.video_dir
+    if manual_render_requested(args):
+        selected, manual_dir = prompt_manual_replays(rows)
+        if manual_dir is not None:
+            video_dir = manual_dir
+        return selected, video_dir
+
+    selected = rows
+    if args.render_losses_only:
+        selected = select_player1_loss_replays(selected)
+    if args.render_truncated_only:
+        selected = [row for row in selected if bool(row.get("truncated"))]
+
+    limit = render_episode_limit(args)
+    if limit is not None:
+        selected = selected[:limit]
+    return selected, video_dir
+
+
+def run_targeted_replay(
+    args: argparse.Namespace,
+    ppo,
+    model_p,
+    model1,
+    model2,
+    state_encoder_fn,
+    rows: List[Dict[str, Any]],
+) -> None:
+    if not _render_options_requested(args):
+        return
+    selected, video_dir = select_targeted_replays(args, rows)
+    if not selected:
+        print("No episodes selected for replay.", flush=True)
+        return
+
+    from nash_skills.env_wrapper import SkillEnv
+
+    env = SkillEnv(
+        proc_id=1,
+        history=HISTORY,
+        reset_mode=args.reset_mode,
+        skill_profile=args.skill_profile,
+        gantry_speed_scale=args.gantry_speed_scale,
+    )
+    bundle = {
+        "ppo": ppo,
+        "model_p": model_p,
+        "model1": model1,
+        "model2": model2,
+        "state_encoder_fn": state_encoder_fn,
+    }
+    try:
+        saved = replay_selected_episodes(
+            env,
+            bundle,
+            selected,
+            replay_one=replay_matchup_episode,
+            filename_stem=matchup_replay_stem,
+            video_dir=video_dir,
+            fps=args.video_fps,
+            capture_every=args.capture_every,
+        )
+    finally:
+        env.close()
+    for path in saved:
+        print(f"Saved replay video: {path}", flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -863,6 +1748,52 @@ def save_csv(results: List[MatchupResult], path: str):
 
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def save_decision_log(rows: List[Dict[str, Any]], path: str) -> None:
+    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
+    preferred = [
+        "matchup_index",
+        "strategy1",
+        "strategy2",
+        "strategy",
+        "episode_id",
+        "player",
+        "player_label",
+        "decision_index",
+        "physics_step",
+        "opponent_skill",
+        "selected_skill",
+        "selected_skill_idx",
+        "score_type",
+        "selected_probability",
+        "final_winner",
+        "player_won",
+        "truncated",
+        "termination_reason",
+        "final_rally_length",
+        "final_physics_steps",
+        "ball_x",
+        "ball_y",
+        "ball_z",
+        "ball_vx",
+        "ball_vy",
+        "ball_vz",
+        "action_values_json",
+        "q_values_json",
+        "phi_values_json",
+        "selection_probabilities_json",
+        "state_json",
+        "next_state_json",
+        "next_action_values_json",
+        "next_q_values_json",
+        "next_phi_values_json",
+    ]
+    extra = sorted({key for row in rows for key in row if key not in preferred})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=preferred + extra, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -1119,6 +2050,42 @@ def main():
         help="RNG seed for probabilistic selection modes (default: None = non-reproducible)",
     )
     parser.add_argument(
+        "--matchup",
+        nargs=2,
+        metavar=("STRATEGY1", "STRATEGY2"),
+        default=None,
+        help="Run only one targeted policy pair, e.g. --matchup nash-p-hard left",
+    )
+    parser.add_argument(
+        "--render-losses-only",
+        action="store_true",
+        help="In targeted mode, save videos captured from original player-1 loss episodes.",
+    )
+    parser.add_argument(
+        "--render-truncated-only",
+        action="store_true",
+        help="Restrict targeted rendering to truncated rallies.",
+    )
+    parser.add_argument(
+        "--render-episodes",
+        nargs="?",
+        const="manual",
+        default=None,
+        help="Save at most N qualifying videos; with no N, prompt for episode IDs in experimental replay mode.",
+    )
+    parser.add_argument("--save-video", action="store_true", help="Save targeted diagnostic replay videos.")
+    parser.add_argument("--video-dir", default="data/rendered_rallies", help="Directory for targeted replay videos.")
+    parser.add_argument("--video-fps", type=int, default=60, help="Frames per second for replay videos.")
+    parser.add_argument("--capture-every", type=int, default=1, help="Capture one video frame every N environment steps.")
+    parser.add_argument(
+        "--experimental-post-eval-replay",
+        action="store_true",
+        help="Use the older post-evaluation replay workflow instead of relying only on original episode capture.",
+    )
+    parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
+    parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="aggressive")
+    parser.add_argument("--gantry-speed-scale", type=float, default=1.0)
+    parser.add_argument(
         "--model-dir",
         default=None,
         dest="model_dir",
@@ -1127,7 +2094,43 @@ def main():
             "(default: 'models/'). Example: --model-dir models_new"
         ),
     )
+    parser.add_argument(
+        "--decision-log",
+        default=None,
+        help=(
+            "Optional CSV path for per-player skill-decision diagnostics. "
+            "Records P1 and P2 decisions separately at every counted net crossing."
+        ),
+    )
     args = parser.parse_args()
+
+    if _render_options_requested(args) and args.matchup is None:
+        raise SystemExit("Rendering options require --matchup STRATEGY1 STRATEGY2")
+    if args.save_video and not (args.render_losses_only or args.experimental_post_eval_replay):
+        raise SystemExit("--save-video requires --render-losses-only or --experimental-post-eval-replay")
+    if args.render_truncated_only and not (args.render_losses_only or args.experimental_post_eval_replay):
+        raise SystemExit("--render-truncated-only requires --render-losses-only or --experimental-post-eval-replay")
+    if args.render_episodes == "manual" and not args.experimental_post_eval_replay:
+        raise SystemExit("--render-episodes without N requires --experimental-post-eval-replay")
+    if args.matchup is not None:
+        unknown = [strategy for strategy in args.matchup if strategy not in VALID_STRATEGIES]
+        if unknown:
+            raise SystemExit(f"Unknown strategy in --matchup: {', '.join(unknown)}")
+    if args.render_episodes not in (None, "manual"):
+        try:
+            args.render_episodes = int(args.render_episodes)
+        except ValueError as exc:
+            raise SystemExit("--render-episodes must be an integer or omitted for manual selection") from exc
+        if args.render_episodes <= 0:
+            raise SystemExit("--render-episodes must be positive")
+    if args.video_fps <= 0:
+        raise SystemExit("--video-fps must be positive")
+    if args.capture_every <= 0:
+        raise SystemExit("--capture-every must be positive")
+
+    matchups = [tuple(args.matchup)] if args.matchup is not None else DEFAULT_MATCHUPS
+    experimental_replay = bool(args.matchup is not None and args.experimental_post_eval_replay)
+    original_capture = _original_capture_requested(args)
 
     from stable_baselines3 import PPO
     from model_arch import SimpleModel, FactoredModel
@@ -1187,8 +2190,8 @@ def main():
     model_p.eval()
 
     # Q-value models — needed for ibr / ibr-q
-    needs_q = any(s in {"ibr", "ibr-q"} for s, _ in DEFAULT_MATCHUPS) or any(
-        s in {"ibr", "ibr-q"} for _, s in DEFAULT_MATCHUPS
+    needs_q = args.decision_log is not None or any(s in {"ibr", "ibr-q"} for s, _ in matchups) or any(
+        s in {"ibr", "ibr-q"} for _, s in matchups
     )
     model1 = model2 = None
     if needs_q:
@@ -1196,11 +2199,11 @@ def main():
         # FactoredModel and skip the SimpleModel construction below.
         if args.arch == "factored":
             if args.v3_5skill:
-                _q1_path = MODEL1_5SK_V3_FACTORED_PATH
-                _q2_path = MODEL2_5SK_V3_FACTORED_PATH
+                _q1_path = _model_path(MODEL1_5SK_V3_FACTORED_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V3_FACTORED_PATH)
             else:  # args.v2_5skill (the model_p branch above already enforced this)
-                _q1_path = MODEL1_5SK_FACTORED_PATH
-                _q2_path = MODEL2_5SK_FACTORED_PATH
+                _q1_path = _model_path(MODEL1_5SK_FACTORED_PATH)
+                _q2_path = _model_path(MODEL2_5SK_FACTORED_PATH)
             # 76-dim encoded data: 74 state dims + 2 skill dims (see model_p above).
             model1 = FactoredModel(state_dim=74, skill_dim=2)
             model2 = FactoredModel(state_dim=74, skill_dim=2)
@@ -1208,22 +2211,24 @@ def main():
             if args.v3_5skill:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_5SK_V3_PATH
-                _q2_path = MODEL2_5SK_V3_PATH
+                _q1_path = _model_path(MODEL1_5SK_V3_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V3_PATH)
             elif args.v2_5skill:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_5SK_V2_PATH
-                _q2_path = MODEL2_5SK_V2_PATH
+                # _q1_path = MODEL1_5SK_V2_PATH
+                # _q2_path = MODEL2_5SK_V2_PATH
+                _q1_path = _model_path(MODEL1_5SK_V2_PATH)
+                _q2_path = _model_path(MODEL2_5SK_V2_PATH)
             elif args.v2:
                 from nash_skills.v2.state_encoder import STATE_DIM as V2_STATE_DIM
                 _sdim = V2_STATE_DIM
-                _q1_path = MODEL1_V2_PATH
-                _q2_path = MODEL2_V2_PATH
+                _q1_path = _model_path(MODEL1_V2_PATH)
+                _q2_path = _model_path(MODEL2_V2_PATH)
             else:
                 _sdim = 116
-                _q1_path = MODEL1_5SK_PATH
-                _q2_path = MODEL2_5SK_PATH
+                _q1_path = _model_path(MODEL1_5SK_PATH)
+                _q2_path = _model_path(MODEL2_5SK_PATH)
             model1 = SimpleModel(_sdim, [64, 32, 16], 1)
             model2 = SimpleModel(_sdim, [64, 32, 16], 1)
         model1.load_state_dict(_safe_load_state_dict(_q1_path))
@@ -1243,7 +2248,8 @@ def main():
             if player == 1:
                 return encode_ego(obs, info)
             else:
-                return encode_opp(obs, info)
+                return encode_ego(obs, info)
+                # return encode_opp(obs, info)
 
         state_encoder_fn = _v2_state_encoder
     else:
@@ -1252,14 +2258,17 @@ def main():
     print(f"  Loaded PPO:         {PPO_MODEL_PATH}")
     print(f"  Loaded potential:   {model_p_path}  ({pipeline_tag})")
     print(
-        f"\nRunning {len(DEFAULT_MATCHUPS)} matchups "
+        f"\nRunning {len(matchups)} matchups "
         f"to {args.episodes} completed episodes each "
         f"(warmup={args.warmup}, max_steps_per_episode={args.steps}) ...\n"
     )
 
     results: List[MatchupResult] = []
+    replay_rows: List[Dict[str, Any]] = []
+    saved_video_rows: List[Dict[str, Any]] = []
+    decision_log_rows: List[Dict[str, Any]] = []
 
-    for matchup_idx, (s1, s2) in enumerate(DEFAULT_MATCHUPS):
+    for matchup_idx, (s1, s2) in enumerate(matchups):
         print(f"  [{s1} vs {s2}] ...")
 
         # Independent, per-matchup, per-player seeds: player 1 and player 2
@@ -1290,6 +2299,20 @@ def main():
             epsilon=args.epsilon,
             rng1=rng1,
             rng2=rng2,
+            reset_mode=args.reset_mode,
+            skill_profile=args.skill_profile,
+            gantry_speed_scale=args.gantry_speed_scale,
+            collect_replay_metadata=experimental_replay,
+            replay_metadata=replay_rows,
+            matchup_index=matchup_idx,
+            capture_original_videos=original_capture,
+            original_video_dir=args.video_dir,
+            original_video_fps=args.video_fps,
+            original_capture_every=args.capture_every,
+            original_video_limit=render_episode_limit(args),
+            original_render_truncated_only=args.render_truncated_only,
+            saved_video_metadata=saved_video_rows,
+            decision_log_rows=decision_log_rows if args.decision_log is not None else None,
         )
         results.append(r)
 
@@ -1348,6 +2371,21 @@ def main():
         json.dump({"results": json_data, "analysis": analysis}, f, indent=2)
 
     print(f"JSON saved to: {args.output_json}")
+
+    if args.decision_log is not None:
+        save_decision_log(decision_log_rows, args.decision_log)
+        print(f"Decision log saved to: {args.decision_log}")
+
+    if experimental_replay:
+        run_targeted_replay(
+            args,
+            ppo,
+            model_p,
+            model1,
+            model2,
+            state_encoder_fn,
+            replay_rows,
+        )
 
 
 if __name__ == "__main__":

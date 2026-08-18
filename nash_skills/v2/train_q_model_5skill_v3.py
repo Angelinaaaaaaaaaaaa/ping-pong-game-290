@@ -31,7 +31,6 @@ from model_arch import SimpleModel
 from nash_skills.skills import N_SKILLS
 from nash_skills.v2.labeling import compute_returns, check_balance, GAMMA
 from nash_skills.v2.state_encoder import STATE_DIM
-from nash_skills.v2.augment import augment_with_flip
 
 # --------------------------------------------------------------------------- #
 # Config                                                                       #
@@ -43,11 +42,11 @@ BATCH_SIZE       = 512
 POTENTIAL_PAIRS  = 20
 CHECKPOINT_EVERY = 100
 
-MODEL1_PATH  = "models/model1_5skill_v3.pth"
-MODEL2_PATH  = "models/model2_5skill_v3.pth"
-MODEL_P_PATH = "models/model_p_5skill_v3.pth"
-LOG_Q_PATH   = "logs/train_q_5skill_v3.csv"
-LOG_P_PATH   = "logs/train_p_5skill_v3.csv"
+MODEL1_PATH  = "models/model1_5skill_v3_updated.pth"
+MODEL2_PATH  = "models/model2_5skill_v3_updated.pth"
+MODEL_P_PATH = "models/model_p_5skill_v3_updated.pth"
+LOG_Q_PATH   = "logs/train_q_5skill_v3_updated.csv"
+LOG_P_PATH   = "logs/train_p_5skill_v3_updated.csv"
 # --------------------------------------------------------------------------- #
 
 
@@ -95,8 +94,11 @@ def train(rally_path: str, n_epochs: int, lr: float) -> None:
         rallies = pkl.load(f)
     print(f"  {len(rallies)} rallies loaded")
 
-    rallies = augment_with_flip(rallies)
-    print(f"  {len(rallies)} rallies after flip augmentation")
+    # Flip augmentation is intentionally disabled for v3. The previous
+    # transform swapped player kinematics but did not correctly mirror ball,
+    # target, and tracking-error features, which made augmented samples
+    # inconsistent with evaluation-time encodings.
+    print("  Flip augmentation: disabled (uses original rallies only)")
 
     is_ok, ratio = check_balance(rallies, threshold=5.0)
     print(f"  Balance: max/min ratio={ratio:.2f}  {'OK' if is_ok else 'WARNING: imbalanced'}")
