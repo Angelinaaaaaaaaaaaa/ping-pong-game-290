@@ -105,24 +105,6 @@ def _swallow_step(env, action):
         return env.step(action)
 
 
-def classify_outcome(ego_terminal: float) -> str:
-    """
-    Classify a rally's raw terminal reward into 'win'/'draw'/'loss'.
-
-    Operates on the raw terminal (+1 win, -1 loss, 0 truncated), never on a
-    shaping-inflated reward, so a long truncated rally can never be misread as
-    a decisive outcome. This trainer's loop counts outcomes directly from
-    play_one_rally's `done`/`winner`; this helper is retained as the shared,
-    unit-tested classification primitive (tests/test_selfplay_5skill_alt.py).
-    """
-    if ego_terminal > 0.5:
-        return "win"
-    elif abs(ego_terminal) < 0.5:
-        return "draw"
-    else:
-        return "loss"
-
-
 def play_one_rally(env, ppo, trainer_policy, frozen_policy, device,
                    ego_init_idx=0, opp_init_idx=0,
                    trunc_penalty=TRUNCATED_PENALTY,
