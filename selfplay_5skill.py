@@ -26,6 +26,7 @@ import random
 import time
 from contextlib import redirect_stdout
 from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -105,6 +106,17 @@ class FixedSkillPolicy:
         else:
             idx = self._fixed_idx
         return idx, self._uniform_probs
+
+
+def history_checkpoint_path(output_path: str, iteration: int) -> str:
+    """
+    Derive a per-iteration snapshot path from the main --output path, so
+    training-over-time performance can be checked against a fixed baseline
+    at iter 100, 250, 500, ... instead of only ever having the single
+    final/overwritten checkpoint.
+    """
+    p = Path(output_path)
+    return str(p.with_name(f"{p.stem}_iter{iteration}{p.suffix}"))
 
 
 def _build_ppo_obs(obs, info, player):
@@ -466,6 +478,8 @@ def train(args):
 
             if it % args.save_every == 0 or it == args.iterations:
                 torch.save(policy.state_dict(), args.output)
+                if args.save_history:
+                    torch.save(policy.state_dict(), history_checkpoint_path(args.output, it))
     finally:
         env.close()
         log_f.close()
@@ -497,6 +511,12 @@ if __name__ == "__main__":
                              "Each entry must be 'random' or a valid skill name.")
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--save-history", action="store_true",
+                        help="Also save a uniquely-named snapshot at every --save-every "
+                             "checkpoint (e.g. <output>_iter100.pth), instead of only ever "
+                             "having the single latest/overwritten --output file. Needed to "
+                             "evaluate performance over the course of training rather than "
+                             "just the final checkpoint.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--log", default=DEFAULT_LOG)
     parser.add_argument("--resume", action="store_true")
