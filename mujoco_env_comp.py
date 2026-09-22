@@ -430,12 +430,12 @@ class KukaTennisEnv(gym.Env):
         gantry_step = self.gantry_speed_scale * 10.0 / 1000.0
         self.data.qpos[0] += gantry_step * action[0]
         self.data.qpos[1] += gantry_step * action[1]
-        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.,-0.5)
+        self.data.qpos[0] = np.clip(self.data.qpos[0],-1.2,-0.3)
         self.data.qpos[1] = np.clip(self.data.qpos[1],-1.,1.)
         
         self.data.qpos[9] += gantry_step * action[9]
         self.data.qpos[10] += gantry_step * action[10]
-        self.data.qpos[9] = np.clip(self.data.qpos[9],-1.,-0.5)
+        self.data.qpos[9] = np.clip(self.data.qpos[9],-1.2,-0.3)
         self.data.qpos[10] = np.clip(self.data.qpos[10],-1.,1.)
         self.update_target_racket_pose(y_target=self.side_target*0.38)
         self.update_target_racket_pose_opp(y_target=self.side_target_opp*0.38)
