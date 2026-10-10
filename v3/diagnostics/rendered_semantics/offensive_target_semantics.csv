@@ -1,0 +1,11 @@
+profile,attacker_id,receiver_id,skill,local_target_x,local_target_y,world_target_x,world_target_y,attacker_perspective_side,receiver_perspective_side
+aggressive,1,2,left,2.5,0.646,2.5,0.646,left,right
+aggressive,1,2,left_short,1.9,0.646,1.9,0.646,left,right
+aggressive,1,2,center_safe,2.0,0.0,2.0,0.0,center,center
+aggressive,1,2,right_short,1.9,-0.646,1.9,-0.646,right,left
+aggressive,1,2,right,2.5,-0.646,2.5,-0.646,right,left
+aggressive,2,1,left,2.5,0.646,0.5,-0.646,left,right
+aggressive,2,1,left_short,1.9,0.646,1.1,-0.646,left,right
+aggressive,2,1,center_safe,2.0,0.0,1.0,-0.0,center,center
+aggressive,2,1,right_short,1.9,-0.646,1.1,0.646,right,left
+aggressive,2,1,right,2.5,-0.646,0.5,0.646,right,left

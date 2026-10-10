@@ -1,0 +1,90 @@
+[
+  {
+    "player": 1,
+    "base_body": "base",
+    "racket_body": "tennis_racket",
+    "base_world_position": [
+      -0.5,
+      0.0,
+      0.0
+    ],
+    "racket_world_position": [
+      -0.2283307896066124,
+      -0.010575898496856978,
+      1.4194814959078739
+    ],
+    "forward_world": [
+      1.0,
+      0.0,
+      0.0
+    ],
+    "left_world": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "right_world": [
+      -0.0,
+      -1.0,
+      -0.0
+    ],
+    "up_world": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "racket_forward_alignment": 0.2716692103933876,
+    "world_y_for_own_left": 1.0,
+    "world_y_for_own_right": -1.0,
+    "target_for_defender_left_world_y": 0.35,
+    "target_for_defender_right_world_y": -0.35,
+    "target_for_defender_left_qpos_y": 0.35,
+    "target_for_defender_right_qpos_y": -0.35,
+    "target_left_matches_physical_left": true,
+    "target_right_matches_physical_right": true
+  },
+  {
+    "player": 2,
+    "base_body": "base_opp",
+    "racket_body": "tennis_racket_opp",
+    "base_world_position": [
+      3.5,
+      0.0,
+      0.0
+    ],
+    "racket_world_position": [
+      3.2283307896066127,
+      0.010575898496856978,
+      1.4194814959078739
+    ],
+    "forward_world": [
+      -1.0,
+      0.0,
+      0.0
+    ],
+    "left_world": [
+      0.0,
+      -1.0,
+      0.0
+    ],
+    "right_world": [
+      -0.0,
+      1.0,
+      -0.0
+    ],
+    "up_world": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "racket_forward_alignment": 0.2716692103933873,
+    "world_y_for_own_left": -1.0,
+    "world_y_for_own_right": 1.0,
+    "target_for_defender_left_world_y": -0.35,
+    "target_for_defender_right_world_y": 0.35,
+    "target_for_defender_left_qpos_y": 0.35,
+    "target_for_defender_right_qpos_y": -0.35,
+    "target_left_matches_physical_left": true,
+    "target_right_matches_physical_right": true
+  }
+]

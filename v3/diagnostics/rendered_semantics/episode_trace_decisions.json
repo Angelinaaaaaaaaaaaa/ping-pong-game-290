@@ -1,0 +1,70 @@
+[
+  {
+    "decision_index": 1,
+    "crossing_physics_step": 31,
+    "attacker_id": 2,
+    "defender_id": 1,
+    "attack_skill": "right",
+    "defense_position": "left",
+    "defense_target_y": 0.35,
+    "defense_target_applied_step": 31,
+    "defense_target_coordinate_frame": "world_gantry_qpos",
+    "defender_actual_y_before_commit": 0.004632321046842329,
+    "attacker_actual_y_before_offensive_execution": -0.17655938577935823,
+    "offensive_skill_set_step": 31,
+    "first_execution_step": 32,
+    "offensive_target_local": [
+      2.5,
+      -0.646
+    ],
+    "offensive_target_world": [
+      0.5,
+      0.646
+    ],
+    "offensive_planner_target_local_first_observed": [
+      -0.044444444444444425,
+      -0.39306868113240934,
+      0.8431976556930463,
+      0.66397996213777,
+      -0.13555938019861774,
+      0.7157112915060267,
+      -0.1688538170444104
+    ],
+    "offensive_target_first_observed_step": 32,
+    "attacker_actual_y_after_first_execution_step": -0.16984446808401976
+  },
+  {
+    "decision_index": 2,
+    "crossing_physics_step": 99,
+    "attacker_id": 1,
+    "defender_id": 2,
+    "attack_skill": "right",
+    "defense_position": "left",
+    "defense_target_y": -0.35,
+    "defense_target_applied_step": 99,
+    "defense_target_coordinate_frame": "world_gantry_qpos",
+    "defender_actual_y_before_commit": -0.07623828560595368,
+    "attacker_actual_y_before_offensive_execution": 0.3421314952574264,
+    "offensive_skill_set_step": 99,
+    "first_execution_step": 100,
+    "offensive_target_local": [
+      2.5,
+      -0.646
+    ],
+    "offensive_target_world": [
+      2.5,
+      -0.646
+    ],
+    "offensive_planner_target_local_first_observed": [
+      -0.12222222222222215,
+      0.5397025703179676,
+      0.839224328820806,
+      0.6635913585249473,
+      0.10674545331559307,
+      0.680000235382016,
+      0.2930044316522639
+    ],
+    "offensive_target_first_observed_step": 100,
+    "attacker_actual_y_after_first_execution_step": 0.35197597631928174
+  }
+]
