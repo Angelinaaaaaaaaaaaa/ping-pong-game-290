@@ -1,0 +1,122 @@
+[
+  {
+    "profile": "aggressive",
+    "attacker_id": 1,
+    "receiver_id": 2,
+    "skill": "left",
+    "local_target_x": 2.5,
+    "local_target_y": 0.646,
+    "world_target_x": 2.5,
+    "world_target_y": 0.646,
+    "attacker_perspective_side": "left",
+    "receiver_perspective_side": "right"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 1,
+    "receiver_id": 2,
+    "skill": "left_short",
+    "local_target_x": 1.9,
+    "local_target_y": 0.646,
+    "world_target_x": 1.9,
+    "world_target_y": 0.646,
+    "attacker_perspective_side": "left",
+    "receiver_perspective_side": "right"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 1,
+    "receiver_id": 2,
+    "skill": "center_safe",
+    "local_target_x": 2.0,
+    "local_target_y": 0.0,
+    "world_target_x": 2.0,
+    "world_target_y": 0.0,
+    "attacker_perspective_side": "center",
+    "receiver_perspective_side": "center"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 1,
+    "receiver_id": 2,
+    "skill": "right_short",
+    "local_target_x": 1.9,
+    "local_target_y": -0.646,
+    "world_target_x": 1.9,
+    "world_target_y": -0.646,
+    "attacker_perspective_side": "right",
+    "receiver_perspective_side": "left"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 1,
+    "receiver_id": 2,
+    "skill": "right",
+    "local_target_x": 2.5,
+    "local_target_y": -0.646,
+    "world_target_x": 2.5,
+    "world_target_y": -0.646,
+    "attacker_perspective_side": "right",
+    "receiver_perspective_side": "left"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 2,
+    "receiver_id": 1,
+    "skill": "left",
+    "local_target_x": 2.5,
+    "local_target_y": 0.646,
+    "world_target_x": 0.5,
+    "world_target_y": -0.646,
+    "attacker_perspective_side": "left",
+    "receiver_perspective_side": "right"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 2,
+    "receiver_id": 1,
+    "skill": "left_short",
+    "local_target_x": 1.9,
+    "local_target_y": 0.646,
+    "world_target_x": 1.1,
+    "world_target_y": -0.646,
+    "attacker_perspective_side": "left",
+    "receiver_perspective_side": "right"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 2,
+    "receiver_id": 1,
+    "skill": "center_safe",
+    "local_target_x": 2.0,
+    "local_target_y": 0.0,
+    "world_target_x": 1.0,
+    "world_target_y": -0.0,
+    "attacker_perspective_side": "center",
+    "receiver_perspective_side": "center"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 2,
+    "receiver_id": 1,
+    "skill": "right_short",
+    "local_target_x": 1.9,
+    "local_target_y": -0.646,
+    "world_target_x": 1.1,
+    "world_target_y": 0.646,
+    "attacker_perspective_side": "right",
+    "receiver_perspective_side": "left"
+  },
+  {
+    "profile": "aggressive",
+    "attacker_id": 2,
+    "receiver_id": 1,
+    "skill": "right",
+    "local_target_x": 2.5,
+    "local_target_y": -0.646,
+    "world_target_x": 0.5,
+    "world_target_y": 0.646,
+    "attacker_perspective_side": "right",
+    "receiver_perspective_side": "left"
+  }
+]
