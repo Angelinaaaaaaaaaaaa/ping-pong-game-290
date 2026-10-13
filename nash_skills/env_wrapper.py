@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from mujoco_env_comp import KukaTennisEnv
 from nash_skills.skills import SKILL_PROFILE_NAMES, get_skill, SKILL_NAMES, N_SKILLS, skill_index
+from nash_skills.defender import DEFENDER_NAMES, defender_target
 
 
 class SkillEnv:
@@ -63,6 +64,20 @@ class SkillEnv:
         self._skill1 = skill1
         self._skill2 = skill2
         self._apply_skills()
+
+    def set_defenders(self, pos1=None, pos2=None):
+        """Defender position per player, by name, or None to leave disabled.
+
+        Separate from set_skills because the two are chosen together but used in
+        different phases: the skill when you hit, the position while you wait.
+        """
+        for p in (pos1, pos2):
+            if p is not None and p not in DEFENDER_NAMES:
+                raise ValueError(f"Unknown defender position '{p}'. Choose from: {DEFENDER_NAMES}")
+        self._env.set_defender_targets(
+            target1=defender_target(pos1) if pos1 else None,
+            target2=defender_target(pos2) if pos2 else None,
+        )
 
     def _apply_skills(self):
         side1, x1 = get_skill(self._skill1, profile=self.skill_profile)

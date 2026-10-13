@@ -225,6 +225,11 @@ class KukaTennisEnv(gym.Env):
         self.last_qpos = np.zeros(3)
         self.side_target = 1.
         self.side_target_opp = 1.
+        # None keeps the plain 5-skill behaviour; set_defender_targets() enables
+        # the attacker/defender variant.
+        self.defender_target1 = None
+        self.defender_target2 = None
+        self._role_p1_defending = False
         self.rally_state = new_rally_state()
         self._last_table_bounce_step = -1
         z_axis = np.array([1.,0.,0.])
@@ -502,6 +507,46 @@ class KukaTennisEnv(gym.Env):
         # print("Updated target: ",pos,z_axis,x_hits[idx],y_hits[idx])
         self.set_target_pose_opp(np.concatenate([pos,q]))
 
+    # Matching v3's V3PrePositionEnv: proportional gain 8.0 with a 1 cm deadband.
+    # Dividing the error by gantry_step instead would land exactly on target, but
+    # it saturates for the whole approach -- and only the *gantry* is
+    # commandeered here, so the arm is still following the tracker towards its
+    # own idea of where the base will be. A softer gain leaves the two
+    # controllers less at odds.
+    _GANTRY_POSITION_GAIN = 8.0
+    _GANTRY_TOLERANCE = 0.01
+
+    @classmethod
+    def _gantry_drive(cls, x, y, target, gantry_step):
+        """Proportional action driving the gantry towards `target`."""
+        tx, ty = target
+        ex, ey = tx - x, ty - y
+        ax = 0.0 if abs(ex) <= cls._GANTRY_TOLERANCE else np.clip(ex * cls._GANTRY_POSITION_GAIN, -1.0, 1.0)
+        ay = 0.0 if abs(ey) <= cls._GANTRY_TOLERANCE else np.clip(ey * cls._GANTRY_POSITION_GAIN, -1.0, 1.0)
+        return float(ax), float(ay)
+
+    # Ball speeds are ~5 m/s in play, so this only ignores the handful of steps
+    # where the racket is reversing the ball and vx passes through zero.
+    _ROLE_VX_DEADBAND = 1.0
+
+    def _latched_p1_defending(self):
+        """Which player is defending, held steady through contact.
+
+        The role flips when the ball is struck, not when it crosses the net --
+        those are ~15 steps apart, and in between the striker is already the one
+        recovering, i.e. defending. Ball travelling towards p2 (vx > 0) means p2
+        is about to hit, so p1 is the defender.
+        """
+        vx = float(self.data.qvel[-6])
+        if abs(vx) >= self._ROLE_VX_DEADBAND:
+            self._role_p1_defending = vx > 0.0
+        return self._role_p1_defending
+
+    def set_defender_targets(self, target1=None, target2=None):
+        """(x, y) gantry targets in each player's own frame, or None to disable."""
+        self.defender_target1 = target1
+        self.defender_target2 = target2
+
     def step(self, action):
         self.prev_actions[:-1,:] = self.prev_actions[1:,:]
         self.prev_actions[-1,:] = action[:9]/10.
@@ -516,6 +561,22 @@ class KukaTennisEnv(gym.Env):
         self.data.ctrl[7:14] = np.array(action[11:18])/10. + np.array(self.data.qpos[11:18])
         
         gantry_step = self.gantry_speed_scale * 10.0 / 1000.0
+
+        # Attacker/defender variant: while a player waits for the ball its gantry
+        # goes to the chosen defender position instead of wherever the tracker
+        # would take it. Only the gantry is commandeered -- the arm keeps
+        # following the tracker, per the spec.
+        if self.defender_target1 is not None or self.defender_target2 is not None:
+            p1_defending = self._latched_p1_defending()
+            if self.defender_target1 is not None and p1_defending:
+                action = np.array(action, dtype=np.float32, copy=True)
+                action[0], action[1] = self._gantry_drive(
+                    self.data.qpos[0], self.data.qpos[1], self.defender_target1, gantry_step)
+            if self.defender_target2 is not None and not p1_defending:
+                action = np.array(action, dtype=np.float32, copy=True)
+                action[9], action[10] = self._gantry_drive(
+                    self.data.qpos[9], self.data.qpos[10], self.defender_target2, gantry_step)
+
         self.data.qpos[0] += gantry_step * action[0]
         self.data.qpos[1] += gantry_step * action[1]
         self.data.qpos[0] = np.clip(self.data.qpos[0],-1.2,-0.3)
@@ -694,6 +755,8 @@ class KukaTennisEnv(gym.Env):
         self.prev_actions_opp = np.zeros((self.history,9))
         self.rally_state = new_rally_state()
         self._last_table_bounce_step = -1
+        # Clear the latched role, or the last rally's carries into this one.
+        self._role_p1_defending = False
         prev_robot_pos = np.array(self.data.qpos[:9])
         prev_robot_pos_opp = np.array(self.data.qpos[9:18])
         mj.mj_resetData(self.model, self.data)
