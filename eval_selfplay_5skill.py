@@ -31,7 +31,9 @@ from stable_baselines3 import PPO
 
 from nash_skills.env_wrapper import SkillEnv
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_from_index
-from nash_skills.v2.state_encoder import encode_ego, encode_opp
+from nash_skills.v2.state_encoder import (
+    encode_ego, encode_opp, state_dim_for, skill_encoding_from_state_dict,
+)
 from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 from nash_skills.winner_inference import infer_terminal_winner
 from selfplay_5skill import (
@@ -98,8 +100,8 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng):
 
             if (prev_ball_x - TABLE_SHIFT) * (curr_ball_x - TABLE_SHIFT) < 0:
                 crossings += 1
-                ego_state = encode_ego(obs, info)
-                opp_state = encode_opp(obs, info)
+                ego_state = encode_ego(obs, info, ego_encoding)
+                opp_state = encode_opp(obs, info, opp_encoding)
                 with torch.no_grad():
                     ego_idx, _ = ego_policy.sample(ego_state, device)
                 opp_idx = opp_pick_fn(opp_state, obs, info, ego_idx)
@@ -181,16 +183,21 @@ def main():
     rng = random.Random(args.seed)
 
     print(f"Loading ego policy from {args.checkpoint} ...")
-    policy = MetaPolicy().to(device)
-    policy.load_state_dict(torch.load(args.checkpoint, map_location=device))
+    saved = torch.load(args.checkpoint, map_location=device)
+    ego_encoding = skill_encoding_from_state_dict(saved)
+    policy = MetaPolicy(state_dim=state_dim_for(ego_encoding)).to(device)
+    policy.load_state_dict(saved)
+    opp_encoding = ego_encoding
     policy.eval()
 
     # Build the list of (label, pick_fn) opponents
     opponents = []
     if args.vs_checkpoint:
         print(f"Loading opp policy from {args.vs_checkpoint} ...")
-        opp_policy = MetaPolicy().to(device)
-        opp_policy.load_state_dict(torch.load(args.vs_checkpoint, map_location=device))
+        opp_saved = torch.load(args.vs_checkpoint, map_location=device)
+        opp_encoding = skill_encoding_from_state_dict(opp_saved)
+        opp_policy = MetaPolicy(state_dim=state_dim_for(opp_encoding)).to(device)
+        opp_policy.load_state_dict(opp_saved)
         opp_policy.eval()
         label = args.vs_label or os.path.splitext(os.path.basename(args.vs_checkpoint))[0]
 
@@ -220,7 +227,11 @@ def main():
             m2.eval()
 
         def _state_enc(obs, info, player):
-            return encode_ego(obs, info) if player == 1 else encode_opp(obs, info)
+            # Phi/Q are SimpleModel(76, ...), trained on the linear encoding, so
+            # they get it explicitly. The self-play policy's own encoding is read
+            # from its checkpoint and is independent of this.
+            return (encode_ego(obs, info, "linear") if player == 1
+                    else encode_opp(obs, info, "linear"))
 
         nash_picker = make_picker(args.vs_strategy, model_p=phi,
                                    state_encoder_fn=_state_enc,

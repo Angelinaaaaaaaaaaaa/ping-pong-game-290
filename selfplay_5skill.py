@@ -37,7 +37,10 @@ from stable_baselines3 import PPO
 from nash_skills.env_wrapper import SkillEnv
 from nash_skills.skills import SKILL_NAMES, N_SKILLS, skill_from_index
 from nash_skills.v2.reward import rally_rewards
-from nash_skills.v2.state_encoder import encode_ego, encode_opp, STATE_DIM
+from nash_skills.v2.state_encoder import (
+    encode_ego, encode_opp, STATE_DIM_ONEHOT, SKILL_ENCODINGS,
+    state_dim_for, skill_encoding_from_state_dict,
+)
 from nash_skills.winner_inference import infer_terminal_winner
 
 # --------------------------------------------------------------------------- #
@@ -58,7 +61,7 @@ TRUNCATED_PENALTY = -0.5
 class MetaPolicy(nn.Module):
     """76-dim state -> categorical over N_SKILLS actions."""
 
-    def __init__(self, state_dim: int = STATE_DIM, n_actions: int = N_SKILLS, hidden=(64, 32)):
+    def __init__(self, state_dim: int = STATE_DIM_ONEHOT, n_actions: int = N_SKILLS, hidden=(64, 32)):
         super().__init__()
         layers = []
         prev = state_dim
@@ -147,7 +150,8 @@ def _swallow_step(env, action):
 def play_one_rally(env, ppo, ego_policy, opp_policy, device,
                    ego_init_idx=0, opp_init_idx=0,
                    trunc_penalty=TRUNCATED_PENALTY,
-                   shaping_coef=0.0, trunc_shaping_coef=0.0):
+                   shaping_coef=0.0, trunc_shaping_coef=0.0,
+                   skill_encoding="onehot"):
     env.set_skills(skill_from_index(ego_init_idx), skill_from_index(opp_init_idx))
     obs, info = env.reset()
     prev_ball_x = float(obs[36])
@@ -178,8 +182,8 @@ def play_one_rally(env, ppo, ego_policy, opp_policy, device,
 
         if (prev_ball_x - TABLE_SHIFT) * (curr_ball_x - TABLE_SHIFT) < 0:
             crossings += 1
-            ego_state = encode_ego(obs, info)
-            opp_state = encode_opp(obs, info)
+            ego_state = encode_ego(obs, info, skill_encoding)
+            opp_state = encode_opp(obs, info, skill_encoding)
 
             ego_logits = ego_policy(torch.from_numpy(ego_state).float().unsqueeze(0).to(device))[0]
             ego_dist = torch.distributions.Categorical(logits=ego_logits)
@@ -259,7 +263,7 @@ def train(args):
     print(f"Loading PPO from {PPO_MODEL_PATH} (CPU — MlpPolicy is faster there) ...")
     ppo = PPO.load(PPO_MODEL_PATH, device="cpu")
 
-    policy = MetaPolicy().to(device)
+    policy = MetaPolicy(state_dim=state_dim_for(args.skill_encoding)).to(device)
     if args.resume and os.path.exists(args.output):
         policy.load_state_dict(torch.load(args.output, map_location=device))
         print(f"Resumed weights from {args.output}")
@@ -338,6 +342,7 @@ def train(args):
                     trunc_penalty=args.trunc_penalty,
                     shaping_coef=args.shaping_coef,
                     trunc_shaping_coef=args.trunc_shaping_coef,
+                    skill_encoding=args.skill_encoding,
                 )
 
                 ego_r = rally["ego_reward"]
@@ -522,6 +527,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for random/numpy/torch (default: None = OS entropy)")
+    parser.add_argument("--skill-encoding", default="onehot", choices=list(SKILL_ENCODINGS),
+                        help="How the current skills enter the state. 'linear' is the "
+                             "original pair of scalars, kept for the Phi/Q checkpoints; "
+                             "'onehot' drops the ordering those scalars implied.")
     parser.add_argument("--trunc-penalty", type=float, default=TRUNCATED_PENALTY,
                         help="Reward given to BOTH players when a rally hits the step cap "
                              f"(default: {TRUNCATED_PENALTY}). 0.0 makes the game strictly "
