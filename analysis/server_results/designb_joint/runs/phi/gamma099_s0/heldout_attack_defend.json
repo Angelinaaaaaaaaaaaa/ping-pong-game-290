@@ -1,0 +1,27 @@
+{
+  "encoder": "attack_defend_joint_v2",
+  "seed": 0,
+  "gamma": 0.99,
+  "phi_loss": "lse",
+  "phi_lse_beta": 10.0,
+  "theta_mode": "mixed",
+  "p_vertex": 0.3,
+  "n_train_rallies": 2320,
+  "n_holdout_rallies": 580,
+  "n_train_states": 14441,
+  "n_holdout_states": 3863,
+  "heldout_q1_mse": 0.9614591598510742,
+  "heldout_q2_mse": 0.9418554902076721,
+  "heldout_residuals": {
+    "max_abs": 2.377439022064209,
+    "mean_abs": 0.5574454598260854,
+    "p95_abs": 1.9094075441360472,
+    "n": 204800
+  },
+  "train_residuals": {
+    "max_abs": 2.401036500930786,
+    "mean_abs": 0.5640441626494385,
+    "p95_abs": 1.9051262617111206,
+    "n": 204800
+  }
+}

@@ -1,0 +1,4 @@
+launched: 2026-10-23T03:20:49+00:00
+encoder: attack_defend_joint_v2
+db5df579165070c7db59481776221bc2  logs/best_model_tracker1/best_model.zip
+mujoco 3.6.0 sb3 2.8.0 torch 2.11.0+cpu
