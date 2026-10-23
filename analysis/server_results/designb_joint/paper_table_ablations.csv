@@ -1,0 +1,14 @@
+Study,Setting,Train rallies,Held-out Q MSE (P1/P2),alpha = max|e|,p95 |e|,mean |e|,Static mean,Random,IBR (Q-based)
+data volume,25% of train rallies,580,0.370/0.382,2.149,0.991,0.327,,,
+data volume,50% of train rallies,1160,0.315/0.332,2.183,1.000,0.326,,,
+data volume,"100% of train rallies, seed 0",2320,0.263/0.254,2.120,0.919,0.298,,,
+discount,"gamma 0.7, seed 0",2320,0.263/0.254,2.120,0.919,0.298,,,
+discount,"gamma 0.99, seed 0",2320,0.961/0.942,2.377,1.909,0.557,,,
+Phi loss,smooth max (LSE),2320,0.263/0.254,2.120,0.919,0.298,,,
+Phi loss,MSE,2320,0.263/0.254,2.136,0.800,0.270,,,
+training data,pure + mixed theta,2320,0.263/0.254,2.120,0.919,0.298,,,
+training data,pure only,953,0.213/0.214,2.096,1.101,0.406,,,
+deployment (sampled vs argmax),"alpha-potential, mixed (PGA)",,,,,,0.649 (0.623-0.695),0.597 (0.530-0.665),0.432 (0.405-0.460)
+deployment (sampled vs argmax),"alpha-potential, argmax",,,,,,0.607 (0.576-0.644),0.598 (0.550-0.665),0.412 (0.345-0.495)
+deployment (sampled vs argmax),"self-play, sampled",,,,,,0.611 (0.586-0.633),0.592 (0.515-0.640),0.468 (0.390-0.540)
+deployment (sampled vs argmax),"self-play, argmax",,,,,,0.636 (0.595-0.687),0.607 (0.550-0.640),0.468 (0.385-0.515)

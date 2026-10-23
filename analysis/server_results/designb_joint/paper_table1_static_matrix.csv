@@ -1,0 +1,21 @@
+Method,Opponent attack target,prepares left,prepares right,prepares center
+"alpha-potential (PGA, Eq. 18)",left,0.638,0.512,0.452
+"alpha-potential (PGA, Eq. 18)",left_short,0.640,0.642,0.623
+"alpha-potential (PGA, Eq. 18)",center_safe,0.895,0.938,0.783
+"alpha-potential (PGA, Eq. 18)",right_short,0.648,0.563,0.543
+"alpha-potential (PGA, Eq. 18)",right,0.658,0.638,0.563
+self-play (sampled),left,0.600,0.642,0.447
+self-play (sampled),left_short,0.558,0.627,0.565
+self-play (sampled),center_safe,0.843,0.927,0.732
+self-play (sampled),right_short,0.565,0.475,0.523
+self-play (sampled),right,0.632,0.523,0.500
+alpha-potential (argmax),left,0.523,0.513,0.382
+alpha-potential (argmax),left_short,0.608,0.622,0.558
+alpha-potential (argmax),center_safe,0.868,0.920,0.733
+alpha-potential (argmax),right_short,0.592,0.542,0.513
+alpha-potential (argmax),right,0.577,0.605,0.543
+self-play (argmax),left,0.705,0.685,0.653
+self-play (argmax),left_short,0.562,0.623,0.513
+self-play (argmax),center_safe,0.845,0.825,0.685
+self-play (argmax),right_short,0.613,0.550,0.587
+self-play (argmax),right,0.632,0.512,0.553
