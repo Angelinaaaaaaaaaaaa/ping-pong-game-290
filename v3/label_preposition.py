@@ -119,7 +119,16 @@ def examples_from_rally(rally: dict[str, Any], gamma: float) -> list[dict[str, A
 
 def label(input_pkl: str, output_pkl: str, output_csv: str, gamma: float) -> list[dict[str, Any]]:
     with open(input_pkl, "rb") as f:
-        rallies = pkl.load(f)
+        payload = pkl.load(f)
+    if not isinstance(payload, dict) or "rallies" not in payload:
+        raise ValueError(
+            "Input is a historical V3 pickle without the state74 schema metadata; "
+            "do not relabel it as corrected V3 data."
+        )
+    metadata = payload.get("metadata", {})
+    if metadata.get("state_encoder") != STATE_ENCODER_NAME or metadata.get("state_dim") != STATE_DIM:
+        raise ValueError("Input V3 pickle is incompatible with the corrected state74 schema")
+    rallies = payload["rallies"]
 
     examples: list[dict[str, Any]] = []
     for rally in rallies:
@@ -134,6 +143,8 @@ def label(input_pkl: str, output_pkl: str, output_csv: str, gamma: float) -> lis
                 "gamma": gamma,
                 "state_dim": STATE_DIM,
                 "state_encoder": STATE_ENCODER_NAME,
+                "state_schema_version": STATE_ENCODER_NAME,
+                "model_input_schema": "v3_state74_action_onehot_v1",
                 "attack_skills": list(SKILL_NAMES),
                 "defense_prepositions": list(DEFENSE_POSITIONS),
             },
@@ -176,9 +187,9 @@ def label(input_pkl: str, output_pkl: str, output_csv: str, gamma: float) -> lis
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Label V3 pre-position decisions for attacker-perspective Q training.")
-    parser.add_argument("--input-pkl", default="data/v3/random_preposition_canonical_decisions.pkl")
-    parser.add_argument("--output-pkl", default="data/v3/labeled_preposition_canonical_examples.pkl")
-    parser.add_argument("--output-csv", default="skill_eval/v3/labeled_preposition_canonical_examples.csv")
+    parser.add_argument("--input-pkl", default="data/v3/random_preposition_state74_decisions.pkl")
+    parser.add_argument("--output-pkl", default="data/v3/labeled_preposition_state74_examples.pkl")
+    parser.add_argument("--output-csv", default="skill_eval/v3/labeled_preposition_state74_examples.csv")
     parser.add_argument("--gamma", type=float, default=GAMMA)
     return parser
 

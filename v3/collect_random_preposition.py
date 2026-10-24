@@ -43,20 +43,16 @@ def skill_value(skill: str) -> float:
     return skill_index(skill) / (N_SKILLS - 1)
 
 
-def state_for_attacker(obs: np.ndarray, info: dict[str, Any], attacker: int, attack_skill: str) -> list[float]:
-    state = encode_state_for_attacker(obs, info, attacker, attack_skill=attack_skill)
+def state_for_attacker(obs: np.ndarray, info: dict[str, Any], attacker: int) -> list[float]:
+    state = encode_state_for_attacker(obs, info, attacker)
     return [float(x) for x in state]
 
 
-def raw_obs_for_decision(obs: np.ndarray, attacker: int, attack_skill: str) -> list[float]:
-    raw = obs.copy()
-    if attacker == 1:
-        raw[-2] = skill_value(attack_skill)
-    elif attacker == 2:
-        raw[-1] = skill_value(attack_skill)
-    else:
-        raise ValueError("attacker must be 1 or 2")
-    return [float(x) for x in raw]
+def raw_obs_for_decision(obs: np.ndarray) -> list[float]:
+    """Return the untouched raw pre-decision observation."""
+    if len(obs) != 116:
+        raise ValueError(f"Expected 116-dim raw observation, got {len(obs)}")
+    return [float(x) for x in np.asarray(obs).copy()]
 
 
 def winner_label(winner: str) -> int:
@@ -95,8 +91,9 @@ def commit_random_decision(
     attack_skill = str(rng.choice(SKILL_NAMES))
     defense_position = str(rng.choice(DEFENSE_POSITIONS))
     defender = opponent(attacker)
-    state = state_for_attacker(obs, info, attacker, attack_skill)
-    raw_obs = raw_obs_for_decision(obs, attacker, attack_skill)
+    # Capture physical state before either newly selected action is committed.
+    state = state_for_attacker(obs, info, attacker)
+    raw_obs = raw_obs_for_decision(obs)
 
     if attacker == 1:
         env.set_skills(attack_skill, env._skill2)
@@ -113,6 +110,8 @@ def commit_random_decision(
         "decision_index": decision_index,
         "attacker_id": attacker,
         "attack_skill": attack_skill,
+        "attack_skill_idx": skill_index(attack_skill),
+        "action_execution_order": "attacker_skill_then_defender_preposition",
         **semantic_diagnostics,
         "defender_id": defender,
         "defense_preposition": defense_position,
@@ -151,6 +150,7 @@ def commit_random_decision(
         "discounted_return": "",
         "gamma": gamma,
         "state_encoder": STATE_ENCODER_NAME,
+        "state_dim": len(state),
     }
     if debug:
         print(
@@ -278,8 +278,11 @@ def build_pickle_rallies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "raw_obs": np.asarray(json.loads(row["raw_obs_before_action"]), dtype=np.float32),
                 "attacker_id": int(row["attacker_id"]),
                 "attack_skill": str(row["attack_skill"]),
+                "attack_skill_idx": int(row["attack_skill_idx"]),
+                "action_execution_order": str(row["action_execution_order"]),
                 "defender_id": int(row["defender_id"]),
                 "defense_preposition": str(row["defense_preposition"]),
+                "defense_preposition_idx": DEFENSE_POSITIONS.index(str(row["defense_preposition"])),
                 "defender_target_world_position": (
                     float(row["defender_target_world_x"]),
                     float(row["defender_target_world_y"]),
@@ -360,6 +363,7 @@ def build_pickle_rallies(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "truncated": bool(first["truncated"]),
             "decisions": decisions,
             "state_encoder": STATE_ENCODER_NAME,
+            "state_dim": 74,
         })
     return rallies
 
@@ -370,11 +374,21 @@ def _optional_position(x_value: Any, y_value: Any) -> tuple[float, float] | None
     return (float(x_value), float(y_value))
 
 
-def write_pickle(path: str, rows: list[dict[str, Any]]) -> None:
+def write_pickle(path: str, rows: list[dict[str, Any]], metadata: dict[str, Any] | None = None) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     rallies = build_pickle_rallies(rows)
+    payload = {
+        "metadata": {
+            "collector": "v3.collect_random_preposition",
+            "state_encoder": STATE_ENCODER_NAME,
+            "state_dim": 74,
+            "planner": "legacy",
+            **(metadata or {}),
+        },
+        "rallies": rallies,
+    }
     with Path(path).open("wb") as f:
-        pkl.dump(rallies, f)
+        pkl.dump(payload, f, protocol=pkl.HIGHEST_PROTOCOL)
     print(f"Pickle saved to: {path}")
 
 
@@ -495,20 +509,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--progress-every", type=int, default=10)
     parser.add_argument("--debug-decisions", action="store_true")
     parser.add_argument("--render", action="store_true", help="Use the existing live MuJoCo viewer via env.render().")
-    parser.add_argument("--output-csv", default="skill_eval/v3/random_preposition_canonical_decisions.csv")
-    parser.add_argument("--coverage-csv", default="skill_eval/v3/random_preposition_canonical_coverage.csv")
-    parser.add_argument("--output-json", default="skill_eval/v3/random_preposition_canonical_decisions.json")
-    parser.add_argument("--output-pkl", default="data/v3/random_preposition_canonical_decisions.pkl")
+    parser.add_argument("--output-csv", default="skill_eval/v3/random_preposition_state74_decisions.csv")
+    parser.add_argument("--coverage-csv", default="skill_eval/v3/random_preposition_state74_coverage.csv")
+    parser.add_argument("--output-json", default="skill_eval/v3/random_preposition_state74_decisions.json")
+    parser.add_argument("--output-pkl", default="data/v3/random_preposition_state74_decisions.pkl")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     default_outputs = {
-        "output_csv": "skill_eval/v3/random_preposition_canonical_decisions.csv",
-        "coverage_csv": "skill_eval/v3/random_preposition_canonical_coverage.csv",
-        "output_json": "skill_eval/v3/random_preposition_canonical_decisions.json",
-        "output_pkl": "data/v3/random_preposition_canonical_decisions.pkl",
+        "output_csv": "skill_eval/v3/random_preposition_state74_decisions.csv",
+        "coverage_csv": "skill_eval/v3/random_preposition_state74_coverage.csv",
+        "output_json": "skill_eval/v3/random_preposition_state74_decisions.json",
+        "output_pkl": "data/v3/random_preposition_state74_decisions.pkl",
     }
     for field, default_path in default_outputs.items():
         setattr(args, field, planner_output_path(getattr(args, field), args.planner, default_path))
@@ -519,6 +533,8 @@ def main(argv: list[str] | None = None) -> int:
         "decision_index",
         "attacker_id",
         "attack_skill",
+        "attack_skill_idx",
+        "action_execution_order",
         "attack_semantic_action",
         "attack_player_relative_side",
         "attack_target_local_y",
@@ -526,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
         "attack_target_world_y",
         "defender_id",
         "defense_preposition",
+        "defense_preposition_idx",
         "defense_semantic_action",
         "defense_world_y",
         "defender_raw_qpos_y",
@@ -534,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         "defense_target_player_relative_side",
         "defense_player_relative_side",
         "state_encoder",
+        "state_dim",
         "defender_target_world_x",
         "defender_target_world_y",
         "defender_target_qpos_x",
@@ -570,7 +588,13 @@ def main(argv: list[str] | None = None) -> int:
     ]
     write_csv(args.output_csv, rows, fields)
     write_csv(args.coverage_csv, coverage, ["attack_skill", "defense_preposition", "count"])
-    write_pickle(args.output_pkl, rows)
+    write_pickle(args.output_pkl, rows, metadata={
+        "planner": args.planner,
+        "seed": args.seed,
+        "gamma": args.gamma,
+        "state_schema_version": STATE_ENCODER_NAME,
+        "model_input_schema_version": "v3_state74_action_onehot_v1",
+    })
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
     with Path(args.output_json).open("w") as f:
         json.dump(
@@ -580,6 +604,9 @@ def main(argv: list[str] | None = None) -> int:
                     "planner": args.planner,
                     "seed": args.seed,
                     "gamma": args.gamma,
+                    "state_dim": 74,
+                    "state_encoder": STATE_ENCODER_NAME,
+                    "model_input_schema": "v3_state74_action_onehot_v1",
                 },
                 "decisions": rows,
                 "coverage": coverage,

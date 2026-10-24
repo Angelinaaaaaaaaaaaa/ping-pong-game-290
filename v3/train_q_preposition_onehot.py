@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Train the V3 Q model with one-hot action encoding.
 
-This is a separate encoding ablation for the scalar-encoded V3 trainer. It
-reuses the existing V3 dataset, split logic, MLP shape, optimizer, checkpoint
-selection, and diagnostics without changing the scalar trainer or its model.
+This is the corrected V3 one-hot trainer. It reuses the existing V3 dataset,
+split logic, MLP shape, optimizer, checkpoint selection, and diagnostics while
+using the state74/action-onehot schema.
 """
 
 from __future__ import annotations
@@ -22,8 +22,15 @@ import torch.nn as nn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from model_arch import SimpleModel  # noqa: E402
-from nash_skills.skills import SKILL_NAMES, skill_index  # noqa: E402
+from nash_skills.skills import SKILL_NAMES  # noqa: E402
 from v3.constants import DEFENSE_POSITIONS  # noqa: E402
+from v3.model_input import (  # noqa: E402
+    ACTION_DIM,
+    MODEL_INPUT_DIM,
+    MODEL_INPUT_SCHEMA_VERSION,
+    build_joint_action_input,
+    iter_action_pairs,
+)
 from v3.state_encoder import STATE_DIM, STATE_ENCODER_NAME  # noqa: E402
 from v3.train_q_preposition import (  # noqa: E402
     HIDDEN,
@@ -37,14 +44,7 @@ from v3.train_q_preposition import (  # noqa: E402
 )
 
 
-ACTION_DIM = len(SKILL_NAMES) + len(DEFENSE_POSITIONS)
-INPUT_DIM = STATE_DIM + ACTION_DIM
-
-
-def defense_index(position: str | int) -> int:
-    if isinstance(position, int):
-        return position
-    return DEFENSE_POSITIONS.index(position)
+INPUT_DIM = MODEL_INPUT_DIM
 
 
 def encode_input(
@@ -52,25 +52,13 @@ def encode_input(
     attack_skill: str | int,
     defense_preposition: str | int,
 ) -> np.ndarray:
-    """Encode one state/action pair as 76 state + 5 skill + 3 position dims."""
-    state = np.asarray(state, dtype=np.float32).reshape(-1)
-    if state.shape[0] != STATE_DIM:
-        raise ValueError(f"Expected {STATE_DIM}-dim state, got {state.shape[0]}")
-
-    attack_index = attack_skill if isinstance(attack_skill, int) else skill_index(attack_skill)
-    position_index = defense_index(defense_preposition)
-    action = np.zeros(ACTION_DIM, dtype=np.float32)
-    action[attack_index] = 1.0
-    action[len(SKILL_NAMES) + position_index] = 1.0
-    return np.concatenate([state, action]).astype(np.float32)
+    """Encode one state/action pair as 74 state + 5 + 3 one-hot dims."""
+    return build_joint_action_input(state, attack_skill, defense_preposition)
 
 
 def q_matrix(model: nn.Module, state: np.ndarray, device: str = "cpu") -> np.ndarray:
-    """Evaluate all 5 x 3 V3 action pairs for one 76-dim state."""
-    rows = []
-    for skill in SKILL_NAMES:
-        for position in DEFENSE_POSITIONS:
-            rows.append(encode_input(state, skill, position))
+    """Evaluate all 5 x 3 V3 action pairs for one 74-dim state."""
+    rows = [encode_input(state, skill, position) for skill, position in iter_action_pairs()]
     model.eval()
     with torch.no_grad():
         x = torch.tensor(np.asarray(rows), dtype=torch.float32, device=device)
@@ -165,6 +153,7 @@ def train(args: argparse.Namespace) -> None:
         "state_dim": STATE_DIM,
         "state_encoder": STATE_ENCODER_NAME,
         "action_dim": ACTION_DIM,
+        "model_input_schema": MODEL_INPUT_SCHEMA_VERSION,
         "attack_encoding": "one_hot",
         "defense_encoding": "one_hot",
         "hidden": HIDDEN,
@@ -195,7 +184,7 @@ def train(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train V3 Q model with one-hot action encoding.")
-    parser.add_argument("--labels", default="data/v3/labeled_preposition_canonical_examples.pkl")
+    parser.add_argument("--labels", default="data/v3/labeled_preposition_state74_examples.pkl")
     parser.add_argument("--epochs", type=int, default=1500)
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--seed", type=int, default=0)
@@ -203,11 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--print-every", type=int, default=100)
     parser.add_argument("--bins", type=int, default=5)
-    parser.add_argument("--model-out", default="models/v3/q_preposition_onehot_canonical.pth")
-    parser.add_argument("--log-csv", default="logs/v3/train_q_preposition_onehot_canonical.csv")
-    parser.add_argument("--metrics-json", default="skill_eval/v3/q_preposition_onehot_canonical_metrics.json")
-    parser.add_argument("--bins-csv", default="skill_eval/v3/q_preposition_onehot_canonical_bins.csv")
-    parser.add_argument("--q-matrix-csv", default="skill_eval/v3/q_preposition_onehot_canonical_sample_matrix.csv")
+    parser.add_argument("--model-out", default="models/v3/q_preposition_state74_onehot.pth")
+    parser.add_argument("--log-csv", default="logs/v3/train_q_preposition_state74_onehot.csv")
+    parser.add_argument("--metrics-json", default="skill_eval/v3/q_preposition_state74_onehot_metrics.json")
+    parser.add_argument("--bins-csv", default="skill_eval/v3/q_preposition_state74_onehot_bins.csv")
+    parser.add_argument("--q-matrix-csv", default="skill_eval/v3/q_preposition_state74_onehot_sample_matrix.csv")
     return parser
 
 

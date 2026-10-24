@@ -1,7 +1,7 @@
 """Role-based, attacker-relative V3 state encoding.
 
-The encoder keeps the V2 state width (76 values) while changing the meaning
-of the slots so that they are independent of physical P1/P2 identity:
+The encoder keeps the first 74 physical/context features while changing the
+meaning of the slots so that they are independent of physical P1/P2 identity:
 
     first role  = current attacker
     second role = current defender
@@ -25,13 +25,11 @@ The fixed-width layout is:
     59:62  defender target position error
     62:68  attacker gantry history (three most recent x/y frames)
     68:74  defender gantry history (three most recent x/y frames)
-    74     attacker skill
-    75     defender skill
-
 The old 4-frame full pose history and quaternion tracking errors cannot all
-fit alongside both role robot blocks at 76 dimensions.  The retained history
-is the spatial gantry history; target poses retain their full position and
-orientation information.
+fit alongside both role robot blocks.  The retained history is the spatial
+gantry history; target poses retain their full position and orientation
+information.  Skill identifiers are action data, not state data, and are
+appended by ``v3.model_input`` when a model evaluates a candidate action.
 """
 
 from __future__ import annotations
@@ -41,15 +39,14 @@ from typing import Any
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from nash_skills.skills import N_SKILLS, skill_index
 from v3.constants import GantryTarget, gantry_to_world_position
 from v3.racket_target_planner import mirror_position_to_world, mirror_velocity_to_local
 
 
-STATE_DIM = 76
+STATE_DIM = 74
 HISTORY = 4
 HISTORY_FRAMES_RETAINED = 3
-STATE_ENCODER_NAME = "v3_role_symmetric_canonical_v1"
+STATE_ENCODER_NAME = "v3_role_symmetric_canonical_state74_v2"
 
 ATTACKER_QPOS = slice(0, 9)
 ATTACKER_QVEL = slice(9, 18)
@@ -63,18 +60,8 @@ ATTACKER_DIFF_POS = slice(56, 59)
 DEFENDER_DIFF_POS = slice(59, 62)
 ATTACKER_HISTORY = slice(62, 68)
 DEFENDER_HISTORY = slice(68, 74)
-ATTACKER_SKILL = 74
-DEFENDER_SKILL = 75
 
 _REFLECTION = np.diag([-1.0, -1.0, 1.0])
-
-
-def normalized_skill(skill: str | int | float) -> float:
-    if isinstance(skill, str):
-        index = skill_index(skill)
-    else:
-        index = skill
-    return float(index) / float(N_SKILLS - 1)
 
 
 def _validate_inputs(obs: np.ndarray, info: dict[str, Any]) -> np.ndarray:
@@ -181,9 +168,9 @@ def _canonical_history(raw_history: np.ndarray, player: int, attacker: int) -> n
 
 def _role_raw_slices(player: int) -> tuple[slice, slice, slice]:
     if player == 1:
-        return slice(0, 9), slice(9, 18), slice(42, 78)
+        return slice(0, 9), slice(18, 27), slice(42, 78)
     if player == 2:
-        return slice(18, 27), slice(27, 36), slice(78, 114)
+        return slice(9, 18), slice(27, 36), slice(78, 114)
     raise ValueError("player must be 1 or 2")
 
 
@@ -205,8 +192,6 @@ def encode_canonical_state(
     obs: np.ndarray,
     info: dict[str, Any],
     attacker_id: int,
-    attack_skill: str | int | float | None = None,
-    defender_skill: str | int | float | None = None,
 ) -> np.ndarray:
     """Encode a raw environment state using attacker/defender roles."""
     raw = _validate_inputs(obs, info)
@@ -237,9 +222,8 @@ def encode_canonical_state(
     state[ATTACKER_HISTORY] = _canonical_history(raw[attacker_history_slice], attacker_id, attacker_id)
     state[DEFENDER_HISTORY] = _canonical_history(raw[defender_history_slice], defender_id, attacker_id)
 
-    physical_skills = {1: float(raw[-2]), 2: float(raw[-1])}
-    state[ATTACKER_SKILL] = normalized_skill(attack_skill) if attack_skill is not None else physical_skills[attacker_id]
-    state[DEFENDER_SKILL] = normalized_skill(defender_skill) if defender_skill is not None else physical_skills[defender_id]
+    if state.shape != (STATE_DIM,):
+        raise AssertionError(f"V3 encoder produced {state.shape}, expected {(STATE_DIM,)}")
     return state
 
 
@@ -247,10 +231,9 @@ def state_for_attacker(
     obs: np.ndarray,
     info: dict[str, Any],
     attacker_id: int,
-    attack_skill: str | int | float | None = None,
 ) -> np.ndarray:
-    """Compatibility wrapper used by V3 collection and policy evaluation."""
-    return encode_canonical_state(obs, info, attacker_id, attack_skill=attack_skill)
+    """Encode the pre-decision physical state for the current attacker."""
+    return encode_canonical_state(obs, info, attacker_id)
 
 
 STATE_FIELD_NAMES = [
@@ -270,7 +253,6 @@ STATE_FIELD_NAMES = [
     "defender_history_gantry_0_x", "defender_history_gantry_0_y",
     "defender_history_gantry_1_x", "defender_history_gantry_1_y",
     "defender_history_gantry_2_x", "defender_history_gantry_2_y",
-    "attacker_skill", "defender_skill",
 ]
 
 if len(STATE_FIELD_NAMES) != STATE_DIM:
@@ -278,12 +260,9 @@ if len(STATE_FIELD_NAMES) != STATE_DIM:
 
 
 __all__ = [
-    "ATTACKER_SKILL",
-    "DEFENDER_SKILL",
     "STATE_DIM",
     "STATE_ENCODER_NAME",
     "STATE_FIELD_NAMES",
     "encode_canonical_state",
-    "normalized_skill",
     "state_for_attacker",
 ]
