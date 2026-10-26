@@ -1,0 +1,5 @@
+Method,Deployment,Seeds,Static mean,Static minimum,Hardest static opponent (seed mean),Random,IBR (Q-based),Other proposed
+alpha-potential,PGA (Eq. 18),3,0.649 (0.623-0.695),0.422 (0.340-0.545),left/center,0.597 (0.530-0.665),0.432 (0.405-0.460),0.467 (0.370-0.535)
+Self-play RL,sampled,3,0.611 (0.586-0.633),0.422 (0.380-0.450),left/center,0.592 (0.515-0.640),0.468 (0.390-0.540),0.533 (0.465-0.630)
+alpha-potential (ablation),argmax,3,0.607 (0.576-0.644),0.382 (0.290-0.490),left/center,0.598 (0.550-0.665),0.412 (0.345-0.495),0.457 (0.430-0.475)
+Self-play RL (ablation),argmax,3,0.636 (0.595-0.687),0.403 (0.375-0.440),right/right,0.607 (0.550-0.640),0.468 (0.385-0.515),0.540 (0.505-0.595)

@@ -1,0 +1,5 @@
+method,seed,static_mean,static_mean_ci_lo,static_mean_ci_hi,static_mean_range,static_min,static_min_range,static_min_opponent,random,random_ci_lo,random_ci_hi,random_range,ibr,ibr_ci_lo,ibr_ci_hi,ibr_range,vs_nash_p_pga,vs_nash_p_hard,decided,truncated,median_rally_steps,share_le_2_returns_est,source
+"alpha-potential (PGA, Eq. 18)",0,0.7047,0.6888,0.7205,,0.5700,,left/left,0.7200,0.6541,0.7776,,0.5300,0.4609,0.5980,,,,3400,7,191.0000,0.7265,nash_p_pga_s0.json
+"alpha-potential (PGA, Eq. 18)",1,0.6793,0.6633,0.6954,,0.4150,,left/center,0.6500,0.5816,0.7127,,0.4800,0.4118,0.5490,,,,3400,13,183.0000,0.7415,nash_p_pga_s1.json
+"alpha-potential (PGA, Eq. 18)",2,0.7040,0.6882,0.7198,,0.4750,,left/center,0.6500,0.5816,0.7127,,0.6100,0.5409,0.6749,,,,3400,7,191.0000,0.7035,nash_p_pga_s2.json
+"alpha-potential (PGA, Eq. 18)",mean (3 seeds),0.6960,,,0.679-0.705,0.4867,0.415-0.570,,0.6733,,,0.650-0.720,0.5400,,,0.480-0.610,,,10200,27,188.3333,0.7238,

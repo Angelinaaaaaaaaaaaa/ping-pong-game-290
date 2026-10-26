@@ -13,12 +13,12 @@ We extend this by also passing x_target when applying a skill.
 """
 
 TABLE_SHIFT = 1.5       # net position (x)
-TABLE_NEAR  = 1.75      # short return: raised from 1.65 (simulator validation showed
+TABLE_NEAR  = 1.95      # short return: raised from 1.65 (simulator validation showed
                         # PPO cannot track 1.65; left_short landed 0.20m deeper than left)
-TABLE_MID   = 1.85      # center-safe: middle of opponent's half
+TABLE_MID   = 2.0      # center-safe: middle of opponent's half
 TABLE_FAR   = TABLE_SHIFT + 1.37 / 2  # ~2.19, deep return (existing default)
-TABLE_SHORT_MODERATE = 1.66
-TABLE_SHORT_AGGRESSIVE = 1.60
+TABLE_SHORT_MODERATE = 1.85
+TABLE_SHORT_AGGRESSIVE = 1.90
 TABLE_FAR_MODERATE = 2.35
 TABLE_FAR_AGGRESSIVE = 2.50
 SIDE_CURRENT = 1.0

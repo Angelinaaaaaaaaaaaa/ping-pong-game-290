@@ -6,9 +6,8 @@ The learned payoff is attacker-perspective:
 
 The state encoder used during V3 collection is role-based and canonical:
 the attacker occupies the first role slots and the defender occupies the
-second role slots.  Counterfactual Q evaluation updates the canonical
-attacker-skill slot for each candidate shot before applying the one-hot
-action encoding.
+second role slots. Counterfactual Q evaluation changes only the appended
+one-hot action fields; it never mutates the physical state prefix.
 """
 
 from __future__ import annotations
@@ -21,21 +20,20 @@ import torch
 from scipy.optimize import linprog
 
 from model_arch import SimpleModel
-from nash_skills.skills import N_SKILLS, SKILL_NAMES, skill_index
+from nash_skills.skills import SKILL_NAMES
 from v3.constants import DEFENSE_POSITIONS
-from v3.state_encoder import ATTACKER_SKILL, STATE_DIM, state_for_attacker
+from v3.model_input import (
+    ACTION_DIM,
+    MODEL_INPUT_DIM,
+    MODEL_INPUT_SCHEMA_VERSION,
+    build_joint_action_input,
+    iter_action_pairs,
+)
+from v3.state_encoder import STATE_DIM, state_for_attacker
 from v3.train_q_preposition_onehot import HIDDEN, safe_load_state_dict
 
 
-ACTION_DIM = len(SKILL_NAMES) + len(DEFENSE_POSITIONS)
-INPUT_DIM = STATE_DIM + ACTION_DIM
-def normalized_skill_index(skill: str | int) -> float:
-    index = skill if isinstance(skill, int) else skill_index(skill)
-    return float(index) / float(N_SKILLS - 1)
-
-
-def defense_index(position: str | int) -> int:
-    return position if isinstance(position, int) else DEFENSE_POSITIONS.index(position)
+INPUT_DIM = MODEL_INPUT_DIM
 
 
 def encode_action_input(
@@ -43,15 +41,7 @@ def encode_action_input(
     attack_skill: str | int,
     defense_preposition: str | int,
 ) -> np.ndarray:
-    state = np.asarray(state, dtype=np.float32).reshape(-1)
-    if state.shape[0] != STATE_DIM:
-        raise ValueError(f"Expected {STATE_DIM}-dim state, got {state.shape[0]}")
-    attack = attack_skill if isinstance(attack_skill, int) else skill_index(attack_skill)
-    defense = defense_index(defense_preposition)
-    action = np.zeros(ACTION_DIM, dtype=np.float32)
-    action[attack] = 1.0
-    action[len(SKILL_NAMES) + defense] = 1.0
-    return np.concatenate([state, action]).astype(np.float32)
+    return build_joint_action_input(state, attack_skill, defense_preposition)
 
 
 def q_matrix(
@@ -63,18 +53,13 @@ def q_matrix(
     """Evaluate the trained model for all 5x3 semantic action pairs.
 
     ``attacker_id`` is retained as an ignored compatibility parameter for
-    existing V3 callers.  The state is already canonical, so all candidate
-    skills replace the single role-based attacker skill slot.
+    existing V3 callers. The state is already canonical; candidate actions
+    affect only the appended one-hot action fields.
     """
     state = np.asarray(base_state, dtype=np.float32).reshape(-1)
     if state.shape[0] != STATE_DIM:
         raise ValueError(f"Expected {STATE_DIM}-dim state, got {state.shape[0]}")
-    rows = []
-    for skill in SKILL_NAMES:
-        candidate_state = state.copy()
-        candidate_state[ATTACKER_SKILL] = normalized_skill_index(skill)
-        for position in DEFENSE_POSITIONS:
-            rows.append(encode_action_input(candidate_state, skill, position))
+    rows = [encode_action_input(state, skill, position) for skill, position in iter_action_pairs()]
     model.eval()
     with torch.no_grad():
         values = model(torch.tensor(np.asarray(rows), dtype=torch.float32, device=device))
@@ -82,8 +67,15 @@ def q_matrix(
 
 
 def load_q_model(path: str, device: str = "cpu") -> SimpleModel:
+    checkpoint = safe_load_state_dict(path)
+    first_weight = checkpoint.get("fc.0.weight") if isinstance(checkpoint, dict) else None
+    if first_weight is not None and int(first_weight.shape[1]) != INPUT_DIM:
+        raise ValueError(
+            f"Incompatible V3 Q checkpoint: expected input_dim {INPUT_DIM}, "
+            f"got {int(first_weight.shape[1])}; historical 76/84 artifacts are not reusable"
+        )
     model = SimpleModel(INPUT_DIM, HIDDEN, 1)
-    model.load_state_dict(safe_load_state_dict(path))
+    model.load_state_dict(checkpoint)
     model.to(device)
     model.eval()
     return model
@@ -169,7 +161,7 @@ def solve_zero_sum_matrix(matrix: np.ndarray) -> MatrixGameSolution:
 
 def greedy_ibr_distributions(
     matrix: np.ndarray,
-    iterations: int = 10,
+    iterations: int = 4,
     initial_defender_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return deterministic alternating best responses for the 5x3 game."""
@@ -199,6 +191,7 @@ __all__ = [
     "ACTION_DIM",
     "DEFENSE_POSITIONS",
     "INPUT_DIM",
+    "MODEL_INPUT_SCHEMA_VERSION",
     "MatrixGameSolution",
     "SKILL_NAMES",
     "encode_action_input",
