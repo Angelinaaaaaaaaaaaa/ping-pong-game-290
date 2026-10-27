@@ -57,7 +57,7 @@ DEFAULT_OUTPUT      = "models/selfplay_5skill_ad.pth"
 DEFAULT_LOG         = "logs/selfplay_5skill_ad.csv"
 HISTORY             = 4
 TABLE_SHIFT         = 1.5
-MAX_STEPS_PER_RALLY = int(os.environ.get("PINGPONG_MAX_STEPS", 3000))   # was 1000, and 800 before that.  At 1000 the cap
+MAX_STEPS_PER_RALLY = int(os.environ.get("PINGPONG_MAX_STEPS", 2500))   # was 1000, and 800 before that.  At 1000 the cap
                              # was not just losing samples, it was biasing them:
                              # a rally cut off before a player put the ball out
                              # never charges that player for the fault.  Raising

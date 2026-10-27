@@ -152,7 +152,20 @@ def pick_baseline(name, rng):
 
 
 def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng,
-             ego_encoding="onehot", opp_encoding="onehot"):
+             ego_encoding="onehot", opp_encoding="onehot",
+             decided_target=None, max_rallies=None, pool_sides=False):
+    """Evaluate `ego_policy` against `opp_pick_fn`.
+
+    Two options exist to match the team's Table 1 protocol ("200 decided rallies
+    per opponent; both sides pooled"):
+
+    `decided_target` plays until that many rallies have produced a point rather
+    than a fixed total, so truncations shrink the compute spent and not the
+    sample.  `pool_sides` alternates which physical player ego is, so any
+    left/right asymmetry in the environment cancels instead of loading onto one
+    seat -- `set_joint` otherwise wires ego to player 1 permanently.  Both
+    default off so existing numbers stay reproducible.
+    """
     wins = 0; losses = 0; trunc = 0
     crossings_list = []
     steps_list_all = []      # every rally (done + trunc)
@@ -171,10 +184,27 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng,
     pair_stats = defaultdict(lambda: {"n": 0, "wins": 0, "losses": 0, "trunc": 0,
                                       "steps_all": [], "steps_done": []})
 
-    for _ in range(n_rallies):
+    cap = max_rallies if max_rallies else (
+        n_rallies if decided_target is None else 20 * decided_target)
+    attempted = 0
+    while True:
+        if decided_target is None:
+            if attempted >= n_rallies:
+                break
+        elif (wins + losses) >= decided_target or attempted >= cap:
+            break
+        attempted += 1
+        # Which physical player ego is this rally.  set_joint takes (ego, opp)
+        # and maps the first to player 1, so swapping the arguments is what
+        # moves ego to the other seat; the encoders and the winner test below
+        # have to follow.
+        ego_player = 2 if (pool_sides and attempted % 2 == 0) else 1
         ego_init = rng.randint(0, N_JOINT - 1)
         opp_init = rng.randint(0, N_JOINT - 1)
-        set_joint(env, ego_init, opp_init)
+        if ego_player == 1:
+            set_joint(env, ego_init, opp_init)
+        else:
+            set_joint(env, opp_init, ego_init)
         obs, info = env.reset()
         prev_ball_x = float(obs[36])
         traj = [(float(obs[36]), float(obs[37]), float(obs[38]), float(obs[39]))]
@@ -199,14 +229,19 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng,
 
             if (prev_ball_x - TABLE_SHIFT) * (curr_ball_x - TABLE_SHIFT) < 0:
                 crossings += 1
-                ego_state = encode_ego(obs, info, ego_encoding)
-                opp_state = encode_opp(obs, info, opp_encoding)
+                p1_state = encode_ego(obs, info, ego_encoding)
+                p2_state = encode_opp(obs, info, opp_encoding)
+                ego_state, opp_state = ((p1_state, p2_state) if ego_player == 1
+                                        else (p2_state, p1_state))
                 with torch.no_grad():
                     ego_idx, _ = ego_policy.sample(ego_state, device)
                 opp_idx = opp_pick_fn(opp_state, obs, info, ego_idx)
                 ego_skill_count[ego_idx] += 1
                 ego_skills_this_rally.append(ego_idx)
-                set_joint(env, ego_idx, opp_idx)
+                if ego_player == 1:
+                    set_joint(env, ego_idx, opp_idx)
+                else:
+                    set_joint(env, opp_idx, ego_idx)
 
             prev_ball_x = curr_ball_x
 
@@ -224,7 +259,8 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng,
         pair_stats[pair_key]["steps_all"].append(steps)
         if done:
             winner = infer_terminal_winner(obs, info, fallback="position") or "opp"
-            if winner == "ego":
+            ego_won = (winner == "ego") if ego_player == 1 else (winner != "ego")
+            if ego_won:
                 wins += 1
                 pair_stats[pair_key]["wins"] += 1
             else:
@@ -242,8 +278,9 @@ def eval_one(env, ppo, ego_policy, opp_pick_fn, device, n_rallies, rng,
     skill_usage = dict(zip(JOINT_NAMES, ego_skill_count))
     return {
         "wins": wins, "losses": losses, "trunc": trunc,
+        "attempted": attempted,
         "real_wr": real_wr,
-        "trunc_rate": trunc / n_rallies,
+        "trunc_rate": trunc / max(attempted, 1),
         "avg_xs": float(np.mean(crossings_list)),
         "avg_steps_all": float(np.mean(steps_list_all)),
         "avg_steps_done": float(np.mean(steps_list_done)) if steps_list_done else float("nan"),
@@ -279,7 +316,14 @@ def main():
 
                              "tracker, so these must match")
 
-    parser.add_argument("--rallies", type=int, default=30)
+    parser.add_argument("--rallies", type=int, default=30,
+                        help="fixed rally count; ignored when --decided is given")
+    parser.add_argument("--decided", type=int, default=None,
+                        help="play until this many rallies are decided (team Table 1 uses 200)")
+    parser.add_argument("--max-rallies", type=int, default=None,
+                        help="hard cap when --decided is used (default 20x)")
+    parser.add_argument("--pool-sides", action="store_true",
+                        help="alternate which physical player ego is, as Table 1 does")
     parser.add_argument("--json", default=None,
                         help="Also write the summary table to this path as JSON, so "
                              "drivers do not have to parse the printed output.")
@@ -315,6 +359,14 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Seed every source, not just ours.  env.reset() randomises the robots'
+    # initial pose through the *global* numpy RNG (mujoco_env_comp lines 277-282)
+    # and MetaPolicy.sample draws with torch.multinomial, so seeding only this
+    # Random() left the whole evaluation irreproducible -- the same command with
+    # the same --seed gave 25.0% and 62.5% on consecutive runs.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
     print(f"Loading ego policy from {args.checkpoint} ...")
@@ -405,7 +457,9 @@ def main():
     all_results = []
     for label, pick_fn in opponents:
         r = eval_one(env, ppo, policy, pick_fn, device, args.rallies, rng,
-                     ego_encoding=ego_encoding, opp_encoding=opp_encoding)
+                     ego_encoding=ego_encoding, opp_encoding=opp_encoding,
+                     decided_target=args.decided, max_rallies=args.max_rallies,
+                     pool_sides=args.pool_sides)
         skill_str = " ".join(f"{p:>{skill_col_w}.1%}" for p in r["skill_pct"])
         stp_done = f"{r['avg_steps_done']:>8.1f}" if r['avg_steps_done'] == r['avg_steps_done'] else f"{'nan':>8}"
         print(f"{label:<{label_w}} {r['real_wr']:>8.1%} "
