@@ -55,6 +55,11 @@ class SkillEnv:
     # Skill API                                                            #
     # ------------------------------------------------------------------ #
 
+    @property
+    def defender_positions(self):
+        """(pos1, pos2) by name, or (None, None) before set_defenders."""
+        return getattr(self, "_pos1", None), getattr(self, "_pos2", None)
+
     def set_skills(self, skill1: str, skill2: str):
         """Call before each rally to set the skill for each player."""
         if skill1 not in SKILL_NAMES:
@@ -74,14 +79,54 @@ class SkillEnv:
         for p in (pos1, pos2):
             if p is not None and p not in DEFENDER_NAMES:
                 raise ValueError(f"Unknown defender position '{p}'. Choose from: {DEFENDER_NAMES}")
+        # Keep the names, not just the coordinates.  The preposition is a
+        # strategic choice and belongs in the high-level state, but it never
+        # reaches the observation -- _encode_obs_skills writes only the two skill
+        # scalars, and set_defender_targets takes coordinates -- so without this
+        # the only trace of it is where the gantry has got to, which lags the
+        # commitment by however long the 8.0-gain controller takes to arrive.
+        self._pos1, self._pos2 = pos1, pos2
         self._env.set_defender_targets(
             target1=defender_target(pos1) if pos1 else None,
             target2=defender_target(pos2) if pos2 else None,
         )
 
+    # Lateral sign convention for the five skills.
+    #
+    #   "legacy"  nash_skills.skills as written: `left` lands at -world-y.
+    #   "v3"      Kexin's v3.skill_semantics convention: +y is the acting
+    #             player's own physical left, so `left` lands at +world-y.
+    #             This is the sign the defender positions already use, so
+    #             under "v3" a shot named left and a position named def_left
+    #             refer to the same half of the table.
+    #
+    # Only the sign changes here.  Depths come from nash_skills.skills, which is
+    # now the shared upstream file (short 1.90, side 1.70, mid 2.0) -- the
+    # env-var overrides this switch used to pair with are gone, so a depth sweep
+    # has to edit that file or go through v3.  The action set {+-SIDE} x {short,
+    # far} is symmetric, so flipping the sign relabels the five skills without
+    # changing which five physical shots they are.
+    # Default stays "legacy" deliberately.  This class is on the shared path --
+    # nash_skills/v2's collectors and trainers all construct SkillEnv -- so
+    # changing the default would silently flip the physical side every skill name
+    # refers to for everyone who pulls, which is the class of divergence this
+    # switch exists to make explicit rather than to introduce.  Opt in per run.
+    _SKILL_SEMANTICS = os.environ.get("PINGPONG_SKILL_SEMANTICS", "legacy")
+
+    @classmethod
+    def _get_skill(cls, name, profile):
+        side, depth = get_skill(name, profile=profile)
+        if cls._SKILL_SEMANTICS == "v3":
+            return -side, depth
+        if cls._SKILL_SEMANTICS != "legacy":
+            raise ValueError(
+                f"PINGPONG_SKILL_SEMANTICS must be 'legacy' or 'v3', "
+                f"got {cls._SKILL_SEMANTICS!r}")
+        return side, depth
+
     def _apply_skills(self):
-        side1, x1 = get_skill(self._skill1, profile=self.skill_profile)
-        side2, x2 = get_skill(self._skill2, profile=self.skill_profile)
+        side1, x1 = self._get_skill(self._skill1, self.skill_profile)
+        side2, x2 = self._get_skill(self._skill2, self.skill_profile)
         self._env.side_target     = side1
         self._env.side_target_opp = side2
         self._x_target1 = x1

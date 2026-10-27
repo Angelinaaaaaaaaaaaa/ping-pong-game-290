@@ -72,8 +72,12 @@ def attack_side_world(skill_name: str, profile: str = "aggressive") -> float:
     Positive means the same side that `def_left` stands on. Use this instead of
     comparing the two names directly, which would silently be off by a mirror.
     """
-    from nash_skills.skills import get_skill
-    side, _x = get_skill(skill_name, profile=profile)
+    from nash_skills.env_wrapper import SkillEnv
+    # Go through the env's accessor, not skills.get_skill, so this follows
+    # PINGPONG_SKILL_SEMANTICS.  Reading skills.py directly would report the
+    # legacy sign while the env is actually playing the flipped one, and every
+    # "did the shot go where the defender stood" answer would be mirrored.
+    side, _x = SkillEnv._get_skill(skill_name, profile)
     return float(side)
 
 

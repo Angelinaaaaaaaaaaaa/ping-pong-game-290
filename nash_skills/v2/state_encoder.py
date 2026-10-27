@@ -48,6 +48,14 @@ Encoded state (same dims for ego and opp)
 STATE_DIM = 76 (linear, for the original Q/Phi pipeline)
 STATE_DIM_ONEHOT = 84
 
+NOTE (2026-10-26): the raw-observation slicing in encode_ego/encode_opp was off by
+one 9-wide block and has been corrected.  Checkpoints trained before this date saw
+different quantities in the same slots -- the ego vector carried the opponent's
+qpos where it claimed its own velocities, and the opponent vector carried no
+positions at all -- so they cannot be compared against anything trained after it.
+`encode_joint` below is the version that also adds the opponent's state and
+canonicalises frames; this pair stays ego-only, which is what it always claimed.
+
 The original linear encoding is the default for the existing Q/Phi pipeline
 and its 76-dimensional checkpoints. Five-skill self-play explicitly chooses
 either that representation or one-hot, preserving both experiment families.
@@ -71,6 +79,8 @@ Why this design?
 """
 
 import numpy as np
+
+from nash_skills.defender import DEFENDER_NAMES, N_DEFENDER
 
 HISTORY = 4    # number of pose history frames (must match env)
 
@@ -146,7 +156,14 @@ def encode_ego(obs: np.ndarray, info: dict, skill_encoding: str = "linear") -> n
     out = np.zeros(state_dim_for(skill_encoding), dtype=np.float32)
     out[_GANTRY_SLICE] = obs[0:2]       # ego gantry
     out[_ARM_SLICE]    = obs[2:9]       # ego arm joints
-    out[_QVEL_SLICE]   = obs[9:18]      # ego joint velocities
+    # obs is concatenate([qpos[:18], qvel[:18], ...]), so BOTH players' positions
+    # come first and the velocities follow: obs[0:9] p1 qpos | obs[9:18] p2 qpos |
+    # obs[18:27] p1 qvel | obs[27:36] p2 qvel.  This line used to read obs[9:18],
+    # which is player 2's qpos, not player 1's velocities -- so the ego vector
+    # silently carried the opponent's gantry and arm in a slot labelled as its own
+    # velocity, and nobody's velocities at all.  `_build_ppo_obs` in the self-play
+    # trainers slices the same observation correctly and is the easiest cross-check.
+    out[_QVEL_SLICE]   = obs[18:27]     # ego joint velocities
     out[_BALL_POS]     = obs[36:39]     # ball position
     out[_BALL_VEL]     = obs[39:42]     # ball velocity
     out[_DIFF_POS]     = info["diff_pos"]
@@ -179,8 +196,12 @@ def encode_opp(obs: np.ndarray, info: dict, skill_encoding: str = "linear") -> n
     (76,) for linear or (84,) for onehot, float32
     """
     out = np.zeros(state_dim_for(skill_encoding), dtype=np.float32)
-    out[_GANTRY_SLICE] = obs[18:20]     # opp gantry (qpos[9:11] remapped)
-    out[_ARM_SLICE]    = obs[20:27]     # opp arm joints
+    # Same correction as encode_ego, mirrored: these used to read obs[18:20] and
+    # obs[20:27], which are player *1*'s velocities, so the opponent vector had no
+    # position information whatsoever -- both players' velocities and nobody's
+    # positions.  Only the velocity line below was accidentally right.
+    out[_GANTRY_SLICE] = obs[9:11]      # opp gantry (qpos[9:11])
+    out[_ARM_SLICE]    = obs[11:18]     # opp arm joints
     out[_QVEL_SLICE]   = obs[27:36]     # opp joint velocities
     out[_BALL_POS]     = obs[36:39]     # ball position (same ball)
     out[_BALL_VEL]     = obs[39:42]     # ball velocity
@@ -193,4 +214,171 @@ def encode_opp(obs: np.ndarray, info: dict, skill_encoding: str = "linear") -> n
     else:
         out[_SKILL_EGO] = _one_hot(obs[-2])
         out[_SKILL_OPP] = _one_hot(obs[-1])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# joint_v1: the four corrections, as one caller-indexed encoder
+# ---------------------------------------------------------------------------
+#
+# `encode_ego`/`encode_opp` above are kept untouched so the existing results
+# stay reproducible.  They have four defects, fixed here together because
+# applying only the first makes the strategic picture worse rather than better:
+#
+#   1. Slice order.  The raw observation is
+#          obs[0:9] p1 qpos | obs[9:18] p2 qpos | obs[18:27] p1 qvel | obs[27:36] p2 qvel
+#      -- concatenate([qpos[:18], qvel[:18], ...]) in mujoco_env_comp -- but the
+#      encoders above index it as [p1 qpos, p1 qvel, p2 qpos, p2 qvel].  The net
+#      effect is that `encode_ego` loads p2's qpos into the slot it calls "own
+#      joint velocities", and `encode_opp` loads p1's qvel into the slots it
+#      calls "opponent gantry/arm".  So player 1 acted on both players'
+#      positions and no velocities, and player 2 on both velocities and no
+#      positions.  (`_build_ppo_obs` in the self-play trainers slices the same
+#      observation correctly, which is the easiest cross-check.)
+#
+#   2. The opponent's state was never intended to be present.  Correcting (1)
+#      alone therefore *removes* the opponent's body, which the attacker/defender
+#      game needs: "hit where the opponent is not" is unavailable without it.
+#      So both robots' qpos and qvel are included deliberately.
+#
+#   3. Frames.  Player 2's base is rotated 180 degrees, so its raw lateral qpos
+#      carries the opposite sign from world y and its x is reflected about the
+#      table centre.  The ball, meanwhile, was never converted at all -- both
+#      players received the identical world-frame ball.  Everything here is
+#      expressed in the *calling* player's frame, so a given number means the
+#      same physical side regardless of who is acting.  Only the gantry pair is
+#      converted; the seven arm joints are joint coordinates, not positions, and
+#      are left alone (matching v3/state_encoder.py).
+#
+#   4. Choice slots were ordered by player id, so slot "ego skill" held player
+#      1's choice in *both* vectors.  Here they are ordered self-then-other.
+#
+# All four matter specifically because one shared set of weights serves both
+# players: a slot whose meaning depends on the caller has no single correct
+# interpretation, and the stable thing for the network to learn is to ignore it.
+
+TABLE_SHIFT = 1.5       # mujoco_env_comp.TABLE_SHIFT; table centre in x
+
+# Caller-relative layout.  One table, because the bug this encoder exists to fix
+# came from four index expressions drifting apart: get one wrong and the slot
+# silently holds another quantity.  "self" is always the calling player.
+_JGS = {
+    "self_qpos":   slice(0, 9),      # gantry(2) in caller frame + arm joints(7)
+    "self_qvel":   slice(9, 18),
+    "other_qpos":  slice(18, 27),
+    "other_qvel":  slice(27, 36),
+    "ball_pos":    slice(36, 39),
+    "ball_vel":    slice(39, 42),
+    "self_dpos":   slice(42, 45),    # racket tracking error, position
+    "self_dquat":  slice(45, 49),    # ... and orientation
+    "self_target": slice(49, 56),    # racket target pose (pos 3 + quat 4)
+    "other_dpos":  slice(56, 59),
+    "other_dquat": slice(59, 63),
+    "other_target": slice(63, 70),   # what the opponent's solver has committed to
+    "self_hist":   slice(70, 106),   # caller's action history, 4 frames x 9
+    "role":        slice(106, 108),  # [am I attacker, am I defender]
+    "self_skill":  slice(108, 113),
+    "self_pos":    slice(113, 116),
+    "other_skill": slice(116, 121),
+    "other_pos":   slice(121, 124),
+}
+STATE_DIM_JOINT = 124
+STATE_ENCODER_NAME = "ego_centric_joint_v2"
+
+_RAW_QPOS = {1: slice(0, 9),   2: slice(9, 18)}
+_RAW_QVEL = {1: slice(18, 27), 2: slice(27, 36)}
+_RAW_HIST = {1: slice(42, 78), 2: slice(78, 114)}
+
+
+def _mirror_xy(x, y):
+    """World <-> player-2 frame.  An involution, so one function serves both."""
+    return 2.0 * TABLE_SHIFT - x, -y
+
+
+def _mirror_pose(pose):
+    """Reflect a 7-vector [pos(3), quat(4)].  Only x/y of the position move; the
+    quaternion is left alone -- orientation under this reflection is not a
+    rotation, and the targets are consumed as "where the racket is pointed"
+    rather than compared across players."""
+    out = np.array(pose, dtype=np.float32, copy=True)
+    out[0], out[1] = _mirror_xy(out[0], out[1])
+    return out
+
+
+def encode_joint(obs: np.ndarray, info: dict, player: int, *,
+                 attacker_id: int, self_pos: str, other_pos: str) -> np.ndarray:
+    """124-dim state for `player`, both robots, everything in `player`'s frame.
+
+    Fixes four things the ego-centric pair above could not, and which matter
+    together because one shared network serves both players:
+
+      1. Slice order (see the NOTE in the module docstring).
+      2. The opponent's body, racket target and tracking error are present --
+         the game's premise is "hit where the opponent is not", and the
+         opponent's committed racket pose is a finer statement of the incoming
+         shot than its five-way skill label.
+      3. Frames.  Player 2's base is rotated 180 degrees, so its raw lateral
+         qpos has the opposite sign from world y and its x is reflected about
+         the table centre; the ball was never converted at all.  Here a given
+         number means the same physical side whoever is acting.
+      4. Choices are ordered self-then-other, and the *defender positions* are
+         included.  Those were never in the observation at all, so until now the
+         only trace of a preposition was where the gantry had got to -- which
+         lags the commitment while the controller drives toward it, and the
+         attacker decides inside exactly that window.
+
+    `self_pos` / `other_pos` are defender position names; they come from
+    SkillEnv.defender_positions because the observation has no room for them.
+    `attacker_id` comes from the strike-latched role.
+    """
+    if player not in (1, 2):
+        raise ValueError(f"player must be 1 or 2, got {player!r}")
+    if attacker_id not in (1, 2):
+        raise ValueError(f"attacker_id must be 1 or 2, got {attacker_id!r}")
+    other = 3 - player
+    mirror = (player == 2)          # convert world-frame quantities for p2
+    out = np.zeros(STATE_DIM_JOINT, dtype=np.float32)
+
+    # --- robots: own frame as-is; the other player's is always reflected,
+    # because the two players' frames are mirror images of each other.
+    self_qpos = np.asarray(obs[_RAW_QPOS[player]], dtype=np.float32)
+    other_qpos = np.array(obs[_RAW_QPOS[other]], dtype=np.float32, copy=True)
+    other_qvel = np.array(obs[_RAW_QVEL[other]], dtype=np.float32, copy=True)
+    other_qpos[0], other_qpos[1] = _mirror_xy(other_qpos[0], other_qpos[1])
+    other_qvel[0], other_qvel[1] = -other_qvel[0], -other_qvel[1]
+    out[_JGS["self_qpos"]] = self_qpos
+    out[_JGS["self_qvel"]] = obs[_RAW_QVEL[player]]
+    out[_JGS["other_qpos"]] = other_qpos
+    out[_JGS["other_qvel"]] = other_qvel
+
+    # --- ball: world frame, so it converts for player 2 only
+    bx, by = (_mirror_xy(obs[36], obs[37]) if mirror else (obs[36], obs[37]))
+    out[_JGS["ball_pos"]] = (bx, by, float(obs[38]))
+    bvx, bvy = ((-obs[39], -obs[40]) if mirror else (obs[39], obs[40]))
+    out[_JGS["ball_vel"]] = (bvx, bvy, float(obs[41]))
+
+    # --- racket tracking, both players.  info's *_opp fields are player 2's.
+    # info's plain keys are player 1's and the *_opp ones player 2's, each in
+    # that player's own frame.  So the same rule as qpos applies: the caller's
+    # own pose needs no conversion and the other player's always does.
+    key = lambda base, p: (f"{base}_opp" if p == 2 else base)
+    for who, tag, flip in ((player, "self", False), (other, "other", True)):
+        tgt = np.asarray(info[key("target", who)], dtype=np.float32)[:7]
+        out[_JGS[f"{tag}_target"]] = _mirror_pose(tgt) if flip else tgt
+        out[_JGS[f"{tag}_dpos"]] = np.asarray(info[key("diff_pos", who)], dtype=np.float32)[:3]
+        out[_JGS[f"{tag}_dquat"]] = np.asarray(info[key("diff_quat", who)], dtype=np.float32)[:4]
+    out[_JGS["self_hist"]] = obs[_RAW_HIST[player]]
+
+    # --- role: the same physical state means different things depending on
+    # whether the caller is about to hit or about to wait.  Recoverable from the
+    # ball's velocity sign, but cheap to state outright.
+    out[_JGS["role"]] = (1.0, 0.0) if player == attacker_id else (0.0, 1.0)
+
+    # --- choices, self then other
+    raw_skill = {1: float(obs[-2]), 2: float(obs[-1])}
+    out[_JGS["self_skill"]] = _one_hot(raw_skill[player])
+    out[_JGS["other_skill"]] = _one_hot(raw_skill[other])
+    for tag, pos in (("self_pos", self_pos), ("other_pos", other_pos)):
+        if pos is not None:
+            out[_JGS[tag]][DEFENDER_NAMES.index(pos)] = 1.0
     return out
