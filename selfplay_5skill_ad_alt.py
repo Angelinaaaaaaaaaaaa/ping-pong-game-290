@@ -23,6 +23,40 @@ unexploitable mixture, which is what the 2026-07-29 five-skill runs showed.
 There is no opponent snapshot pool here, unlike the simultaneous trainer.  The
 frozen network *is* the held-fixed opponent, so a pool would blur the
 best-response objective rather than stabilise it.
+
+Why this file and not the simultaneous trainer (2026-10-27).  Section 4.2 opens
+with "for player i, a neural actor with parameters psi_i" -- psi is indexed by
+player, i.e. two parameter sets -- and then "alternate learner updates while
+holding the opponent fixed within an update round".  This file is the only
+implementation in the project that does either: `policy_A`/`policy_B` with
+their own optimizers, and `frozen.eval()` for a whole `--phase-length` block.
+Both simultaneous trainers (ours and Angelina's PPO one) share a single network
+and update it against itself, which contradicts that first sentence.
+
+What is still missing here, and it is a missing feature rather than a conflict:
+the snapshot pool of the next sentence.  A pool is orthogonal to the
+alternation -- the opponent for a rally can be drawn from {the currently frozen
+network} union {its earlier snapshots}, which is what "earlier strategies as
+well as recent opponents" asks for.
+
+What has to come from the PPO side.  The algorithm in 4.2 is PPO with a critic,
+a discount, and two heads over Delta_5 x Delta_3; truncated rollouts are
+bootstrapped from the critic.  This file inherits REINFORCE with an EMA scalar
+baseline, no discount, one shared 15-way joint head, an 84-dim ego-centric
+state against the planner's 76 ("the same physical information available to the
+potential-based planner" is false for us), and -0.5 to both players on
+truncation -- the only place in the project that breaks zero-sum, since the
+alpha-potential labelling scores a truncated rally (0, 0).
+
+So the target is one trainer that is this file's structure with that algorithm:
+two parameter sets and alternating phases, plus PPO, a critic, two heads, the
+90-dim joint state, and the pool.  The plan is to re-apply this phase logic on
+top of her ``selfplay_attack_defend.py`` once it is pushed -- the same thin
+layer this file is over ``selfplay_5skill_ad.py``, which it imports
+``play_one_rally`` from rather than reimplementing.  Neither 4.2 nor any
+implementation yet does "only the head corresponding to the active role selects
+an action": all three select all four values and execute the role-relevant
+half, while 3.2 eq (4) defines the action set as 2.
 """
 
 from __future__ import annotations

@@ -117,7 +117,13 @@ def skill_encoding_from_state_dict(state_dict: dict) -> str:
     for encoding in SKILL_ENCODINGS:
         if width == state_dim_for(encoding):
             return encoding
-    raise ValueError(f"Unsupported self-play input width: {width}")
+    raise ValueError(
+        f"Unsupported self-play input width: {width}. This loader only knows "
+        f"the ego-centric contract ({STATE_DIM} linear / {STATE_DIM_ONEHOT} "
+        f"onehot); `encode_joint` below is {STATE_DIM_JOINT}-wide and has no "
+        f"checkpoints yet. A 90-wide checkpoint is attack_defend_joint_v2 and "
+        f"also needs that pipeline's model class (trunk + attack/defend heads "
+        f"+ critic), not MetaPolicy.")
 
 # Public aliases for the one-hot layout. The linear layout uses [74] and [75].
 SKILL_EGO_SLICE = _SKILL_EGO
@@ -221,6 +227,33 @@ def encode_opp(obs: np.ndarray, info: dict, skill_encoding: str = "linear") -> n
 # joint_v1: the four corrections, as one caller-indexed encoder
 # ---------------------------------------------------------------------------
 #
+# Status (2026-10-27).  This is the project's only encoder of ours that carries
+# both robots and the ball, i.e. the only one that can express the policy as
+# Dvij writes it -- pi(s1, s2, b) -- and the only one for which sec 4.2's "the
+# actor receives the same physical information available to the potential-based
+# planner" could be true.  `encode_ego`/`encode_opp` above are ego-only: the
+# opponent's body is absent and so is either player's ready position, so the
+# 84-dim policy is closer to pi(s_i, b, a1, a2) with the skills lagged one
+# exchange.
+#
+# The convergence target is `attack_defend_joint_v2` (90-dim, Angelina), whose
+# layout is known from the input BatchNorm of her pushed Phi weights:
+#
+#     0:18  robot A qpos+qvel     42:56  robot A target + dpos + dquat
+#    18:36  robot B qpos+qvel     56:70  robot B target + dpos + dquat
+#    36:42  ball pos+vel          70:72  attacker one-hot (varies, 50/50)
+#                                 72:74  acting-player one-hot (constant)
+#                                 74:84  two 5-way skill one-hots
+#                                 84:90  two 3-way position one-hots
+#
+# so 124 = 90 + 36 (the prev_actions block below) - 2 (one role pair instead of
+# her two).  Her *code* is not pushed -- only results, weights and launch
+# scripts -- so until it is, this encoder is what we have, and the 36-dim
+# history is the one block to drop when aligning (measured max|v| = 0.039
+# against 0.393 for the joint velocities that are its physical consequence;
+# Kexin's v3 cut the same block to 12 and hers to 0).
+#
+#
 # `encode_ego`/`encode_opp` above are kept untouched so the existing results
 # stay reproducible.  They have four defects, fixed here together because
 # applying only the first makes the strategic picture worse rather than better:
@@ -241,14 +274,19 @@ def encode_opp(obs: np.ndarray, info: dict, skill_encoding: str = "linear") -> n
 #      game needs: "hit where the opponent is not" is unavailable without it.
 #      So both robots' qpos and qvel are included deliberately.
 #
-#   3. Frames.  Player 2's base is rotated 180 degrees, so its raw lateral qpos
-#      carries the opposite sign from world y and its x is reflected about the
-#      table centre.  The ball, meanwhile, was never converted at all -- both
-#      players received the identical world-frame ball.  Everything here is
-#      expressed in the *calling* player's frame, so a given number means the
-#      same physical side regardless of who is acting.  Only the gantry pair is
-#      converted; the seven arm joints are joint coordinates, not positions, and
-#      are left alone (matching v3/state_encoder.py).
+#   3. Frames.  Exactly one quantity in the observation is world-frame: the
+#      ball (`data.body('ball').xpos` and `data.qvel[-6:-3]`).  It was never
+#      converted, so both players received the identical world-frame ball even
+#      though player 2's base is rotated 180 degrees -- a given ball y meant
+#      opposite physical sides to the two of them.  It is converted here.
+#      Everything else -- qpos (gantry included), qvel, prev_actions, and the
+#      racket targets/errors in `info` -- is already expressed in the owning
+#      player's own frame and needs no conversion.  Verified on the model: both
+#      gantries read qpos -0.5 at reset while their rackets sit at world
+#      x = -0.243 and x = +3.243, and driving p2's local +y moves its racket
+#      toward world -y.  So the local coordinate is already frame-canonical and
+#      mirroring it is a category error.  Angelina's 90-dim encoder agrees:
+#      slots 0 and 18 of its input BatchNorm both have mean -0.76.
 #
 #   4. Choice slots were ordered by player id, so slot "ego skill" held player
 #      1's choice in *both* vectors.  Here they are ordered self-then-other.
@@ -295,16 +333,6 @@ def _mirror_xy(x, y):
     return 2.0 * TABLE_SHIFT - x, -y
 
 
-def _mirror_pose(pose):
-    """Reflect a 7-vector [pos(3), quat(4)].  Only x/y of the position move; the
-    quaternion is left alone -- orientation under this reflection is not a
-    rotation, and the targets are consumed as "where the racket is pointed"
-    rather than compared across players."""
-    out = np.array(pose, dtype=np.float32, copy=True)
-    out[0], out[1] = _mirror_xy(out[0], out[1])
-    return out
-
-
 def encode_joint(obs: np.ndarray, info: dict, player: int, *,
                  attacker_id: int, self_pos: str, other_pos: str) -> np.ndarray:
     """124-dim state for `player`, both robots, everything in `player`'s frame.
@@ -317,10 +345,12 @@ def encode_joint(obs: np.ndarray, info: dict, player: int, *,
          the game's premise is "hit where the opponent is not", and the
          opponent's committed racket pose is a finer statement of the incoming
          shot than its five-way skill label.
-      3. Frames.  Player 2's base is rotated 180 degrees, so its raw lateral
-         qpos has the opposite sign from world y and its x is reflected about
-         the table centre; the ball was never converted at all.  Here a given
-         number means the same physical side whoever is acting.
+      3. Frames.  The ball is the only world-frame quantity in the
+         observation, and it was never converted -- so a given ball y meant
+         opposite physical sides to the two players, whose bases are rotated
+         180 degrees from each other.  It is converted here.  qpos (gantry
+         included), qvel, prev_actions and the `info` racket targets are
+         already in the owning player's own frame, so they are passed through.
       4. Choices are ordered self-then-other, and the *defender positions* are
          included.  Those were never in the observation at all, so until now the
          only trace of a preposition was where the gantry had got to -- which
@@ -339,17 +369,18 @@ def encode_joint(obs: np.ndarray, info: dict, player: int, *,
     mirror = (player == 2)          # convert world-frame quantities for p2
     out = np.zeros(STATE_DIM_JOINT, dtype=np.float32)
 
-    # --- robots: own frame as-is; the other player's is always reflected,
-    # because the two players' frames are mirror images of each other.
-    self_qpos = np.asarray(obs[_RAW_QPOS[player]], dtype=np.float32)
-    other_qpos = np.array(obs[_RAW_QPOS[other]], dtype=np.float32, copy=True)
-    other_qvel = np.array(obs[_RAW_QVEL[other]], dtype=np.float32, copy=True)
-    other_qpos[0], other_qpos[1] = _mirror_xy(other_qpos[0], other_qpos[1])
-    other_qvel[0], other_qvel[1] = -other_qvel[0], -other_qvel[1]
-    out[_JGS["self_qpos"]] = self_qpos
+    # --- robots: all nine qpos entries are joint coordinates in the owning
+    # player's own frame -- the gantry rail included, not just the seven arm
+    # joints.  Two symmetric robots read the same qpos, so these slots are
+    # already caller-relative and must be passed through unchanged.  Mirroring
+    # the gantry pair (as this encoder first did) treats a rail coordinate as a
+    # world position: it offsets `other_qpos` by 2*TABLE_SHIFT and so puts the
+    # opponent's gantry around 3.0-3.5 in a slot whose `self_` counterpart
+    # stays inside +/-0.5.
+    out[_JGS["self_qpos"]] = obs[_RAW_QPOS[player]]
     out[_JGS["self_qvel"]] = obs[_RAW_QVEL[player]]
-    out[_JGS["other_qpos"]] = other_qpos
-    out[_JGS["other_qvel"]] = other_qvel
+    out[_JGS["other_qpos"]] = obs[_RAW_QPOS[other]]
+    out[_JGS["other_qvel"]] = obs[_RAW_QVEL[other]]
 
     # --- ball: world frame, so it converts for player 2 only
     bx, by = (_mirror_xy(obs[36], obs[37]) if mirror else (obs[36], obs[37]))
@@ -357,14 +388,14 @@ def encode_joint(obs: np.ndarray, info: dict, player: int, *,
     bvx, bvy = ((-obs[39], -obs[40]) if mirror else (obs[39], obs[40]))
     out[_JGS["ball_vel"]] = (bvx, bvy, float(obs[41]))
 
-    # --- racket tracking, both players.  info's *_opp fields are player 2's.
-    # info's plain keys are player 1's and the *_opp ones player 2's, each in
-    # that player's own frame.  So the same rule as qpos applies: the caller's
-    # own pose needs no conversion and the other player's always does.
+    # --- racket tracking, both players.  info's plain keys are player 1's and
+    # the *_opp ones player 2's, and each is already in that player's own frame
+    # -- `target` reads [0, 0, 0.9] while `target_opp` reads [-0.02, -0.49,
+    # 0.86], both about the owner's own base rather than about the table.  So
+    # neither is mirrored; only the self/other *ordering* is caller-relative.
     key = lambda base, p: (f"{base}_opp" if p == 2 else base)
-    for who, tag, flip in ((player, "self", False), (other, "other", True)):
-        tgt = np.asarray(info[key("target", who)], dtype=np.float32)[:7]
-        out[_JGS[f"{tag}_target"]] = _mirror_pose(tgt) if flip else tgt
+    for who, tag in ((player, "self"), (other, "other")):
+        out[_JGS[f"{tag}_target"]] = np.asarray(info[key("target", who)], dtype=np.float32)[:7]
         out[_JGS[f"{tag}_dpos"]] = np.asarray(info[key("diff_pos", who)], dtype=np.float32)[:3]
         out[_JGS[f"{tag}_dquat"]] = np.asarray(info[key("diff_quat", who)], dtype=np.float32)[:4]
     out[_JGS["self_hist"]] = obs[_RAW_HIST[player]]
