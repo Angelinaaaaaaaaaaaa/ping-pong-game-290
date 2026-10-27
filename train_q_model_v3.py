@@ -198,6 +198,18 @@ def train(
     optimizer_p = torch.optim.Adam(model_p.parameters(), lr=0.001)
 
     # Build four skill-pair variants of the dataset.
+    # This block writes the skill slots by negative index, which is only valid
+    # for the linear encoding, where the two skills are the last two scalars.
+    # Under one-hot they are five slots each, so [:, -2] / [:, -1] would land on
+    # the opponent's last two one-hot bits and corrupt X without raising.
+    from nash_skills.v2.state_encoder import STATE_DIM as _LINEAR_DIM
+    if X.shape[1] != _LINEAR_DIM:
+        raise RuntimeError(
+            f"train_q_model_v3.py indexes the skill slots as X[:, -2] / X[:, -1], "
+            f"which assumes the {_LINEAR_DIM}-dim linear encoding, but the data is "
+            f"{X.shape[1]}-dim. Either re-encode with skill_encoding='linear', or "
+            f"port this file to state_encoder.SKILL_EGO_SLICE / SKILL_OPP_SLICE.")
+
     # 2-skill: left=-1.0, right=+1.0  (matching env's side_target convention)
     # Encoding: obs[-2] = ego skill, obs[-1] = opp skill
     X11 = X.clone(); X11[:,-2] = 1.;  X11[:,-1] = 1.   # right ego, right opp

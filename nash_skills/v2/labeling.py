@@ -98,7 +98,7 @@ def compute_returns(
     Parameters
     ----------
     rally  : list of np.ndarray — crossing states (may be empty)
-    gamma  : float — discount factor (default: GAMMA = 0.9)
+    gamma  : float — discount factor (default: GAMMA = 0.7)
     winner : int   — 1=ego, 2=opp, 0=truncated
 
     Returns

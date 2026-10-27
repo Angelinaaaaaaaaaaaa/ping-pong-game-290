@@ -40,3 +40,4 @@ skill_eval/*.log
 
 =======
 >>>>>>> 3624139 (Add post-evaluation diagnostic rendering)
+logs/*.jsonl
