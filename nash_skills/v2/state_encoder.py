@@ -8,19 +8,27 @@ about game-theoretic skill selection.  This module defines that representation.
 State layout (from ego player's perspective)
 ============================================
 
-The raw 116-dim env obs is:
-  [0:9]       ego qpos (joint positions)
-                qpos[0:2] = gantry (x, y) — base position
-                qpos[2:9] = arm joint angles (7 DOF)
-  [9:18]      ego qvel (joint velocities)
-  [18:27]     opp qpos
-  [27:36]     opp qvel
+The raw 116-dim env obs is concat(qpos[:18], qvel[:18], ...)
+(mujoco_env_comp.py:601/738):
+  [0:9]       ego (P1) qpos   qpos[0:2] = gantry (x, y), qpos[2:9] = arm joints
+  [9:18]      opp (P2) qpos
+  [18:27]     ego (P1) qvel
+  [27:36]     opp (P2) qvel
   [36:39]     ball position (x, y, z)
   [39:42]     ball velocity (vx, vy, vz)
-  [42:78]     ego pose history (HISTORY=4 frames × 9 dims = 36)
-  [78:114]    opp pose history (36)
+  [42:78]     ego low-level action history (HISTORY=4 frames × 9 dims = 36)
+  [78:114]    opp low-level action history (36)
   [114]       ego skill index (normalised, 0.0–1.0)
   [115]       opp skill index (normalised, 0.0–1.0)
+
+KNOWN LAYOUT BUG, kept for checkpoint compatibility: this encoder was written
+for [ego qpos, ego qvel, opp qpos, opp qvel], so the slots below do not hold what
+their names say. encode_ego's "joint velocities" [9:18] are P2's qpos (so P1's
+state has both robots' positions and no velocities); encode_opp's "gantry" and
+"arm joints" [0:9] are P1's qvel (so P2's state has both robots' velocities and
+no positions). Existing checkpoints were trained on this behaviour, so it is
+unchanged; new work should use nash_skills.v2.state_encoder_attack_defend,
+which reads the blocks correctly. scripts/check_obs_layout.py shows it live.
 
 The info dict from env.step() provides:
   diff_pos     (3,)  — ego racket position error to current target
@@ -99,7 +107,7 @@ def encode_ego(obs: np.ndarray, info: dict) -> np.ndarray:
     out = np.zeros(STATE_DIM, dtype=np.float32)
     out[_GANTRY_SLICE] = obs[0:2]       # ego gantry
     out[_ARM_SLICE]    = obs[2:9]       # ego arm joints
-    out[_QVEL_SLICE]   = obs[9:18]      # ego joint velocities
+    out[_QVEL_SLICE]   = obs[9:18]      # labelled ego qvel, actually P2 qpos (see module docstring)
     out[_BALL_POS]     = obs[36:39]     # ball position
     out[_BALL_VEL]     = obs[39:42]     # ball velocity
     out[_DIFF_POS]     = info["diff_pos"]
@@ -129,8 +137,8 @@ def encode_opp(obs: np.ndarray, info: dict) -> np.ndarray:
     (STATE_DIM,) float32
     """
     out = np.zeros(STATE_DIM, dtype=np.float32)
-    out[_GANTRY_SLICE] = obs[18:20]     # opp gantry (qpos[9:11] remapped)
-    out[_ARM_SLICE]    = obs[20:27]     # opp arm joints
+    out[_GANTRY_SLICE] = obs[18:20]     # labelled opp gantry, actually P1 gantry velocity
+    out[_ARM_SLICE]    = obs[20:27]     # labelled opp arm joints, actually P1 arm velocities
     out[_QVEL_SLICE]   = obs[27:36]     # opp joint velocities
     out[_BALL_POS]     = obs[36:39]     # ball position (same ball)
     out[_BALL_VEL]     = obs[39:42]     # ball velocity

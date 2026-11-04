@@ -32,6 +32,28 @@ def _is_truncated(winner) -> bool:
     return winner not in (1, 2)
 
 
+def _validate_rally_schema(rallies: list, source: str) -> None:
+    """
+    Raise ValueError if `rallies` isn't a list of rally dicts.
+
+    Some legacy pickles (e.g. data_new/rallies.pkl) are a flat list of raw
+    state arrays from the old pre-v2 pipeline, not the
+    {'skill1','skill2','states','winner'} dict schema this script expects.
+    Checking only the first entry is enough to catch "wrong file entirely"
+    -- this codebase's own collectors never produce a schema-mixed pickle.
+    Fails fast with a clear message instead of crashing deep inside
+    summarize_overall/build_pair_stats with an opaque AttributeError.
+    """
+    if rallies and not isinstance(rallies[0], dict):
+        raise ValueError(
+            f"{source!r} does not use the expected rally-dict schema "
+            f"(first entry is {type(rallies[0]).__name__}, not dict). "
+            "This looks like a legacy/incompatible pickle format (e.g. a "
+            "flat list of raw state arrays) rather than a list of "
+            "{'skill1','skill2','states','winner'} rally dicts."
+        )
+
+
 def summarize_overall(rallies: list) -> dict:
     """
     Overall decided/truncated counts and truncation rate.
@@ -125,6 +147,7 @@ def main() -> None:
         rallies = pickle.load(f)
 
     print(f"Loaded {len(rallies)} rallies from {args.input}\n")
+    _validate_rally_schema(rallies, args.input)
 
     overall = summarize_overall(rallies)
     print("Overall")

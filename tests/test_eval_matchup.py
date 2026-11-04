@@ -767,5 +767,68 @@ class TestStrategyValidation(unittest.TestCase):
         self.assertNotIn('smash', self.VALID_STRATEGIES)
 
 
+# =========================================================================== #
+# Shared scorecard integration (meeting note item 19)                         #
+# =========================================================================== #
+
+class TestScorecardIntegration(unittest.TestCase):
+    """
+    eval_matchup.py should be able to feed a MatchupResult into the shared
+    nash_skills/v2/scorecard.py module so its output includes the full
+    metric set (median rally length, skill entropy, dominant fraction) that
+    the ad hoc CSV/print_summary columns don't cover on their own.
+    """
+
+    def setUp(self):
+        m = _import_eval()
+        if m is None:
+            self.skipTest("nash_skills/eval_matchup.py not yet created")
+        self.m = m
+        self.MatchupResult = m.MatchupResult
+
+    def _result(self, **overrides):
+        defaults = dict(
+            strategy1='nash-p-hard', strategy2='random',
+            episodes=8, ego_wins=6, opp_wins=2,
+            ego_contacts=20, opp_contacts=18,
+            ego_successes=15, opp_successes=10,
+            rally_lengths=[3, 4, 5, 6, 7, 8, 9, 10],
+            truncated_episodes=2,
+            skill_usage={'left': 5, 'right': 1, 'center_safe': 1,
+                         'left_short': 1, 'right_short': 0},
+        )
+        defaults.update(overrides)
+        return self.MatchupResult(**defaults)
+
+    def test_matchup_scorecard_returns_full_metric_set(self):
+        r = self._result()
+        sc = self.m.matchup_scorecard(r)
+        self.assertAlmostEqual(sc['win_rate'], 6 / 8)
+        self.assertEqual(sc['truncated'], 2)
+        self.assertIn('median_rally_length', sc)
+        self.assertIn('skill_entropy_normalized', sc)
+        self.assertIn('dominant_skill_fraction', sc)
+
+    def test_matchup_scorecard_uses_skill_usage(self):
+        r = self._result(skill_usage={'left': 10, 'right': 0, 'center_safe': 0,
+                                       'left_short': 0, 'right_short': 0})
+        sc = self.m.matchup_scorecard(r)
+        self.assertEqual(sc['dominant_skill'], 'left')
+        self.assertAlmostEqual(sc['dominant_skill_fraction'], 1.0)
+
+    def test_print_full_scorecards_runs_without_error(self):
+        results = [self._result(), self._result(strategy2='left')]
+        buf = io.StringIO()
+        self.m.print_full_scorecards(results, file=buf)
+        output = buf.getvalue()
+        self.assertIn('random', output)
+        self.assertIn('left', output)
+        self.assertIn('win_rate', output)
+
+    def test_print_full_scorecards_handles_empty_list(self):
+        buf = io.StringIO()
+        self.m.print_full_scorecards([], file=buf)  # should not raise
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

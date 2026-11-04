@@ -1,0 +1,51 @@
+{
+  "profile": "moderate_aggressive",
+  "ppo": "logs/best_model_tracker2/best_model",
+  "ppo_md5": "db5df579165070c7db59481776221bc2",
+  "args": {
+    "ppo": "logs/best_model_tracker2/best_model",
+    "profile": "moderate_aggressive",
+    "rallies": 30,
+    "max_steps": 1500,
+    "max_track_err": 0.05,
+    "seed": 0,
+    "output": "analysis/prep_pose_calibration/moderate_aggressive.json"
+  },
+  "summary": {
+    "left": {
+      "x": -0.28888888888888875,
+      "y": 0.7916162045710403,
+      "z": 0.8037985285845872,
+      "n": 523,
+      "y_iqr": [
+        0.7605607262222782,
+        0.8249485503411429
+      ]
+    },
+    "center": {
+      "x": -0.13333333333333322,
+      "y": 0.12366041941455522,
+      "z": 0.80368133555231,
+      "n": 690,
+      "y_iqr": [
+        0.0952528388574472,
+        0.1532874069159474
+      ]
+    },
+    "right": {
+      "x": -0.19999999999999998,
+      "y": -0.8717808724269206,
+      "z": 0.837984803794562,
+      "n": 324,
+      "y_iqr": [
+        -0.9245198481745689,
+        -0.7818483182826903
+      ]
+    },
+    "shared": {
+      "x": -0.16666666666666666,
+      "z": 0.809947446944292
+    },
+    "n_dropped": 0
+  }
+}

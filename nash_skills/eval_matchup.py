@@ -35,6 +35,8 @@ import torch
 
 from nash_skills.skills import SKILL_NAMES, SKILL_PROFILE_NAMES, N_SKILLS, skill_index, skill_from_index
 from nash_skills.winner_inference import infer_terminal_winner
+from nash_skills.v2.state_encoder_one_hot import STATE_DIM_ONE_HOT
+from nash_skills.v2.scorecard import compute_scorecard, format_scorecard
 from diagnostic_rendering import (
     EpisodeVideoRecorder,
     encode_np_random_state,
@@ -501,6 +503,52 @@ def _initial_skill_idx(name: str, fallback: int = 0) -> int:
 # Strategy picker
 # --------------------------------------------------------------------------- #
 
+def _write_skill_pair(state_tensor, ego_skill_idx: int, opp_skill_idx: int):
+    """
+    Return a NEW tensor (never mutates the input) with a counterfactual
+    (ego_skill, opp_skill) pair written into the correct skill-identity
+    slot(s), auto-detected from the tensor's own last dimension.
+
+    Every nash-p-*/ibr/ibr-q decision rule needs to ask "what would Phi/Q
+    be if the players had committed to THIS skill pair instead" -- which
+    means taking the current encoded state and overwriting just its
+    skill-identity portion. The original code did this with a single,
+    unconditional pair of writes:
+
+        x[-2] = ego_skill_idx / (N_SKILLS - 1)
+        x[-1] = opp_skill_idx / (N_SKILLS - 1)
+
+    That is correct for the 76-dim encoded state
+    (nash_skills.v2.state_encoder) AND the raw 116-dim observation (both
+    end with exactly this scalar convention at [-2]/[-1] -- see
+    state_encoder.py's docstring: raw obs [114]/[115] are the same
+    normalised scalar skill indices). It is WRONG for the one-hot 84-dim
+    encoded state (nash_skills.v2.state_encoder_one_hot), where [-2]/[-1]
+    are just 2 of a player's 5-dim one-hot block at [-10:-5] (ego) /
+    [-5:] (opp) -- writing a fraction into 2 of those 5 slots while
+    leaving the other 3 untouched there produces a state that is neither
+    valid one-hot nor valid scalar, corrupting every counterfactual query
+    built this way.
+
+    Dimension 84 (STATE_DIM_ONE_HOT) gets the one-hot-correct treatment
+    (zero each player's full block, then set exactly one index). Every
+    other dimension -- in particular 76 and 116, the two the rest of
+    this file already depends on -- falls through to the ORIGINAL scalar
+    behavior unchanged, so this is purely additive: nothing about
+    existing legacy-encoder or raw-obs evaluation changes.
+    """
+    out = state_tensor.clone()
+    if out.shape[-1] == STATE_DIM_ONE_HOT:
+        out[..., -10:-5] = 0.0
+        out[..., -10 + ego_skill_idx] = 1.0
+        out[..., -5:] = 0.0
+        out[..., -5 + opp_skill_idx] = 1.0
+    else:
+        out[..., -2] = ego_skill_idx / (N_SKILLS - 1)
+        out[..., -1] = opp_skill_idx / (N_SKILLS - 1)
+    return out
+
+
 def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
     """
     Evaluate Φ(s, p1_skill, p2_skill) for all N×N skill pairs.
@@ -523,9 +571,7 @@ def _build_phi_table(obs_vec, info, player, model_p, state_encoder_fn):
     for ego_s in range(N_SKILLS):
         for opp_s in range(N_SKILLS):
             base = torch.tensor(base_vec, dtype=torch.float32)
-            base[-2] = ego_s / (N_SKILLS - 1)
-            base[-1] = opp_s / (N_SKILLS - 1)
-            rows.append(base)
+            rows.append(_write_skill_pair(base, ego_s, opp_s))
     batch = torch.stack(rows)                    # (N*N, state_dim)
     with torch.no_grad():
         vals = model_p(batch)[:, 0]              # (N*N,)
@@ -544,13 +590,11 @@ def _q_values_for_player(base_enc, player: int, other_skill_idx: int, model1, mo
     model = model1 if player == 1 else model2
     values = []
     for candidate in range(N_SKILLS):
-        x = torch.tensor(base_enc, dtype=torch.float32).clone().unsqueeze(0)
+        x = torch.tensor(base_enc, dtype=torch.float32).unsqueeze(0)
         if player == 1:
-            x[0, -2] = candidate / (N_SKILLS - 1)
-            x[0, -1] = other_skill_idx / (N_SKILLS - 1)
+            x = _write_skill_pair(x, candidate, other_skill_idx)
         else:
-            x[0, -2] = other_skill_idx / (N_SKILLS - 1)
-            x[0, -1] = candidate / (N_SKILLS - 1)
+            x = _write_skill_pair(x, other_skill_idx, candidate)
         with torch.no_grad():
             values.append(float(model(x).item()))
     return values
@@ -561,13 +605,11 @@ def _phi_values_for_player(base_enc, player: int, other_skill_idx: int, model_p)
         return []
     rows = []
     for candidate in range(N_SKILLS):
-        x = torch.tensor(base_enc, dtype=torch.float32).clone()
+        x = torch.tensor(base_enc, dtype=torch.float32)
         if player == 1:
-            x[-2] = candidate / (N_SKILLS - 1)
-            x[-1] = other_skill_idx / (N_SKILLS - 1)
+            x = _write_skill_pair(x, candidate, other_skill_idx)
         else:
-            x[-2] = other_skill_idx / (N_SKILLS - 1)
-            x[-1] = candidate / (N_SKILLS - 1)
+            x = _write_skill_pair(x, other_skill_idx, candidate)
         rows.append(x)
     with torch.no_grad():
         return _float_list(model_p(torch.stack(rows))[:, 0])
@@ -613,13 +655,11 @@ def _policy_action_values(
         for candidate in range(N_SKILLS):
             val = 0.0
             for opp_s, prob in enumerate(mix):
-                x = torch.tensor(base_enc, dtype=torch.float32).clone().unsqueeze(0)
+                x = torch.tensor(base_enc, dtype=torch.float32).unsqueeze(0)
                 if player == 1:
-                    x[0, -2] = candidate / (N_SKILLS - 1)
-                    x[0, -1] = opp_s / (N_SKILLS - 1)
+                    x = _write_skill_pair(x, candidate, opp_s)
                 else:
-                    x[0, -2] = opp_s / (N_SKILLS - 1)
-                    x[0, -1] = candidate / (N_SKILLS - 1)
+                    x = _write_skill_pair(x, opp_s, candidate)
                 with torch.no_grad():
                     val += float(prob) * float(q_model(x).item())
             values.append(val)
@@ -947,9 +987,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 # Ego best-responds to s2 using Q1
                 q1_vals = []
                 for ego_s in range(N_SKILLS):
-                    x = base_enc.clone().unsqueeze(0)
-                    x[0, -2] = ego_s / (N_SKILLS - 1)
-                    x[0, -1] = s2    / (N_SKILLS - 1)
+                    x = _write_skill_pair(base_enc.unsqueeze(0), ego_s, s2)
                     with torch.no_grad():
                         q1_vals.append(model1(x).item())
                 s1 = int(np.argmax(q1_vals))
@@ -958,9 +996,7 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
                 # discounted utility target.
                 q2_vals = []
                 for opp_s in range(N_SKILLS):
-                    x = base_enc.clone().unsqueeze(0)
-                    x[0, -2] = s1    / (N_SKILLS - 1)
-                    x[0, -1] = opp_s / (N_SKILLS - 1)
+                    x = _write_skill_pair(base_enc.unsqueeze(0), s1, opp_s)
                     with torch.no_grad():
                         q2_vals.append(model2(x).item())
                 s2 = int(np.argmax(q2_vals))
@@ -995,13 +1031,11 @@ def make_picker(strategy: str, model_p, state_encoder_fn=None,
             for ego_s in range(N_SKILLS):
                 val = 0.0
                 for opp_s in range(N_SKILLS):
-                    x = base_enc.clone().unsqueeze(0)
+                    base = base_enc.unsqueeze(0)
                     if player == 1:
-                        x[0, -2] = ego_s / (N_SKILLS - 1)
-                        x[0, -1] = opp_s / (N_SKILLS - 1)
+                        x = _write_skill_pair(base, ego_s, opp_s)
                     else:
-                        x[0, -2] = opp_s / (N_SKILLS - 1)
-                        x[0, -1] = ego_s / (N_SKILLS - 1)
+                        x = _write_skill_pair(base, opp_s, ego_s)
                     with torch.no_grad():
                         val += opp_mix[opp_s] * q_model(x).item()
                 ego_vals.append(val)
@@ -1705,6 +1739,36 @@ def dominant_skill_fraction(result: MatchupResult) -> Optional[float]:
         return None
 
     return max(result.skill_usage.values()) / total
+
+
+# --------------------------------------------------------------------------- #
+# Shared scorecard (nash_skills/v2/scorecard.py, meeting note item 19)         #
+# --------------------------------------------------------------------------- #
+
+def matchup_scorecard(result: MatchupResult) -> dict:
+    """
+    Adapt a MatchupResult into the shared scorecard metric set: adds median
+    rally length, skill-usage entropy, and dominant-skill fraction on top of
+    what print_summary/save_csv already report.
+    """
+    return compute_scorecard(
+        wins=result.ego_wins,
+        losses=result.opp_wins,
+        truncated=result.truncated_episodes,
+        rally_lengths=result.rally_lengths,
+        skill_usage=result.skill_usage,
+    )
+
+
+def print_full_scorecards(results: List[MatchupResult], file=None) -> None:
+    """Print the full shared scorecard for every matchup result, one block each."""
+    if file is None:
+        file = sys.stdout
+    for r in results:
+        label = f"{r.strategy1} vs {r.strategy2}"
+        sc = matchup_scorecard(r)
+        print(format_scorecard(sc, label=label), file=file)
+        print(file=file)
 
 
 # --------------------------------------------------------------------------- #

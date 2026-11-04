@@ -62,6 +62,9 @@ import numpy as np
 from diagnostic_fixed_skill import build_ppo_obs
 from nash_skills.skills import SKILL_NAMES, SKILL_PROFILE_NAMES
 from nash_skills.v2.state_encoder import encode_ego
+from nash_skills.v2.state_encoder_one_hot import encode_ego as encode_ego_one_hot
+
+ENCODER_CHOICES = ("legacy", "one_hot")
 from nash_skills.v2.labeling import detect_winner, summarise_balance, check_balance
 
 PPO = None
@@ -312,12 +315,29 @@ def collect(
     seed: int = 0,
     quiet: bool = False,
     accepted_progress_callback=None,
+    encoder: str = "legacy",
 ) -> list:
     """
     Collect `target_rallies` complete rallies for each of the 25 skill pairs.
 
+    `encoder` selects which state encoder's encode_ego() produces the
+    saved "states" field: "legacy" (default) is the original 76-dim
+    nash_skills.v2.state_encoder, unchanged; "one_hot" is the new, separate
+    84-dim nash_skills.v2.state_encoder_one_hot (one-hot skill identity
+    instead of a scalar index). This does not change anything else about
+    collection -- same grid/retry/balance logic, same PPO controller,
+    same physics. The two encoders are NOT interchangeable after the
+    fact: the raw_obs saved alongside "states" does not carry the info
+    dict fields (diff_pos/diff_quat/target) either encoder also needs, so
+    a pickle collected with one encoder cannot be re-encoded into the
+    other without recollecting.
+
     Returns the full list of rally dicts (also saved to output_path).
     """
+    if encoder not in ENCODER_CHOICES:
+        raise ValueError(f"Unknown encoder '{encoder}'. Choose from: {ENCODER_CHOICES}")
+    encode_fn = encode_ego if encoder == "legacy" else encode_ego_one_hot
+
     global SkillEnv
     if SkillEnv is None:
         from nash_skills.env_wrapper import SkillEnv as _SkillEnv
@@ -387,7 +407,7 @@ def collect(
                     steps_this_combo += 1
 
                     if (prev_ball_x - 1.5) * (curr_ball_x - 1.5) < 0:
-                        curr_states.append(encode_ego(obs, info))
+                        curr_states.append(encode_fn(obs, info))
                         curr_raw.append(obs.copy())
                         curr_skill_pairs.append((skill1, skill2))
                         skill1, skill2 = next_skill_pair(mode, setting, rng, (skill1, skill2))
@@ -415,6 +435,7 @@ def collect(
                         "states": curr_states,
                         "raw_obs": curr_raw,
                         "winner": winner,
+                        "encoder": encoder,
                     })
                     completed += 1
                     accepted = True
@@ -649,6 +670,9 @@ if __name__ == "__main__":
                         help="Gantry movement speed multiplier")
     parser.add_argument("--seed", type=int, default=0,
                         help="Seed used for deterministic high-level skill sampling")
+    parser.add_argument("--encoder", choices=ENCODER_CHOICES, default="legacy",
+                        help="State encoder for the saved 'states' field: 'legacy' (76-dim, "
+                             "default, unchanged) or 'one_hot' (84-dim, new, separate)")
     args = parser.parse_args()
 
     collect(
@@ -665,4 +689,5 @@ if __name__ == "__main__":
         skill_profile=args.skill_profile,
         gantry_speed_scale=args.gantry_speed_scale,
         seed=args.seed,
+        encoder=args.encoder,
     )
