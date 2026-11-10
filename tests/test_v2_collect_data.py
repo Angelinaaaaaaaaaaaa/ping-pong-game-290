@@ -146,7 +146,8 @@ def test_collect_passes_env_options_and_aligns_skill_pairs(tmp_path, monkeypatch
     assert len(rallies) == 1
     rally = rallies[0]
     assert len(rally["states"]) == len(rally["skill_pairs"]) == 1
-    assert set(rally) == {"skill1", "skill2", "skill_pairs", "states", "raw_obs", "winner"}
+    assert set(rally) == {"skill1", "skill2", "skill_pairs", "states", "raw_obs", "winner", "encoder"}
+    assert rally["encoder"] == "legacy"  # default; collect() wasn't given encoder=
     assert rally["skill_pairs"][0][0] == "left"
     assert rally["states"][0][-2] == _skill_value(rally["skill_pairs"][0][0])
     assert rally["states"][0][-1] == _skill_value(rally["skill_pairs"][0][1])
@@ -167,6 +168,80 @@ def test_collect_passes_env_options_and_aligns_skill_pairs(tmp_path, monkeypatch
     assert attempt["accepted"] is True
     assert attempt["discard_reason"] == ""
     assert attempt["winner"] == 1
+
+
+def test_collect_with_one_hot_encoder_produces_84_dim_tagged_states(tmp_path, monkeypatch):
+    """
+    collect(encoder="one_hot") must use nash_skills.v2.state_encoder_one_hot
+    instead of the legacy encoder -- producing 84-dim states (not 76) and
+    tagging each rally with which encoder made it, so a pickle's
+    provenance is never ambiguous. Does not touch the legacy path at all
+    (test_collect_passes_env_options_and_aligns_skill_pairs above already
+    pins that the default stays "legacy" / 76-dim).
+    """
+    class FakeEnv:
+        def __init__(self, proc_id, history, reset_mode, skill_profile, gantry_speed_scale):
+            self.skill1 = "left"
+            self.skill2 = "right"
+
+        def set_skills(self, skill1, skill2):
+            self.skill1 = skill1
+            self.skill2 = skill2
+
+        def reset(self):
+            return _obs(1.0, self.skill1, self.skill2), _info()
+
+        def step(self, _action):
+            info = _info()
+            info["winner"] = "ego"
+            return _obs(2.0, self.skill1, self.skill2), 0.0, True, False, info
+
+        def close(self):
+            pass
+
+    class FakeModel:
+        def predict(self, _obs, deterministic=True):
+            return np.zeros(9, dtype=np.float32), None
+
+    class FakePPO:
+        @staticmethod
+        def load(_path):
+            return FakeModel()
+
+    monkeypatch.setattr(collect, "SkillEnv", FakeEnv)
+    monkeypatch.setattr(collect, "PPO", FakePPO)
+    monkeypatch.setattr(collect, "detect_winner", lambda _raw, done, info=None: 1 if done else 0)
+
+    output = tmp_path / "rallies_one_hot.pkl"
+    rallies = collect.collect(
+        target_rallies=1,
+        output_path=str(output),
+        ppo_path="fake",
+        max_steps_per_episode=5,
+        max_attempts_per_pair=1,
+        progress_every=0,
+        mode="fixed_random",
+        fixed_player=1,
+        fixed_skill="left",
+        encoder="one_hot",
+    )
+
+    rally = rallies[0]
+    assert rally["encoder"] == "one_hot"
+    assert rally["states"][0].shape == (84,)
+    ego_skill, opp_skill = rally["skill_pairs"][0]
+    assert rally["states"][0][74:79].argmax() == skill_index(ego_skill)
+    assert rally["states"][0][79:84].argmax() == skill_index(opp_skill)
+
+
+def test_collect_rejects_unknown_encoder(tmp_path, monkeypatch):
+    monkeypatch.setattr(collect, "SkillEnv", lambda **_kw: None)
+    monkeypatch.setattr(collect, "PPO", type("P", (), {"load": staticmethod(lambda _p: None)}))
+    try:
+        collect.collect(output_path=str(tmp_path / "x.pkl"), encoder="bogus")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "bogus" in str(e)
 
 
 def test_training_grouping_prefers_skill_pairs_over_rally_level_skills():

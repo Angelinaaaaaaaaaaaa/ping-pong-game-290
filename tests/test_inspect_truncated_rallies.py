@@ -8,9 +8,12 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import pytest
+
 from nash_skills.v2.inspect_truncated_rallies import (
     build_pair_stats,
     summarize_overall,
+    _validate_rally_schema,
 )
 
 
@@ -110,3 +113,21 @@ class TestBuildPairStats:
 
     def test_empty_rallies_returns_empty_list(self):
         assert build_pair_stats([]) == []
+
+
+class TestValidateRallySchema:
+    def test_accepts_dict_entries(self):
+        _validate_rally_schema([_rally("left", "right", 1, 5)], "some_file.pkl")
+
+    def test_rejects_non_dict_first_entry(self):
+        import numpy as np
+        rallies = [np.zeros(116, dtype=np.float32)]
+        with pytest.raises(ValueError, match="rally-dict schema"):
+            _validate_rally_schema(rallies, "rallies.pkl")
+
+    def test_error_message_includes_source(self):
+        with pytest.raises(ValueError, match="rallies.pkl"):
+            _validate_rally_schema([[1, 2, 3]], "rallies.pkl")
+
+    def test_empty_list_does_not_raise(self):
+        _validate_rally_schema([], "empty.pkl")

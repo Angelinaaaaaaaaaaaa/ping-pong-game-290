@@ -43,6 +43,28 @@ _DEFAULT_RALLIES = "data/rallies_5skill_v2.pkl"
 _DEFAULT_MODEL   = "models/model_p_5skill_v3.pth"
 
 
+def _validate_rally_schema(rallies: list, source: str) -> None:
+    """
+    Raise ValueError if `rallies` isn't a list of rally dicts.
+
+    Some legacy pickles (e.g. data_new/rallies.pkl) are a flat list of raw
+    state arrays from the old pre-v2 pipeline, not the
+    {'skill1','skill2','states','winner'} dict schema this script expects.
+    Checking only the first entry is enough to catch "wrong file entirely"
+    -- this codebase's own collectors never produce a schema-mixed pickle.
+    Fails fast with a clear message instead of crashing deep inside the
+    sampling loop with an opaque AttributeError.
+    """
+    if rallies and not isinstance(rallies[0], dict):
+        raise ValueError(
+            f"{source!r} does not use the expected rally-dict schema "
+            f"(first entry is {type(rallies[0]).__name__}, not dict). "
+            "This looks like a legacy/incompatible pickle format (e.g. a "
+            "flat list of raw state arrays) rather than a list of "
+            "{'skill1','skill2','states','winner'} rally dicts."
+        )
+
+
 def _load_model(model_path: str):
     """Load SimpleModel potential — returns (model, state_dim) or None on failure.
 
@@ -222,6 +244,7 @@ def main() -> None:
     with open(rally_path, "rb") as f:
         rallies = pickle.load(f)
     print(f"\nLoaded {len(rallies)} rallies from {args.rallies}")
+    _validate_rally_schema(rallies, args.rallies)
 
     # Collect encoded states from rallies — match the model's detected state_dim
     states = []

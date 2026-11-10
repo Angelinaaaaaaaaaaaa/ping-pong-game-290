@@ -62,6 +62,28 @@ def _is_truncated(winner) -> bool:
     return winner not in (1, 2)
 
 
+def _validate_rally_schema(rallies: list, source: str) -> None:
+    """
+    Raise ValueError if `rallies` isn't a list of rally dicts.
+
+    Some legacy pickles (e.g. data_new/rallies.pkl) are a flat list of raw
+    state arrays from the old pre-v2 pipeline, not the
+    {'skill1','skill2','states','winner'} dict schema this script expects.
+    Checking only the first entry is enough to catch "wrong file entirely"
+    -- this codebase's own collectors never produce a schema-mixed pickle.
+    Fails fast with a clear message instead of crashing deep inside
+    apply_discard/apply_tie0/apply_asym_small with an opaque AttributeError.
+    """
+    if rallies and not isinstance(rallies[0], dict):
+        raise ValueError(
+            f"{source!r} does not use the expected rally-dict schema "
+            f"(first entry is {type(rallies[0]).__name__}, not dict). "
+            "This looks like a legacy/incompatible pickle format (e.g. a "
+            "flat list of raw state arrays) rather than a list of "
+            "{'skill1','skill2','states','winner'} rally dicts."
+        )
+
+
 def apply_discard(rallies: list) -> list:
     """Remove truncated/undecided rallies. Does not mutate the input list."""
     return [r for r in rallies if not _is_truncated(r.get("winner"))]
@@ -145,6 +167,7 @@ def main() -> None:
     with open(input_path, "rb") as f:
         rallies = pickle.load(f)
     print(f"Loaded {len(rallies)} rallies from {args.input}")
+    _validate_rally_schema(rallies, args.input)
     print("NOTE: outputs are prepared datasets for future retraining, not evaluated results.\n")
 
     for mode in args.modes:

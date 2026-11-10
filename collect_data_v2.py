@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import argparse
 import itertools
 import pickle as pkl
+from typing import Optional
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -105,9 +106,16 @@ def collect(
     target_rallies: int = TARGET_RALLIES,
     output_path: str = DEFAULT_OUTPUT,
     ppo_path: str = PPO_MODEL_PATH,
+    max_attempts_per_pair: Optional[int] = None,
 ) -> list:
     """
     Collect `target_rallies` complete rallies for each of the 4 skill pairs.
+
+    max_attempts_per_pair is an optional safety cap: stop retrying a skill
+    pair after this many attempts even if target_rallies hasn't been
+    reached. Default None preserves the original unbounded-retry behavior
+    (no silent under-collection), but a skill pair that never produces a
+    decisive rally will then retry forever -- pass a cap to bound that.
 
     Returns the full list of rally dicts (also saved to output_path).
     """
@@ -122,6 +130,7 @@ def collect(
         obs, info = env.reset()
 
         completed        = 0
+        attempts         = 0
         steps_this_combo = 0
         prev_ball_x      = obs[36]
 
@@ -130,7 +139,9 @@ def collect(
         curr_raw    = []   # raw obs (116-dim)
         steps_in_ep = 0
 
-        while completed < target_rallies:
+        while completed < target_rallies and (
+            max_attempts_per_pair is None or attempts < max_attempts_per_pair
+        ):
             # Build PPO obs for each player and act
             ppo1 = _build_ppo_obs(obs, info, player=1)
             ppo2 = _build_ppo_obs(obs, info, player=2)
@@ -158,6 +169,7 @@ def collect(
 
             # Episode ended with a real done signal → winner is known
             if done:
+                attempts += 1
                 winner = detect_winner(curr_raw + [obs.copy()], done=True, info=info)
                 if len(curr_states) > 0 and winner in (1, 2):
                     all_rallies.append({
@@ -182,6 +194,7 @@ def collect(
 
             # Step cap hit without done → discard this episode silently and reset
             elif steps_in_ep >= MAX_STEPS_PER_EPISODE:
+                attempts += 1
                 curr_states = []
                 curr_raw    = []
                 steps_in_ep = 0
@@ -189,8 +202,12 @@ def collect(
                 obs, info = env.reset()
                 prev_ball_x = obs[36]
 
+        if completed < target_rallies:
+            print(f"  WARNING: stopped at {attempts} attempts with only "
+                  f"{completed}/{target_rallies} rallies for ego={skill1} opp={skill2} "
+                  f"(max_attempts_per_pair={max_attempts_per_pair})")
         print(f"  Done: {completed} rallies collected "
-              f"({steps_this_combo} total steps)")
+              f"({steps_this_combo} total steps, {attempts} attempts)")
 
     env.close()
 
@@ -226,10 +243,13 @@ if __name__ == "__main__":
                         help=f"Output pickle path (default: {DEFAULT_OUTPUT})")
     parser.add_argument("--ppo",     type=str, default=PPO_MODEL_PATH,
                         help="Path to PPO model checkpoint")
+    parser.add_argument("--max-attempts-per-pair", type=int, default=None,
+                        help="Stop each skill pair after this many attempts, even if target rallies are not reached")
     args = parser.parse_args()
 
     collect(
         target_rallies=args.rallies,
         output_path=args.output,
         ppo_path=args.ppo,
+        max_attempts_per_pair=args.max_attempts_per_pair,
     )

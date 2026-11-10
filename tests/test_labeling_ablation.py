@@ -15,6 +15,7 @@ from nash_skills.v2.labeling_ablation import (
     apply_tie0,
     apply_asym_small,
     MissingInitiatorFieldError,
+    _validate_rally_schema,
 )
 
 
@@ -107,3 +108,21 @@ class TestApplyAsymSmall:
         rallies = [_rally(1, initiator=1)]
         result = apply_asym_small(rallies)
         assert result[0]["winner"] == 1
+
+
+class TestValidateRallySchema:
+    def test_accepts_dict_entries(self):
+        _validate_rally_schema([_rally(1)], "some_file.pkl")
+
+    def test_rejects_non_dict_first_entry(self):
+        import numpy as np
+        rallies = [np.zeros(116, dtype=np.float32)]
+        with pytest.raises(ValueError, match="rally-dict schema"):
+            _validate_rally_schema(rallies, "rallies.pkl")
+
+    def test_error_message_includes_source(self):
+        with pytest.raises(ValueError, match="rallies.pkl"):
+            _validate_rally_schema([[1, 2, 3]], "rallies.pkl")
+
+    def test_empty_list_does_not_raise(self):
+        _validate_rally_schema([], "empty.pkl")
