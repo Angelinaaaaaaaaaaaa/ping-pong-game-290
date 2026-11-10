@@ -77,10 +77,15 @@ def _compare_settings(source, found, settings):
             raise ValueError(f"{source} was made with {key}={got!r}, but this evaluation uses {key}={want!r}")
 
 
-def check_model_settings(model_dir, settings):
+def check_model_settings(model_dir, settings, allow_timing_transfer=False):
     """Phi/Q must come from data collected under the evaluation's mechanism, timing and profile."""
     with open(os.path.join(model_dir, "heldout_attack_defend.json")) as f:
-        _compare_settings(model_dir, json.load(f), settings)
+        found = json.load(f)
+    checked = {k: v for k, v in settings.items() if not (allow_timing_transfer and k == "decision_timing")}
+    _compare_settings(model_dir, found, checked)
+    return {"training_timing": found.get("decision_timing", "crossing"),
+            "evaluation_timing": settings["decision_timing"],
+            "timing_transfer": found.get("decision_timing", "crossing") != settings["decision_timing"]}
 
 
 def check_selfplay_settings(spec, settings):
@@ -89,6 +94,8 @@ def check_selfplay_settings(spec, settings):
     path = spec.split(":", 1)[1]
     with open(path + ".json") as f:
         meta = json.load(f)
+    if settings['decision_timing'] == 'crossing' and meta.get('decision_clock_version') != 'kexin_net_crossing_v1':
+        raise ValueError('Crossing self-play evaluation requires a kexin_net_crossing_v1 checkpoint')
     # Legacy shared-actor checkpoints never recorded their mechanism.
     checked = {k: v for k, v in settings.items() if k in meta or k != "defend_mechanism"}
     _compare_settings(path, meta, checked)
@@ -277,13 +284,16 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 2))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output", required=True)
+    ap.add_argument("--allow-reference-timing-transfer", action="store_true",
+                    help="Explicitly evaluate frozen Q/Phi trained at another timing; preserve and report provenance")
     args = ap.parse_args()
 
     settings = {"defend_mechanism": args.defend_mechanism, "decision_timing": args.decision_timing,
                 "skill_profile": args.skill_profile}
+    reference_protocol = None
     if args.model_dir is not None:
         check_model_encoder(args.model_dir)
-        check_model_settings(args.model_dir, settings)
+        reference_protocol = check_model_settings(args.model_dir, settings, args.allow_reference_timing_transfer)
     opponents = expand_opponents(args.opponents)
     for spec in [args.method] + opponents:
         check_selfplay_settings(spec, settings)
@@ -304,6 +314,8 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     with open(args.output, "w") as f:
         json.dump({"args": vars(args), "settings": settings, "ibr_config": ibr_config,
+                   "decision_clock_version": "kexin_net_crossing_v1" if args.decision_timing == "crossing" else "contact_v1",
+                   "reference_protocol": reference_protocol,
                    "summary": summary, "rows": rows}, f)
     print_table(args.method, summary)
     t = summary["timing"]

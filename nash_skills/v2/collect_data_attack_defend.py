@@ -351,7 +351,7 @@ def collect(
         curr_defending_player = []
 
         curr_attacker = []
-        clock.reset()
+        clock.reset(env, obs)
         prev_defending_player = env._role_tracker.defending_player
         steps = 0
         done = False
@@ -375,7 +375,7 @@ def collect(
             steps += 1
 
             defending_player = env._role_tracker.defending_player
-            attacker = clock.update(env)
+            attacker = clock.update(env, obs) if not (done and decision_timing == "crossing") else None
             if attacker is not None:
                 # A decision just concluded: record the state against the
                 # choices that were active during it, then resample fresh

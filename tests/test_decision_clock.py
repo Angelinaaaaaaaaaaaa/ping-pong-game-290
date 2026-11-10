@@ -18,6 +18,7 @@ class _RoleTracker:
 class _Data:
     def __init__(self):
         self.qvel = np.zeros(24)
+        self.qpos = np.zeros(25)
 
 
 class _Inner:
@@ -73,15 +74,44 @@ class TestContactTiming:
 
 
 class TestCrossingTiming:
-    def test_fires_when_the_role_tracker_changes_with_its_receiver_as_attacker(self):
+    @staticmethod
+    def obs(x):
+        obs = np.zeros(116)
+        obs[36] = x
+        return obs
+
+    def test_no_initial_velocity_or_tracker_latch(self):
         env, clock = FakeEnv(), DecisionClock("crossing")
-        clock.reset()
-        assert clock.update(env) is None
-        env._role_tracker.defending_player = 2  # legacy name: the player the ball heads to
+        clock.reset(env, self.obs(0.15))
+        env.ball_vel_x(4.0)
+        env._role_tracker.defending_player = 2
+        assert clock.update(env, self.obs(0.20)) is None
+
+    def test_fires_on_crossing_step_in_both_directions(self):
+        env, clock = FakeEnv(), DecisionClock("crossing")
+        clock.reset(env, self.obs(1.49))
+        assert clock.update(env, self.obs(1.51)) == 2
+        assert clock.update(env, self.obs(1.60)) is None
+        assert clock.update(env, self.obs(1.49)) == 1
+
+    def test_exact_plane_endpoints_follow_kexin_strict_rule(self):
+        env, clock = FakeEnv(), DecisionClock("crossing")
+        clock.reset(env, self.obs(1.49))
+        assert clock.update(env, self.obs(1.5)) is None
+        assert clock.update(env, self.obs(1.51)) is None
+
+    def test_reset_does_not_reuse_previous_rally_position(self):
+        env, clock = FakeEnv(), DecisionClock("crossing")
+        clock.reset(env, self.obs(1.6))
+        clock.reset(env, self.obs(0.2))
+        assert clock.update(env, self.obs(0.3)) is None
+
+    def test_raw_position_fallback(self):
+        env, clock = FakeEnv(), DecisionClock("crossing")
+        env._env.data.qpos[-7] = 1.49
+        clock.reset(env)
+        env._env.data.qpos[-7] = 1.51
         assert clock.update(env) == 2
-        assert clock.update(env) is None
-        env._role_tracker.defending_player = 1
-        assert clock.update(env) == 1
 
 
 def test_live_halves_are_attack_for_the_attacker_and_defend_for_the_other():

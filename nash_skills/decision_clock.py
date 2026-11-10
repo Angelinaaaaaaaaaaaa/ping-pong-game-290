@@ -1,10 +1,9 @@
 """
 When a Design B strategic decision happens, and who is the attacker at it.
 
-  crossing  legacy: when SkillEnv's role tracker changes (the ball crosses the
-            net toward the other player). Both players re-pick a full
-            (attack, preparation) pair; the defender's new preparation takes
-            over halfway through its preparation window.
+  crossing  Kexin-compatible net-plane crossing: initialize from reset ball
+            position, then require strictly opposite sides on successive steps.
+            An endpoint exactly on the plane does not trigger. No initial latch.
   contact   paper Sec. 3.2: an exchange starts at a racket contact. The
             receiver of the new ball is the attacker (its attack target aims
             its next return); the player who just hit is the defender (its
@@ -18,6 +17,7 @@ DecisionClock.update(env) returns the attacker (1 or 2) when a decision fires
 this step, else None. Call it once per env step, after the step.
 """
 from nash_skills.defend_preparation import PreparationRoleTracker
+from nash_skills.skills import TABLE_SHIFT
 
 __all__ = ["DECISION_TIMINGS", "DEFAULT_DECISION_TIMING", "DecisionClock", "live_halves",
            "validate_decision_timing"]
@@ -42,17 +42,26 @@ class DecisionClock:
         self.timing = validate_decision_timing(timing)
         self._prep = PreparationRoleTracker()
         self._prev = None
+        self._cross_x = None
 
-    def reset(self):
+    def reset(self, env=None, obs=None):
         self._prep.reset()
         self._prev = None
+        self._cross_x = None
+        if self.timing == "crossing" and env is not None:
+            self._cross_x = float(obs[36]) if obs is not None else float(env._env.data.qpos[-7])
 
-    def update(self, env):
+    def update(self, env, obs=None):
         if self.timing == "contact":
             preparing = self._prep.update(float(env._env.data.qvel[-6]))
             current = None if preparing is None else 3 - preparing
         else:
-            current = env._role_tracker.defending_player
+            current_x = float(obs[36]) if obs is not None else float(env._env.data.qpos[-7])
+            previous_x = self._cross_x
+            self._cross_x = current_x
+            if previous_x is None or (previous_x - TABLE_SHIFT) * (current_x - TABLE_SHIFT) >= 0:
+                return None
+            return 2 if current_x > TABLE_SHIFT else 1
         fired = current is not None and current != self._prev
         self._prev = current
         return current if fired else None

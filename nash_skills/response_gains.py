@@ -100,13 +100,13 @@ def collect_decision_points(env, ppo, mechanism, make_method_picker, n_points, r
         apply_joint_pair(env, mechanism, 0, 0)
         obs, info = env.reset()
         clock = DecisionClock(decision_timing)
-        clock.reset()
+        clock.reset(env, obs)
         joints, n_dec = (0, 0), 0
         for _ in range(max_steps):
             obs, _r, done, _t, info = _ppo_step(env, ppo, obs, info)
             if done:
                 break
-            attacker = clock.update(env)
+            attacker = clock.update(env, obs)
             if attacker is None:
                 continue
             if rng.random() < take_prob and len(points) < n_points:
@@ -131,7 +131,8 @@ class ResponseGainEvaluator:
         if fixed is not None:
             pickers[player] = fixed
         clock = DecisionClock(self.timing)
-        clock.update(self.sim)  # latch the exchange that is starting
+        clock.reset(self.sim, obs)
+        clock.update(self.sim, obs)  # seed crossing position / latch contact direction
         joints = _decide(pickers, obs, info, self.sim, point.attacker, point.joints, point.decision_index,
                          self.mechanism)
         n_dec, k = point.decision_index + 1, 0
@@ -140,7 +141,7 @@ class ResponseGainEvaluator:
             if done:
                 won = infer_terminal_winner(obs, info, fallback="position") == ("ego" if player == 1 else "opp")
                 return (1.0 if won else -1.0) * self.gamma ** k
-            attacker = clock.update(self.sim)
+            attacker = clock.update(self.sim, obs)
             if attacker is not None:
                 k += 1
                 joints = _decide(pickers, obs, info, self.sim, attacker, joints, n_dec, self.mechanism)

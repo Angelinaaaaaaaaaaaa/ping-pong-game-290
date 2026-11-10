@@ -116,14 +116,14 @@ def play_rally(env, ppo, policies, learner, device, defend_mechanism, max_steps,
     choice = {1: list(init_choice[0]), 2: list(init_choice[1])}
     _apply(env, defend_mechanism, choice)
     obs, info = env.reset()
-    clock.reset()
+    clock.reset(env, obs)
     rec = {"states": [], "roles": [], "actions": [], "old_log_probs": [], "old_values": []}
     usage = {"attack": np.zeros(N_SKILLS, int), "defend": np.zeros(N_DEFEND_POSITIONS, int)}
     steps, exchanges, done = 0, 0, False
     while not done and steps < max_steps:
         obs, _r, done, _t, info = _ppo_step(env, ppo, obs, info)
         steps += 1
-        attacker = clock.update(env)
+        attacker = clock.update(env, obs) if not (done and decision_timing == "crossing") else None
         if attacker is None:
             continue
         exchanges += 1
@@ -154,6 +154,8 @@ def save_per_player(policies, path, meta=None):
     torch.save({"p1": policies[1].state_dict(), "p2": policies[2].state_dict()}, path)
     sidecar = {"encoder": STATE_ENCODER_NAME, "per_player": True, "decision_timing": DEFAULT_SELFPLAY_TIMING,
                "role_gated": True, **(meta or {})}
+    sidecar["decision_clock_version"] = ("kexin_net_crossing_v1"
+        if sidecar["decision_timing"] == "crossing" else "contact_v1")
     with open(path + ".json", "w") as f:
         json.dump(sidecar, f, indent=2)
 

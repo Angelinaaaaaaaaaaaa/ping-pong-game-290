@@ -604,7 +604,7 @@ def run_matchup_joint(
         obs, info = env.reset()
 
         ego_joint = opp_joint = 0
-        clock.reset()
+        clock.reset(env, obs)
         n_decisions = 0
         steps = 0
         done = False
@@ -627,7 +627,7 @@ def run_matchup_joint(
             rally_opp_successes += osu
             steps += 1
 
-            attacker = clock.update(env)
+            attacker = clock.update(env, obs) if not (done and decision_timing == "crossing") else None
             if attacker is not None:
                 # Simultaneous move (paper Sec. 3.2): neither picker sees the
                 # other's newly sampled action, only the one it played last.
