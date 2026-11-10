@@ -71,6 +71,29 @@ class TestBatching:
         assert spp.build_batch([empty], 0.99, 0.95)["advantages"] == []
 
 
+def test_decision_timing_flag_reaches_every_rally_and_the_checkpoint(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_rally(env, ppo, policies, learner, device, mechanism, max_steps, rng, **kw):
+        seen.append(kw.get("decision_timing"))
+        x = np.zeros(spp.state_dim_for(kw["state_mode"], kw["encoder"]), dtype=np.float32)
+        return {"states": [x], "roles": ["attack"], "actions": [1], "old_log_probs": [-1.6], "old_values": [0.0],
+                "reward": 1.0, "done": True, "winner": "ego", "bootstrap_value": 0.0, "steps": 10, "exchanges": 1,
+                "usage": {"attack": np.eye(5, dtype=int)[1], "defend": np.zeros(3, int)}}
+
+    monkeypatch.setattr(spp, "make_env", lambda args: RecordingTimedEnv(TWO_DECISION_SCRIPT))
+    monkeypatch.setattr(spp, "load_ppo", lambda path: _ZeroPPO())
+    monkeypatch.setattr(spp, "play_rally", fake_rally)
+    out = str(tmp_path / "sp.pth")
+    args = spp.build_parser().parse_args([
+        "--iterations", "2", "--rallies-per-iter", "2", "--round-iters", "1", "--output", out,
+        "--log", str(tmp_path / "log.csv"), "--seed", "0", "--decision-timing", "crossing"])
+    spp.train(args)
+    assert seen == ["crossing"] * 4
+    assert json.load(open(out + ".json"))["decision_timing"] == "crossing"
+    assert spp.build_parser().parse_args(["--output", "o", "--log", "l"]).decision_timing == "contact"
+
+
 def test_training_loop_alternates_learners_and_saves_both_policies(tmp_path, monkeypatch):
     monkeypatch.setattr(spp, "make_env", lambda args: RecordingTimedEnv(TWO_DECISION_SCRIPT))
     monkeypatch.setattr(spp, "load_ppo", lambda path: _ZeroPPO())

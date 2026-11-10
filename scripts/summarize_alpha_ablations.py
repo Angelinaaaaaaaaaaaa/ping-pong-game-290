@@ -5,6 +5,10 @@ model-quality diagnostics (held-out Q error, alpha percentiles, Phi vs constant 
 
     python scripts/summarize_alpha_ablations.py --root runs_paper/ablations_qval --out-dir OUT
 """
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import argparse
 import csv
 import glob
@@ -14,6 +18,15 @@ import re
 from collections import defaultdict
 
 import numpy as np
+
+
+def _static_labels():
+    from nash_skills.defend_positions import DEFEND_POSITION_NAMES
+    from nash_skills.skills import SKILL_NAMES
+    return {f"{a}/{d}" for a in SKILL_NAMES for d in DEFEND_POSITION_NAMES}
+
+
+STATIC_LABELS = _static_labels()
 
 PROFILES = ("aggressive", "moderate_aggressive")
 METRICS = ("static_mean", "static_min", "static_mean_half", "static_min_half", "random", "heldout_q1_mse",
@@ -29,9 +42,12 @@ def _load(path):
         return None
 
 
+TABLE_DIR = "table1"  # folder of the evaluation JSONs, next to phi/ (paper_alpha uses "figevals")
+
+
 def run_metrics(root, profile, name):
     rep = _load(os.path.join(root, profile, "phi", name, "heldout_attack_defend.json"))
-    t1 = _load(os.path.join(root, profile, "table1", name + ".json"))
+    t1 = _load(os.path.join(root, profile, TABLE_DIR, name + ".json"))
     if rep is None:
         return None
     h, c = rep.get("heldout_residuals", {}), rep.get("heldout_residuals_constant_phi", {})
@@ -42,7 +58,7 @@ def run_metrics(root, profile, name):
         s = t1["summary"]
         cells = s["cells"]
         half = [(v["wins"] + 0.5 * v["truncated"]) / max(1, v["decided"] + v["truncated"])
-                for k, v in cells.items() if "/" in k]
+                for k, v in cells.items() if k in STATIC_LABELS]
         out.update(static_mean=s.get("static_mean"), static_min=s.get("static_min"),
                    static_mean_half=float(np.mean(half)) if half else None,
                    static_min_half=float(np.min(half)) if half else None,
@@ -138,7 +154,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--table-dir", default="table1", help="folder of evaluation JSONs next to phi/")
     args = ap.parse_args()
+    global TABLE_DIR
+    TABLE_DIR = args.table_dir
     os.makedirs(args.out_dir, exist_ok=True)
     md, gamma_series, vol_series = [], {}, {}
     for profile in PROFILES:

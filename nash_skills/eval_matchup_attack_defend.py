@@ -90,12 +90,15 @@ __all__ = [
 
 LEARNED_STRATEGIES_JOINT = (
     "nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "nash-p-pga", "ibr", "ibr-q",
+    "nash-q", "br-q", "nash-p-ibr", "nash-p-argmax", "nash-p-argmax-exploit",
 )
 VALID_STRATEGIES_JOINT = LEARNED_STRATEGIES_JOINT + ("random", "ibr-sim")
 
 SELFPLAY_STRATEGY_KINDS = ("selfplay", "selfplay-argmax")
+KEXIN_V3_KIND = "kexin-v3"
 
-_PHI_STRATEGIES = {"nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "nash-p-pga"}
+_PHI_STRATEGIES = {"nash-p-hard", "nash-p-br", "nash-p-minimax", "nash-p-adaptive", "nash-p-pga", "nash-p-ibr",
+                   "nash-p-argmax", "nash-p-argmax-exploit"}
 
 DEFAULT_PGA_STEPS = 60
 DEFAULT_PGA_LR = 0.2
@@ -180,7 +183,7 @@ def _make_per_player_selfplay_picker(checkpoint_path: str, argmax: bool):
     """Per-player, role-gated actor (nash_skills.v2.selfplay_per_player): player p uses
     psi_p, and only the head of its role this exchange (info['attacker']) changes."""
     from nash_skills.v2.selfplay_rollout import _decide, encode_for_player, load_per_player
-    policies, _meta = load_per_player(checkpoint_path)
+    policies, meta = load_per_player(checkpoint_path)
     device = torch.device("cpu")
 
     def pick_selfplay(player, obs_vec, _other_joint_idx, info=None):
@@ -188,7 +191,8 @@ def _make_per_player_selfplay_picker(checkpoint_path: str, argmax: bool):
             raise ValueError("per-player self-play needs info['attacker'] and info['current_joints']")
         choice = {p: list(joint_action_from_index(info["current_joints"][p - 1])) for p in (1, 2)}
         role = "attack" if info["attacker"] == player else "defend"
-        action, _lp, _v = _decide(policies[player], encode_for_player(player, obs_vec, info, choice), role,
+        state = encode_for_player(player, obs_vec, info, choice, meta.get("state_mode", "joint"), meta["encoder"])
+        action, _lp, _v = _decide(policies[player], state, role,
                                   device, argmax=argmax)
         choice[player][0 if role == "attack" else 1] = action
         return joint_action_index(*choice[player])
@@ -274,6 +278,12 @@ def make_picker_joint(
         kind, path = strategy.split(":", 1)
         return _make_selfplay_picker(path, argmax=(kind == "selfplay-argmax"))
 
+    if isinstance(strategy, str) and strategy.split(":", 1)[0] == KEXIN_V3_KIND:
+        # "kexin-v3:<rule>:<potential model path>": Kexin's V3 alpha-potential (nash_skills.kexin_v3_player)
+        _kind, rule, path = strategy.split(":", 2)
+        from nash_skills.kexin_v3_player import make_kexin_v3_picker
+        return make_kexin_v3_picker(rule, potential_model_path=path)
+
     if strategy in _PHI_STRATEGIES and model_p is None:
         raise ValueError(
             f"Strategy '{strategy}' requires a loaded potential model. "
@@ -287,6 +297,25 @@ def make_picker_joint(
         if state_encoder_fn is not None and info is not None:
             return state_encoder_fn(obs_vec, info, player)
         return obs_vec
+
+    # Rules matching Kexin's V3 table rows (nash_skills.table_rules).
+    if strategy in ("nash-q", "br-q"):
+        if model1 is None or model2 is None:
+            raise ValueError(f"{strategy} requires model1 and model2 Q-value models.")
+        from nash_skills.table_rules import make_br_q_picker, make_nash_q_picker
+        factory = make_nash_q_picker if strategy == "nash-q" else make_br_q_picker
+        return factory(model1, model2, _base_vec, np.random.default_rng(pga_seed))
+    if strategy == "nash-p-ibr":
+        from nash_skills.table_rules import make_potential_ibr_picker
+        return make_potential_ibr_picker(model_p, _base_vec)
+    if strategy == "nash-p-argmax":
+        from nash_skills.table_rules import make_potential_argmax_picker
+        return make_potential_argmax_picker(model_p, _base_vec)
+    if strategy == "nash-p-argmax-exploit":
+        if model1 is None or model2 is None:
+            raise ValueError(f"{strategy} requires model1 and model2 Q-value models.")
+        from nash_skills.table_rules import make_potential_exploit_picker
+        return make_potential_exploit_picker(model_p, model1, model2, _base_vec)
 
     # ------------------------------------------------------------------ #
     # nash-p-pga: projected gradient ascent over mixed theta (paper Eq.18) #
@@ -606,7 +635,8 @@ def run_matchup_joint(
                 # force (each rally restarts both players at joint 0);
                 # attacker is this exchange's receiver; env is the live env
                 # (simulation-based pickers snapshot it, nobody steps it).
-                pick_info = {**info, "current_joints": (ego_joint, opp_joint), "attacker": attacker, "env": env}
+                pick_info = {**info, "current_joints": (ego_joint, opp_joint), "attacker": attacker, "env": env,
+                             "decision_index": n_decisions}
                 t0 = time.perf_counter()
                 new_ego = pick1(1, obs, opp_joint, pick_info)
                 t1 = time.perf_counter()

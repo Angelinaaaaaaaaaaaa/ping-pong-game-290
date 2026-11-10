@@ -53,6 +53,17 @@ def test_split_gives_chunks_that_add_up_with_distinct_seeds():
     assert len({t["seed"] for t in tasks}) == len(tasks)
 
 
+def test_build_tasks_caps_attempts_per_task():
+    # default: no cap recorded, so run_matchup_joint keeps its 10x n_episodes budget
+    assert all("max_attempts" not in t for t in t1.build_tasks("m", ["random"], 10, {}, seed=0))
+    tasks = t1.build_tasks("m", ["random", "ibr-sim"], episodes=10, split={"ibr-sim": 4}, seed=0,
+                           max_attempt_factor=2.0)
+    assert {t["max_attempts"] for t in tasks if t["opponent"] == "random"} == {20}
+    assert sorted({(t["episodes"], t["max_attempts"]) for t in tasks if t["opponent"] == "ibr-sim"}) == [(2, 4), (3, 6)]
+    # a factor below 1 still allows one attempt per requested rally
+    assert {t["max_attempts"] for t in t1.build_tasks("m", ["random"], 10, {}, 0, max_attempt_factor=0.5)} == {10}
+
+
 def test_timing_summary_averages_decision_seconds_per_side():
     rows = [{"opponent": "ibr-sim", "method_player": 1, "method_seconds": [0.1, 0.3], "opponent_seconds": [2.0]},
             {"opponent": "ibr-sim", "method_player": 2, "method_seconds": [0.2], "opponent_seconds": [4.0, 6.0]}]

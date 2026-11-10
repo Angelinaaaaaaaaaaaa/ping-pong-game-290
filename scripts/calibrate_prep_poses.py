@@ -32,6 +32,16 @@ import numpy as np
 ATTACK_FOR_POSITION = {"left": "left", "center": "center_safe", "right": "right"}
 
 
+def _mean_orientation(quats):
+    """Mean racket orientation (scalar-last quaternion, the env's convention) and its median spread."""
+    from scipy.spatial.transform import Rotation as R
+    rots = R.from_quat(np.asarray(quats, dtype=float))
+    mean = rots.mean()
+    spread = np.degrees((rots * mean.inv()).magnitude())
+    env_form = R.from_matrix(mean.as_matrix()).as_quat()  # the env's sign convention (see prep_pose_tables)
+    return {"quat": [float(v) for v in env_form], "quat_spread_deg": float(np.median(spread))}
+
+
 def summarize_contacts(records, max_track_err):
     """records: dicts with attack, target [x, y, z], track_err. Returns per-position medians."""
     kept = [r for r in records if r["track_err"] <= max_track_err]
@@ -44,6 +54,9 @@ def summarize_contacts(records, max_track_err):
         q25, q75 = np.percentile(pts[:, 1], [25, 75])
         out[position] = {"x": float(med[0]), "y": float(med[1]), "z": float(med[2]), "n": int(len(pts)),
                          "y_iqr": [float(q25), float(q75)]}
+        quats = [r["quat"] for r in kept if r["attack"] == attack and "quat" in r]
+        if quats:
+            out[position].update(_mean_orientation(quats))
     all_pts = np.array([r["target"] for r in kept], dtype=float)
     out["shared"] = {"x": float(np.median(all_pts[:, 0])), "z": float(np.median(all_pts[:, 2]))}
     out["n_dropped"] = len(records) - len(kept)
@@ -76,6 +89,7 @@ def collect_contacts(env, ppo, attack, n_rallies, max_steps, seed0):
                     own = env._env.curr_target if hitter == "ego" else env._env.curr_target_opp
                     err = info["diff_pos"] if hitter == "ego" else info["diff_pos_opp"]
                     records.append({"attack": attack, "target": [float(v) for v in own[:3]],
+                                    "quat": [float(v) for v in own[3:7]],
                                     "track_err": float(np.linalg.norm(err))})
             prev = hitter
             if done or trunc:
@@ -116,7 +130,8 @@ def main():
     for k in ("left", "center", "right"):
         s = summary[k]
         print(f"{args.profile:<20} {k:<7} y={s['y']:+.3f} IQR [{s['y_iqr'][0]:+.3f},{s['y_iqr'][1]:+.3f}] "
-              f"x={s['x']:+.3f} z={s['z']:.3f} n={s['n']}")
+              f"x={s['x']:+.3f} z={s['z']:.3f} n={s['n']} quat={np.round(s.get('quat', []), 4).tolist()} "
+              f"spread={s.get('quat_spread_deg', float('nan')):.1f} deg")
     print(f"{args.profile:<20} shared  x={summary['shared']['x']:+.3f} z={summary['shared']['z']:.3f} "
           f"(dropped {summary['n_dropped']} unconverged)  ppo md5 {result['ppo_md5']}")
 

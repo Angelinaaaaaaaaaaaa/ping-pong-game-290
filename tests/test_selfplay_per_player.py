@@ -115,7 +115,45 @@ class TestPlayRally:
         assert out["roles"] == ["attack", "defend"]
 
 
+class CrossingOnlyEnv(RecordingTimedEnv):
+    """The role tracker flips at net crossings, but the ball x-velocity the contact clock reads stays 0,
+    so contact timing never fires a decision here."""
+
+    def step(self, action):
+        out = super().step(action)
+        self._env.data.qvel[-6] = 0.0
+        return out
+
+
+def _rally_timed(timing, learner=1):
+    env = CrossingOnlyEnv(TWO_DECISION_SCRIPT)
+    kw = {} if timing is None else {"decision_timing": timing}
+    out = sr.play_rally(env, _ZeroPPO(), {1: _FixedPolicy(), 2: _FixedPolicy()}, learner=learner,
+                        device=torch.device("cpu"), defend_mechanism="preparation", max_steps=100,
+                        rng=np.random.default_rng(0), init_choice=((0, 0), (0, 0)), **kw)
+    return env, out
+
+
+class TestDecisionTiming:
+    def test_crossing_timing_decides_at_net_crossings_with_the_receiver_attacking(self):
+        _env, out = _rally_timed("crossing")
+        assert out["roles"] == ["defend", "attack"] and out["exchanges"] == 2
+
+    def test_contact_timing_stays_the_default_and_needs_the_contact_signal(self):
+        _env, out = _rally_timed(None)
+        assert out["roles"] == [] and out["exchanges"] == 0
+
+    def test_unknown_timing_is_refused(self):
+        with pytest.raises(ValueError):
+            _rally_timed("bounce")
+
+
 class TestCheckpoint:
+    def test_sidecar_records_the_decision_timing_it_was_given(self, tmp_path):
+        path = str(tmp_path / "sp.pth")
+        sr.save_per_player({1: MetaPolicy(), 2: MetaPolicy()}, path, {"decision_timing": "crossing"})
+        assert sr.load_per_player(path)[1]["decision_timing"] == "crossing"
+
     def test_round_trip_with_metadata(self, tmp_path):
         policies = {1: MetaPolicy(), 2: MetaPolicy()}
         path = str(tmp_path / "sp.pth")

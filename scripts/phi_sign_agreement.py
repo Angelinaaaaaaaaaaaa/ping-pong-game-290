@@ -61,7 +61,7 @@ def deviation_diffs(model_p, model1, model2, x, player, half, rng):
 
 def main():
     from model_arch import SimpleModel
-    from nash_skills.v2.state_encoder_attack_defend import STATE_DIM_ATTACK_DEFEND as D
+    from nash_skills.v2.state_encoder_attack_defend import STATE_ENCODER_NAME, state_dim
     from nash_skills.v2.train_q_model_5skill_v3_attack_defend import build_dataset, split_rallies
     import pickle
     ap = argparse.ArgumentParser()
@@ -73,6 +73,7 @@ def main():
     args = ap.parse_args()
     with open(os.path.join(args.model_dir, "heldout_attack_defend.json")) as f:
         report = json.load(f)
+    D = state_dim(report.get("encoder", STATE_ENCODER_NAME))
     models = {"p": SimpleModel(D, [64, 32, 16], 1, last_layer_activation=None),
               "1": SimpleModel(D, [64, 32, 16], 1), "2": SimpleModel(D, [64, 32, 16], 1)}
     for key, name in (("p", "model_p"), ("1", "model1"), ("2", "model2")):

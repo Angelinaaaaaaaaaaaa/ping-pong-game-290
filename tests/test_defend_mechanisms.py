@@ -18,16 +18,17 @@ class RecordingEnv:
     def set_defend_reactive_positions(self, pos1, pos2):
         self.calls.append(("reactive", pos1, pos2))
 
-    def set_defend_preparation_positions(self, pos1, pos2, calibrated=False):
-        self.calls.append(("preparation_cal" if calibrated else "preparation", pos1, pos2))
+    def set_defend_preparation_positions(self, pos1, pos2, calibrated=False, orientation="fixed"):
+        name = "preparation" if not calibrated else ("preparation_full" if orientation == "calibrated" else "preparation_cal")
+        self.calls.append((name, pos1, pos2))
 
 
 def test_all_mechanisms_are_available_and_reactive_stays_the_default():
-    assert set(DEFEND_MECHANISMS) == {"reactive", "preparation", "preparation_cal"}
+    assert set(DEFEND_MECHANISMS) == {"reactive", "preparation", "preparation_cal", "preparation_full"}
     assert DEFAULT_DEFEND_MECHANISM == "reactive"
 
 
-@pytest.mark.parametrize("mechanism", ["reactive", "preparation", "preparation_cal"])
+@pytest.mark.parametrize("mechanism", ["reactive", "preparation", "preparation_cal", "preparation_full"])
 def test_routes_to_exactly_the_chosen_mechanism(mechanism):
     env = RecordingEnv()
     set_defend_choices(env, mechanism, "left", "right")

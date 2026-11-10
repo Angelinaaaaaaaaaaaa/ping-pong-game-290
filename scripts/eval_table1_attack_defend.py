@@ -54,16 +54,17 @@ def spec_label(spec):
 
 
 def check_model_encoder(model_dir):
-    """Refuse Phi/Q models trained on another state encoder (same input size, different meaning)."""
-    from nash_skills.v2.state_encoder_attack_defend import STATE_ENCODER_NAME
+    """The state encoder the Phi/Q models were trained with; refuses unknown ones (another layout)."""
+    from nash_skills.v2.state_encoder_attack_defend import ENCODER_DIMS
     path = os.path.join(model_dir, "heldout_attack_defend.json")
     encoder = None
     if os.path.exists(path):
         with open(path) as f:
             encoder = json.load(f).get("encoder")
-    if encoder != STATE_ENCODER_NAME:
-        raise ValueError(f"{model_dir} was trained with state encoder {encoder!r}, not {STATE_ENCODER_NAME!r}; "
-                         "retrain it with the current encoder.")
+    if encoder not in ENCODER_DIMS:
+        raise ValueError(f"{model_dir} was trained with state encoder {encoder!r}, not one of {sorted(ENCODER_DIMS)}; "
+                         "retrain it with a current encoder.")
+    return encoder
 
 
 _SETTING_DEFAULTS = {"defend_mechanism": "reactive", "decision_timing": "crossing", "skill_profile": "aggressive"}
@@ -93,8 +94,10 @@ def check_selfplay_settings(spec, settings):
     _compare_settings(path, meta, checked)
 
 
-def build_tasks(method, opponents, episodes, split, seed):
-    """One task per (opponent, side, chunk); `split` maps an opponent label to its chunk count."""
+def build_tasks(method, opponents, episodes, split, seed, max_attempt_factor=None):
+    """One task per (opponent, side, chunk); `split` maps an opponent label to its chunk count.
+    max_attempt_factor caps the rally attempts of a task at factor x its decided rallies (rallies that
+    reach the step limit are re-drawn); None keeps run_matchup_joint's default of 10x."""
     tasks = []
     for opp in opponents:
         n_chunks = max(1, split.get(spec_label(opp), 1))
@@ -102,8 +105,11 @@ def build_tasks(method, opponents, episodes, split, seed):
         for side in (1, 2):
             for size in sizes:
                 if size > 0:
-                    tasks.append({"method": method, "opponent": opp, "method_player": side, "episodes": size,
-                                  "seed": seed * 100000 + len(tasks)})
+                    task = {"method": method, "opponent": opp, "method_player": side, "episodes": size,
+                            "seed": seed * 100000 + len(tasks)}
+                    if max_attempt_factor is not None:
+                        task["max_attempts"] = max(size, int(math.ceil(max_attempt_factor * size)))
+                    tasks.append(task)
     return tasks
 
 
@@ -122,32 +128,45 @@ def timing_summary(rows):
 
 
 def _load_models(model_dir):
+    """Phi, Q1, Q2 sized for the state encoder they were trained with (also returned, as "encoder")."""
     import torch
     from model_arch import SimpleModel
-    from nash_skills.v2.state_encoder_attack_defend import STATE_DIM_ATTACK_DEFEND as D
+    from nash_skills.v2.state_encoder_attack_defend import STATE_ENCODER_NAME, state_dim
     if model_dir is None:
-        return {"model_p": None, "model1": None, "model2": None}
-    models = {"model_p": SimpleModel(D, [64, 32, 16], 1, last_layer_activation=None),
-              "model1": SimpleModel(D, [64, 32, 16], 1), "model2": SimpleModel(D, [64, 32, 16], 1)}
+        return {"model_p": None, "model1": None, "model2": None, "encoder": STATE_ENCODER_NAME}
+    encoder = check_model_encoder(model_dir)
+    d = state_dim(encoder)
+    models = {"model_p": SimpleModel(d, [64, 32, 16], 1, last_layer_activation=None),
+              "model1": SimpleModel(d, [64, 32, 16], 1), "model2": SimpleModel(d, [64, 32, 16], 1)}
     for key, model in models.items():
         model.load_state_dict(torch.load(os.path.join(model_dir, MODEL_NAMES[key]), map_location="cpu"))
         model.eval()
-    return models
+    return {**models, "encoder": encoder}
 
 
 def _init_worker(ppo_path, model_dir, settings, max_steps, ibr_config):
     from stable_baselines3 import PPO
     _W["ppo"] = PPO.load(ppo_path, device="cpu")
     _W.update(_load_models(model_dir))
+    _W["encode"] = make_phi_encoder(_W["encoder"])
     _W.update(mechanism=settings["defend_mechanism"], timing=settings["decision_timing"],
               profile=settings["skill_profile"], max_steps=max_steps, ibr_config=ibr_config)
 
 
-def _encode_for_phi(obs, info, _player):
-    """Phi/Q see the ego-perspective state they were trained on; every rule
-    overwrites all four action blocks, so the defend placeholders never matter."""
+def make_phi_encoder(encoder):
+    """State function for Phi/Q: the ego-perspective state they were trained on, with their encoder;
+    every rule overwrites all four action blocks, so the defend placeholders never matter."""
     from nash_skills.v2.state_encoder_attack_defend import encode_ego
-    return encode_ego(obs, info, "center", "center")
+
+    def encode(obs, info, _player):
+        return encode_ego(obs, info, "center", "center", encoder=encoder)
+    return encode
+
+
+def _encode_for_phi(obs, info, player):
+    """make_phi_encoder for the v2 encoder (models trained before the v3 state)."""
+    from nash_skills.v2.state_encoder_attack_defend import STATE_ENCODER_NAME
+    return make_phi_encoder(STATE_ENCODER_NAME)(obs, info, player)
 
 
 def run_task(task):
@@ -159,7 +178,7 @@ def run_task(task):
     s1, s2 = (method, opponent) if side == 1 else (opponent, method)
     result = run_matchup_joint(
         s1, s2, _W["ppo"], _W["model_p"], n_episodes=task["episodes"], max_steps_per_episode=_W["max_steps"],
-        state_encoder_fn=_encode_for_phi, model1=_W["model1"], model2=_W["model2"],
+        max_attempts=task.get("max_attempts"), state_encoder_fn=_W["encode"], model1=_W["model1"], model2=_W["model2"],
         defend_mechanism=_W["mechanism"], reset_targets=True, skill_profile=_W["profile"],
         decision_timing=_W["timing"], ibr_sim_config=_W["ibr_config"], picker_seed=task["seed"],
     )
@@ -242,6 +261,9 @@ def main():
     ap.add_argument("--model-dir", default=None)
     ap.add_argument("--episodes", type=int, default=100, help="decided rallies per opponent per side")
     ap.add_argument("--max-steps", type=int, default=2500)
+    ap.add_argument("--max-attempt-factor", type=float, default=None,
+                    help="cap rally attempts per task at this multiple of its decided rallies "
+                         "(default: 10x); rallies reaching --max-steps are re-drawn up to the cap")
     ap.add_argument("--defend-mechanism", default="preparation")
     ap.add_argument("--decision-timing", choices=DECISION_TIMINGS, default="crossing")
     ap.add_argument("--skill-profile", default="aggressive")
@@ -267,7 +289,7 @@ def main():
         check_selfplay_settings(spec, settings)
     split = {k: int(v) for k, v in (item.split("=", 1) for item in args.split)}
     ibr_config = {"rounds": args.ibr_rounds, "horizon_exchanges": args.ibr_horizon, "gamma": args.ibr_gamma}
-    tasks = build_tasks(args.method, opponents, args.episodes, split, args.seed)
+    tasks = build_tasks(args.method, opponents, args.episodes, split, args.seed, args.max_attempt_factor)
     print(f"{args.method}: {len(opponents)} opponents x 2 sides x {args.episodes} decided rallies "
           f"({len(tasks)} tasks) on {args.workers} workers, {settings}", flush=True)
     start, rows = time.time(), []

@@ -139,7 +139,9 @@ from nash_skills.defend_mechanisms import (
 )
 from nash_skills.decision_clock import DECISION_TIMINGS, DEFAULT_DECISION_TIMING, DecisionClock
 from nash_skills.v2.collect_data import _build_ppo_obs
-from nash_skills.v2.state_encoder_attack_defend import encode_ego, STATE_DIM_ATTACK_DEFEND, STATE_ENCODER_NAME
+from nash_skills.v2.state_encoder_attack_defend import (
+    ENCODER_DIMS, STATE_DIM_ATTACK_DEFEND, STATE_ENCODER_NAME, encode_ego, state_dim,
+)
 from nash_skills.v2.labeling import detect_winner
 from nash_skills.v2.joint_action import write_mixed_strategy_pair
 from nash_skills.v2.mixed_strategy import DEFAULT_P_VERTEX, sample_theta, sample_action_from_theta
@@ -260,8 +262,12 @@ def collect(
     defend_mechanism: str = DEFAULT_DEFEND_MECHANISM,
     reset_targets: bool = False,
     decision_timing: str = DEFAULT_DECISION_TIMING,
+    encoder: str = STATE_ENCODER_NAME,
 ) -> list:
     """
+    `encoder` names the state encoder (nash_skills.v2.state_encoder_attack_defend.ENCODER_DIMS);
+    attack_defend_joint_v3 adds the ball's spin and the rally status to every state.
+
     Collect rallies via joint-action sampling until `target_decisions`
     total decisions (net crossings, from accepted rallies only) have
     been recorded, or `max_rallies` rallies have been attempted,
@@ -294,6 +300,7 @@ def collect(
     if sampling not in SAMPLING_MODES:
         raise ValueError(f"Unknown sampling mode '{sampling}'. Choose from: {SAMPLING_MODES}")
     validate_defend_mechanism(defend_mechanism)
+    state_dim(encoder)  # fails fast on an unknown encoder name
     clock = DecisionClock(decision_timing)
     mixed = sampling == "mixed"
     theta_rng = np.random.default_rng(seed) if mixed else None
@@ -383,7 +390,7 @@ def collect(
                 else:
                     credited_role = attacker
                 curr_attacker.append(attacker)
-                state = encode_ego(obs, info, ego_defend, opp_defend)
+                state = encode_ego(obs, info, ego_defend, opp_defend, encoder=encoder)
                 if mixed:
                     # The label is a return under theta, so the state's
                     # action slots carry theta, not this segment's draw.
@@ -420,7 +427,7 @@ def collect(
                 "defending_player": curr_defending_player,
                 "attacker": curr_attacker,
                 "winner": winner,
-                "encoder": STATE_ENCODER_NAME,
+                "encoder": encoder,
                 "defend_mechanism": defend_mechanism,
                 "decision_timing": decision_timing,
                 "skill_profile": skill_profile,
@@ -514,6 +521,8 @@ if __name__ == "__main__":
     parser.add_argument("--reset-targets", action="store_true",
                         help="Restore both racket targets before every rally "
                              "(KukaTennisEnv.reset() otherwise carries them over)")
+    parser.add_argument("--encoder", choices=sorted(ENCODER_DIMS), default=STATE_ENCODER_NAME,
+                        help="state encoder; attack_defend_joint_v3 adds the ball's spin and the rally status")
     parser.add_argument("--decision-timing", choices=DECISION_TIMINGS, default=DEFAULT_DECISION_TIMING,
                         help="'crossing' (net crossings, legacy) or 'contact' (each racket "
                              "contact starts an exchange, paper Sec 3.2)")
@@ -535,4 +544,5 @@ if __name__ == "__main__":
         p_vertex=args.p_vertex,
         defend_mechanism=args.defend_mechanism,
         reset_targets=args.reset_targets,
+        encoder=args.encoder,
     )

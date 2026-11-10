@@ -33,11 +33,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from nash_skills.decision_clock import DECISION_TIMINGS
 from nash_skills.defend_mechanisms import DEFEND_MECHANISMS
 from nash_skills.skills import SKILL_PROFILE_NAMES
 from nash_skills.v2.selfplay_attack_defend import MetaPolicy, compute_gae, ppo_clipped_loss
+from nash_skills.v2.state_encoder_attack_defend import ENCODER_DIMS, STATE_ENCODER_NAME
 from nash_skills.v2.selfplay_rollout import (
-    is_round_start, learner_for_iteration, play_rally, role_head_log_prob_entropy, save_per_player,
+    DEFAULT_SELFPLAY_TIMING, STATE_MODES, is_round_start, learner_for_iteration, play_rally,
+    role_head_log_prob_entropy, save_per_player, state_dim_for,
 )
 
 PPO_MODEL_PATH = "logs/best_model_tracker1/best_model"
@@ -126,12 +129,13 @@ def train(args):
     rng = _seed(args.seed)
     device = torch.device("cpu")
     env, ppo = make_env(args), load_ppo(args.ppo)
-    policies = {1: MetaPolicy(), 2: MetaPolicy()}
+    policies = {p: MetaPolicy(state_dim=state_dim_for(args.state_mode, args.encoder)) for p in (1, 2)}
     optims = {p: torch.optim.Adam(policies[p].parameters(), lr=args.lr) for p in (1, 2)}
     pools, round_opponent = {1: [], 2: []}, None
     meta = {"skill_profile": args.skill_profile, "defend_mechanism": args.defend_mechanism,
             "gamma": args.gamma, "ppo": args.ppo, "iterations": args.iterations,
-            "rallies_per_iter": args.rallies_per_iter, "round_iters": args.round_iters}
+            "rallies_per_iter": args.rallies_per_iter, "round_iters": args.round_iters,
+            "state_mode": args.state_mode, "encoder": args.encoder, "decision_timing": args.decision_timing}
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     os.makedirs(os.path.dirname(args.log) or ".", exist_ok=True)
     with open(args.log, "w", newline="") as log_f:
@@ -149,7 +153,9 @@ def train(args):
                     use_pool = pools[other] and random.random() < args.snapshot_prob
                     opp = random.choice(pools[other]) if use_pool else round_opponent
                     rallies.append(play_rally(env, ppo, {learner: policies[learner], other: opp}, learner,
-                                              device, args.defend_mechanism, MAX_STEPS_PER_RALLY, rng))
+                                              device, args.defend_mechanism, MAX_STEPS_PER_RALLY, rng,
+                                              state_mode=args.state_mode, encoder=args.encoder,
+                                              decision_timing=args.decision_timing))
                 stats = ppo_update(policies[learner], optims[learner],
                                    build_batch(rallies, args.gamma, args.gae_lambda), args)
                 if it % args.snapshot_every == 0:
@@ -211,6 +217,13 @@ def build_parser():
     ap.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="aggressive")
     ap.add_argument("--defend-mechanism", choices=DEFEND_MECHANISMS, default="preparation_cal")
     ap.add_argument("--reset-targets", action="store_true")
+    ap.add_argument("--state-mode", choices=STATE_MODES, default="joint",
+                    help="actor input: 'joint' (with both players' current choices) or 'no_choices' "
+                         "(without them, the paper's x = (ball, robots, role))")
+    ap.add_argument("--encoder", choices=sorted(ENCODER_DIMS), default=STATE_ENCODER_NAME,
+                    help="state encoder; attack_defend_joint_v3 adds the ball's spin and the rally status")
+    ap.add_argument("--decision-timing", choices=DECISION_TIMINGS, default=DEFAULT_SELFPLAY_TIMING,
+                    help="when both players decide: each racket contact (paper Sec. 3.2) or each net crossing")
     return ap
 
 

@@ -9,6 +9,9 @@ and self-play can run either one under an otherwise identical pipeline.
                matches the paper's attacker/defender roles
   preparation_cal  same as preparation, but the poses come from the
                per-profile calibration (nash_skills.prep_pose_tables)
+  preparation_full  preparation_cal plus the calibrated racket orientation per
+               position (the fixed face-forward one is 53-67 degrees from the
+               orientation wide shots are hit with)
 """
 
 __all__ = [
@@ -18,7 +21,7 @@ __all__ = [
     "set_defend_choices",
 ]
 
-DEFEND_MECHANISMS = ("reactive", "preparation", "preparation_cal")
+DEFEND_MECHANISMS = ("reactive", "preparation", "preparation_cal", "preparation_full")
 DEFAULT_DEFEND_MECHANISM = "reactive"
 
 
@@ -34,5 +37,7 @@ def set_defend_choices(env, mechanism: str, pos1, pos2):
         env.set_defend_reactive_positions(pos1, pos2)
     elif mechanism == "preparation":
         env.set_defend_preparation_positions(pos1, pos2)
-    else:
+    elif mechanism == "preparation_cal":
         env.set_defend_preparation_positions(pos1, pos2, calibrated=True)
+    else:
+        env.set_defend_preparation_positions(pos1, pos2, calibrated=True, orientation="calibrated")

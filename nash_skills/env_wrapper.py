@@ -27,9 +27,10 @@ from nash_skills.defend_steering import compute_defend_steering_action
 from nash_skills.defend_role import DefenderRoleTracker
 from nash_skills.defend_engagement import DefendEngagementTracker
 from nash_skills.defend_target_pose import defend_target_pose, DefendPoseEngagementTracker
-from nash_skills.prep_pose_tables import CALIBRATED_PREP_POSES, calibrated_prep_pose
+from nash_skills.prep_pose_tables import CALIBRATED_PREP_POSES, PREP_ORIENTATIONS, calibrated_prep_pose
 from nash_skills.defend_reactive_pose import reactive_defend_pose
 from nash_skills.defend_preparation import PreparationRoleTracker
+from nash_skills.rally_status import rally_status
 
 
 class SkillEnv:
@@ -69,6 +70,7 @@ class SkillEnv:
         self._defend_prep1 = None   # opt-in: paper-faithful preparation by the player
         self._defend_prep2 = None   # who just hit (nash_skills.defend_preparation)
         self._prep_calibrated = False
+        self._prep_orientation = "fixed"
         self._role_tracker = DefenderRoleTracker()
         self._prep_tracker = PreparationRoleTracker()
         # KukaTennisEnv.reset() never resets the racket targets (its
@@ -158,7 +160,7 @@ class SkillEnv:
         self._defend_reactive1 = pos1
         self._defend_reactive2 = pos2
 
-    def set_defend_preparation_positions(self, pos1, pos2, calibrated: bool = False):
+    def set_defend_preparation_positions(self, pos1, pos2, calibrated: bool = False, orientation: str = "fixed"):
         """
         Opt-in, paper-faithful defend mechanism (nash_skills.defend_preparation):
         while the ball travels away from a player (from its own hit until the
@@ -170,6 +172,8 @@ class SkillEnv:
 
         calibrated=False uses defend_target_pose's legacy table; True uses this
         env's skill profile's table from nash_skills.prep_pose_tables.
+        orientation="calibrated" (needs calibrated=True) also uses the calibrated
+        racket orientation per position instead of the fixed face-forward one.
         """
         for pos in (pos1, pos2):
             if pos is not None and pos not in DEFEND_POSITION_NAMES:
@@ -179,13 +183,16 @@ class SkillEnv:
         if calibrated and self.skill_profile not in CALIBRATED_PREP_POSES:
             raise ValueError(f"No calibrated preparation poses for skill profile '{self.skill_profile}'. "
                              f"Calibrated: {sorted(CALIBRATED_PREP_POSES)}")
+        if orientation not in PREP_ORIENTATIONS or (orientation == "calibrated" and not calibrated):
+            raise ValueError(f"orientation must be one of {PREP_ORIENTATIONS}; 'calibrated' needs calibrated=True")
         self._defend_prep1 = pos1
         self._defend_prep2 = pos2
         self._prep_calibrated = calibrated
+        self._prep_orientation = orientation
 
     def _prep_pose(self, name):
         if self._prep_calibrated:
-            return calibrated_prep_pose(name, self.skill_profile)
+            return calibrated_prep_pose(name, self.skill_profile, orientation=self._prep_orientation)
         return defend_target_pose(name)
 
     def _reactive_pose_for_player(self, player: int, defend_name: str):
@@ -234,6 +241,16 @@ class SkillEnv:
         obs[-1] = self._skill_value(self._skill2)
         return obs
 
+    def _with_ball_status(self, info):
+        """info plus the parts of the paper's x_t the raw observation lacks: the ball's angular
+        velocity (MuJoCo free-joint qvel[-3:]) and the rally status (nash_skills.rally_status).
+        Unchanged for an inner env without a simulator or rally tracker (test doubles); the v3
+        state encoder then refuses the info with a KeyError."""
+        data, rally = getattr(self._env, "data", None), getattr(self._env, "rally_state", None)
+        if data is None or rally is None:
+            return info
+        return {**info, "ball_angvel": np.array(data.qvel[-3:], dtype=float), "rally_status": rally_status(rally)}
+
     # ------------------------------------------------------------------ #
     # Gym-style interface (delegates to inner env)                         #
     # ------------------------------------------------------------------ #
@@ -248,7 +265,7 @@ class SkillEnv:
         self._engagement.reset()    # new rally -- clear pre-positioning latches
         self._pose_engagement.reset()  # new rally -- clear Option B's latches too
         self._prep_tracker.reset()
-        return self._encode_obs_skills(obs), info
+        return self._encode_obs_skills(obs), self._with_ball_status(info)
 
     def step(self, action):
         # Sync skill targets into the inner env before it runs
@@ -360,7 +377,7 @@ class SkillEnv:
             self._env.update_target_racket_pose_opp = original_update_opp
 
         obs, reward, done, truncated, info = result
-        return self._encode_obs_skills(obs), reward, done, truncated, info
+        return self._encode_obs_skills(obs), reward, done, truncated, self._with_ball_status(info)
 
     def _apply_defend_steering(self, action):
         """Return a copy of `action` with the defending player's gantry

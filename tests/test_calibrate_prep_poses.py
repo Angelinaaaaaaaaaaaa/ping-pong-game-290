@@ -2,6 +2,7 @@
 import os
 import sys
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -41,6 +42,21 @@ def test_shared_x_z_are_medians_over_all_positions():
     out = summarize_contacts(recs, max_track_err=0.05)
     assert out["shared"]["x"] == pytest.approx(-0.2)
     assert out["shared"]["z"] == pytest.approx(0.9)
+
+
+def test_mean_orientation_per_position_when_quaternions_are_recorded():
+    from scipy.spatial.transform import Rotation as R
+    q_left = R.from_euler("z", 40, degrees=True).as_quat().tolist()
+    q_right = R.from_euler("z", -40, degrees=True).as_quat().tolist()
+    recs = [dict(_rec("left", (0, 0.6, 0.8)), quat=q_left), dict(_rec("left", (0, 0.6, 0.8)), quat=q_left),
+            dict(_rec("right", (0, -0.7, 0.8)), quat=q_right), dict(_rec("center_safe", (0, 0, 0.8)), quat=[0, 0, 0, 1])]
+    out = summarize_contacts(recs, max_track_err=0.05)
+    angle = R.from_quat(out["left"]["quat"]).as_euler("xyz", degrees=True)[2]
+    assert angle == pytest.approx(40, abs=1e-6)
+    assert out["left"]["quat_spread_deg"] == pytest.approx(0.0, abs=1e-6)
+    assert R.from_quat(out["right"]["quat"]).as_euler("xyz", degrees=True)[2] == pytest.approx(-40, abs=1e-6)
+    q = out["left"]["quat"]
+    np.testing.assert_allclose(q, R.from_matrix(R.from_quat(q).as_matrix()).as_quat(), atol=1e-9)
 
 
 def test_missing_position_raises():

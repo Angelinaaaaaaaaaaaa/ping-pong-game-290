@@ -67,3 +67,50 @@ def test_calibrated_preparation_refuses_an_uncalibrated_profile(monkeypatch):
     env = env_wrapper.SkillEnv(skill_profile="current")
     with pytest.raises(ValueError, match="current"):
         env.set_defend_preparation_positions("left", "right", calibrated=True)
+
+
+def test_calibrated_orientation_uses_the_per_position_table():
+    from nash_skills.prep_pose_tables import CALIBRATED_PREP_QUATS
+    for profile in ("aggressive", "moderate_aggressive"):
+        for name in ("left", "center", "right"):
+            pose = calibrated_prep_pose(name, profile, orientation="calibrated")
+            np.testing.assert_allclose(pose[:3], CALIBRATED_PREP_POSES[profile][name])
+            np.testing.assert_allclose(pose[3:], CALIBRATED_PREP_QUATS[profile][name])
+            assert np.linalg.norm(pose[3:]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_unknown_orientation_mode_raises():
+    with pytest.raises(ValueError):
+        calibrated_prep_pose("left", "aggressive", orientation="sideways")
+
+
+@pytest.mark.parametrize("profile", ["aggressive", "moderate_aggressive"])
+def test_orientation_table_matches_the_saved_calibration_run(profile):
+    from nash_skills.prep_pose_tables import CALIBRATED_PREP_QUATS
+    with open(os.path.join(CAL_DIR, f"{profile}_orient.json")) as f:
+        cal = json.load(f)
+    assert cal["ppo_md5"] == PREP_POSE_CONTROLLER_MD5
+    from scipy.spatial.transform import Rotation as R
+    for name in ("left", "center", "right"):
+        diff = R.from_quat(CALIBRATED_PREP_QUATS[profile][name]) * R.from_quat(cal["summary"][name]["quat"]).inv()
+        assert np.degrees(diff.magnitude()) < 0.1
+
+
+def test_orientations_are_in_the_envs_sign_convention():
+    from scipy.spatial.transform import Rotation as R
+    from nash_skills.prep_pose_tables import CALIBRATED_PREP_QUATS
+    for table in CALIBRATED_PREP_QUATS.values():
+        for q in table.values():
+            np.testing.assert_allclose(q, R.from_matrix(R.from_quat(q).as_matrix()).as_quat(), atol=1e-6)
+
+
+def test_full_preparation_sets_the_calibrated_orientation(cal_env):
+    cal_env.set_defend_preparation_positions("left", "right", calibrated=True, orientation="calibrated")
+    calls = _step_with_ball_vel_x(cal_env, 4.0)
+    np.testing.assert_allclose(_set_pose(calls, "set"),
+                               calibrated_prep_pose("left", "moderate_aggressive", orientation="calibrated"))
+
+
+def test_calibrated_orientation_needs_calibrated_positions(cal_env):
+    with pytest.raises(ValueError):
+        cal_env.set_defend_preparation_positions("left", "right", calibrated=False, orientation="calibrated")

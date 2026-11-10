@@ -5,12 +5,25 @@ the "(½)" columns count an unresolved rally as half a point.
 
     python scripts/summarize_table1_fixed.py --root analysis/server_results/paper_runs
 """
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import argparse
 import glob
 import json
 import os
 
 import numpy as np
+
+
+def _static_labels():
+    from nash_skills.defend_positions import DEFEND_POSITION_NAMES
+    from nash_skills.skills import SKILL_NAMES
+    return {f"{a}/{d}" for a in SKILL_NAMES for d in DEFEND_POSITION_NAMES}
+
+
+STATIC_LABELS = _static_labels()
 
 PROFILES = ("aggressive", "moderate_aggressive")
 
@@ -25,7 +38,7 @@ def _load(path):
 
 def static_stats(result):
     cells = result["summary"]["cells"]
-    st = [v for k, v in cells.items() if "/" in k]
+    st = [v for k, v in cells.items() if k in STATIC_LABELS]
     dec = [v["win"] for v in st]
     half = [(v["wins"] + 0.5 * v["truncated"]) / max(1, v["decided"] + v["truncated"]) for v in st]
     unresolved = sum(v["truncated"] for v in st) / max(1, sum(v["decided"] + v["truncated"] for v in st))

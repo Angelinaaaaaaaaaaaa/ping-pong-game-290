@@ -78,12 +78,15 @@ import torch.nn as nn
 from model_arch import SimpleModel
 from nash_skills.v2.labeling import compute_returns, GAMMA
 from nash_skills.v2.collect_data_attack_defend import _summarize_decision_balance
-from nash_skills.v2.state_encoder_attack_defend import STATE_DIM_ATTACK_DEFEND as STATE_DIM, STATE_ENCODER_NAME
+from nash_skills.v2.state_encoder_attack_defend import (
+    ENCODER_DIMS, STATE_DIM_ATTACK_DEFEND as STATE_DIM, STATE_ENCODER_NAME, state_dim,
+)
 from nash_skills.v2.joint_action import (
     N_JOINT_ACTIONS, write_joint_pair_by_index, write_mixed_strategy_pair,
 )
 from nash_skills.v2.mixed_strategy import DEFAULT_P_VERTEX, sample_theta
 from nash_skills.v2.phi_selection import PHI_SELECT_MODES, PHI_SELECT_STATS, PhiValidator, rally_metadata
+from nash_skills.v2.state_symmetry import augment_rallies_with_swap
 
 # --------------------------------------------------------------------------- #
 # Config                                                                       #
@@ -197,8 +200,17 @@ def build_constraints() -> list:
     return constraints
 
 
-def build_dataset(rallies: list, gamma: float = GAMMA):
-    """Convert rally list into (X, Y1, Y2) tensors using discounted returns."""
+def returns_with_horizon(n: int, winner, gamma: float, horizon: int) -> np.ndarray:
+    """Player 1's continuation return G_H (paper Eq. 9) at each of a rally's n decisions: the
+    point outcome after k more exchanges counts as gamma**k only when k < horizon, else 0."""
+    r = {1: 1.0, 2: -1.0}.get(winner, 0.0)
+    k = np.arange(n - 1, -1, -1)
+    return np.where(k < horizon, r * gamma ** k, 0.0)
+
+
+def build_dataset(rallies: list, gamma: float = GAMMA, horizon=None):
+    """Convert rally list into (X, Y1, Y2) tensors using discounted returns
+    (cut off after `horizon` exchanges when given, paper Eq. 9)."""
     x_list = []
     y1_list = []
     y2_list = []
@@ -209,7 +221,11 @@ def build_dataset(rallies: list, gamma: float = GAMMA):
         if len(states) == 0:
             continue
 
-        g1, g2 = compute_returns(states, gamma=gamma, winner=winner)
+        if horizon is None:
+            g1, g2 = compute_returns(states, gamma=gamma, winner=winner)
+        else:
+            g1 = returns_with_horizon(len(states), winner, gamma, horizon)
+            g2 = -g1
         for state, v1, v2 in zip(states, g1, g2):
             x_list.append(state)
             y1_list.append([v1])
@@ -328,13 +344,27 @@ def output_paths(out_dir, heldout_out: str = HELDOUT_PATH) -> dict:
     return paths
 
 
+def rally_encoder(rallies: list) -> str:
+    """The one state encoder every rally was collected with (it fixes the state size)."""
+    encoders = {r.get("encoder") for r in rallies}
+    if len(encoders) > 1:
+        raise ValueError(f"Rallies must share one state encoder, found {sorted(map(str, encoders))}")
+    encoder = next(iter(encoders), STATE_ENCODER_NAME)
+    if encoder not in ENCODER_DIMS:
+        raise ValueError(
+            f"Rallies were collected with encoder={encoder!r}, not one of {sorted(ENCODER_DIMS)}. Recollect with "
+            f"'collect_data_attack_defend.py' -- a legacy or one-hot pickle cannot be "
+            f"reused here, the defend-position choices needed to re-encode were never saved.")
+    return encoder
+
+
 def train_q_models(x, y1, y2, n_epochs, lr, log_path, val_data=None, val_every=DEFAULT_PHI_VAL_EVERY):
     """Full-batch Q1/Q2 training. With val_data=(x_val, y1_val, y2_val), keeps the
     epoch with the lowest summed validation MSE (checked every val_every epochs and
     at the end) instead of the last epoch. Returns (model1, model2, epoch, val_mse)."""
     criterion = nn.MSELoss()
-    model1 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
-    model2 = SimpleModel(STATE_DIM, [64, 32, 16], 1)
+    model1 = SimpleModel(x.shape[1], [64, 32, 16], 1)
+    model2 = SimpleModel(x.shape[1], [64, 32, 16], 1)
     opt1 = torch.optim.Adam(model1.parameters(), lr=lr)
     opt2 = torch.optim.Adam(model2.parameters(), lr=lr)
     best = {"epoch": n_epochs, "mse": None, "state": None}
@@ -384,7 +414,8 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
           heldout_out: str = HELDOUT_PATH, out_dir=None,
           phi_select: str = "train_loss", val_frac: float = DEFAULT_VAL_FRAC,
           phi_val_every: int = DEFAULT_PHI_VAL_EVERY, phi_select_stat: str = "p95",
-          q_select: str = "last") -> dict:
+          q_select: str = "last", augment_swap: bool = False, horizon=None,
+          pure_data_only: bool = False) -> dict:
     paths = output_paths(out_dir, heldout_out)
     if q_select not in Q_SELECT_MODES:
         raise ValueError(f"Unknown Q selection '{q_select}'. Choose from: {Q_SELECT_MODES}")
@@ -394,6 +425,8 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
         raise ValueError(f"Unknown phi loss kind '{phi_loss}'. Choose from: {PHI_LOSS_KINDS}")
     if theta_mode not in THETA_MODES:
         raise ValueError(f"Unknown theta mode '{theta_mode}'. Choose from: {THETA_MODES}")
+    if pure_data_only and theta_mode != "pure":
+        raise ValueError("pure_data_only trains the fixed-pair policy family (paper Eq. 7): use theta_mode='pure'")
     random.seed(seed)
     torch.manual_seed(seed)
     theta_rng = np.random.default_rng(seed)
@@ -403,14 +436,8 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
         rallies = pkl.load(f)
     print(f"  {len(rallies)} rallies loaded")
 
-    bad_encoder = [r.get("encoder") for r in rallies if r.get("encoder") != STATE_ENCODER_NAME]
-    if bad_encoder:
-        raise ValueError(
-            f"{len(bad_encoder)} rallies were not collected with encoder='{STATE_ENCODER_NAME}' "
-            f"(found: {set(bad_encoder)}). Recollect with "
-            f"'collect_data_attack_defend.py' -- a legacy or one-hot pickle cannot be "
-            f"reused here, the defend-position choices needed to re-encode were never saved."
-        )
+    encoder = rally_encoder(rallies)
+    dim = state_dim(encoder)
     if theta_mode == "mixed" and not any(r.get("theta_mode") == "mixed" for r in rallies):
         raise ValueError(
             "theta_mode='mixed' needs data collected with collect_data_attack_defend.py "
@@ -419,6 +446,11 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
             "would be pure extrapolation."
         )
 
+    if pure_data_only:
+        # Paper Eq. 7: each continuation holds one fixed (target, preparation) pair per player.
+        n_all = len(rallies)
+        rallies = [r for r in rallies if r.get("theta_mode") != "mixed"]
+        print(f"  Fixed-pair rallies only: {len(rallies)}/{n_all}")
     metadata = rally_metadata(rallies)
     print(f"  Collection settings: {metadata}")
     train_rallies, holdout_rallies = split_rallies(rallies, holdout_frac, seed)
@@ -428,6 +460,9 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
         # selected on the same validation rallies.
         train_rallies, val_rallies = split_rallies(train_rallies, val_frac, seed + 1)
     train_rallies = limit_rallies(train_rallies, train_rally_limit)
+    if augment_swap:
+        # After the split and the volume limit: held-out and validation rallies stay unseen.
+        train_rallies = augment_rallies_with_swap(train_rallies)
     print(f"  Rally-level split (seed={seed}): {len(train_rallies)} train, "
           f"{len(val_rallies)} validation, {len(holdout_rallies)} held-out"
           + (f" (train limited to {train_rally_limit})" if train_rally_limit else ""))
@@ -442,17 +477,17 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
     else:
         print("  WARNING: no decisions found in training set")
 
-    x, y1, y2 = build_dataset(train_rallies, gamma=gamma)
-    x_hold, y1_hold, y2_hold = build_dataset(holdout_rallies, gamma=gamma)
+    x, y1, y2 = build_dataset(train_rallies, gamma=gamma, horizon=horizon)
+    x_hold, y1_hold, y2_hold = build_dataset(holdout_rallies, gamma=gamma, horizon=horizon)
     print(f"  Train X={tuple(x.shape)}, held-out X={tuple(x_hold.shape)}")
-    if x.shape[1] != STATE_DIM:
-        raise ValueError(f"Expected {STATE_DIM}-dim states, got {x.shape[1]}")
+    if x.shape[1] != dim:
+        raise ValueError(f"Expected {dim}-dim states (encoder {encoder}), got {x.shape[1]}")
     if len(x) < 2:
         raise ValueError("Need at least 2 training states (BatchNorm needs a batch).")
 
     n_nonzero = (y1.abs() > 1e-6).sum().item()
     print(f"  Non-zero Y1: {n_nonzero}/{len(y1)} = {100*n_nonzero/len(y1):.1f}%")
-    print(f"  gamma={gamma}, STATE_DIM={STATE_DIM}, N_JOINT_ACTIONS={N_JOINT_ACTIONS}, "
+    print(f"  gamma={gamma}, encoder={encoder} ({dim} dims), N_JOINT_ACTIONS={N_JOINT_ACTIONS}, "
           f"phi_loss={phi_loss}" + (f" (beta={phi_lse_beta})" if phi_loss == "lse" else "")
           + f", theta_mode={theta_mode}" + (f" (p_vertex={p_vertex})" if theta_mode == "mixed" else ""))
 
@@ -464,7 +499,7 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
     # ------------------------------------------------------------------ #
     # Train Q-value models                                                 #
     # ------------------------------------------------------------------ #
-    val_data = build_dataset(val_rallies, gamma=gamma) if q_select == "val" else None
+    val_data = build_dataset(val_rallies, gamma=gamma, horizon=horizon) if q_select == "val" else None
     model1, model2, q_best_epoch, q_val_mse = train_q_models(
         x, y1, y2, n_epochs, lr, paths["log_q"], val_data=val_data, val_every=phi_val_every)
     torch.save(model1.state_dict(), paths["model1"])
@@ -478,7 +513,7 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
     model1.eval()
     model2.eval()
 
-    model_p = SimpleModel(STATE_DIM, [64, 32, 16], 1, last_layer_activation=None)
+    model_p = SimpleModel(dim, [64, 32, 16], 1, last_layer_activation=None)
     model_p.batch_norm.running_mean = model1.batch_norm.running_mean.clone()
     model_p.batch_norm.running_var = model1.batch_norm.running_var.clone()
     model_p.batch_norm.momentum = 0.0
@@ -493,7 +528,7 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
     validator = None
     best_epoch, best_val = None, float("inf")
     if phi_select == "val_residual":
-        x_val, _, _ = build_dataset(val_rallies, gamma=gamma)
+        x_val, _, _ = build_dataset(val_rallies, gamma=gamma, horizon=horizon)
         if len(x_val) == 0:
             raise ValueError("phi_select='val_residual' needs validation states; raise val_frac.")
         validator = PhiValidator(x_val, constraints, theta_mode, seed=seed + 7,
@@ -563,7 +598,7 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
     model_p.load_state_dict(torch.load(paths["model_p"]))
     model_p.eval()
     report = {
-        "encoder": STATE_ENCODER_NAME, "seed": seed, "gamma": gamma, "phi_loss": phi_loss,
+        "encoder": encoder, "seed": seed, "gamma": gamma, "phi_loss": phi_loss,
         "phi_lse_beta": phi_lse_beta if phi_loss == "lse" else None,
         "theta_mode": theta_mode, "p_vertex": p_vertex if theta_mode == "mixed" else None,
         "n_train_rallies": len(train_rallies), "n_holdout_rallies": len(holdout_rallies),
@@ -572,6 +607,7 @@ def train(rally_path: str, n_epochs: int, lr: float, *,
         "n_val_rallies": len(val_rallies), "phi_best_epoch": best_epoch,
         "phi_val_score": best_val if validator else None,
         "q_select": q_select, "q_best_epoch": q_best_epoch, "q_val_mse": q_val_mse,
+        "augment_swap": augment_swap, "horizon": horizon, "pure_data_only": pure_data_only,
         **metadata,
     }
 
@@ -654,9 +690,16 @@ if __name__ == "__main__":
     parser.add_argument("--q-select", choices=Q_SELECT_MODES, default="last",
                         help="'last' (legacy: Q after the final epoch) or 'val' (early stopping on the "
                              "validation split carved from the training rallies)")
+    parser.add_argument("--horizon", type=int, default=None,
+                        help="continuation length H in exchanges for the value targets (paper Eq. 9); default: whole rally")
+    parser.add_argument("--pure-data-only", action="store_true",
+                        help="train only on fixed-pair rallies (paper Eq. 7 policy family; needs --theta-mode pure)")
+    parser.add_argument("--augment-swap", action="store_true",
+                        help="add the player-swapped copy of every training rally (nash_skills.v2.state_symmetry)")
     args = parser.parse_args()
 
-    train(args.rallies, args.epochs, args.lr,
+    train(args.rallies, args.epochs, args.lr, augment_swap=args.augment_swap, horizon=args.horizon,
+          pure_data_only=args.pure_data_only,
           phi_select=args.phi_select, phi_select_stat=args.phi_select_stat, q_select=args.q_select,
           val_frac=args.val_frac, phi_val_every=args.phi_val_every,
           holdout_frac=args.holdout_frac, seed=args.seed, gamma=args.gamma,
