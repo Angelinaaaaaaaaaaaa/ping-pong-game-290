@@ -1,0 +1,169 @@
+{
+  "human_dataset": "human_both",
+  "human_region": {
+    "name": "four_quadrants_center_override",
+    "depth_split": 0.51,
+    "lateral_split": 0.0,
+    "center_depth_min": 0.2,
+    "center_depth_max": 0.7,
+    "center_lateral_min": -0.35,
+    "center_lateral_max": 0.35
+  },
+  "totals": {
+    "human_both": 5741,
+    "nash_q": 12203,
+    "potential_max": 5881,
+    "random_p2_vs_nash_q": 14702,
+    "random_p2_vs_potential_max": 7251
+  },
+  "center_band_m": 0.25,
+  "normalized_center_half_band": 0.3278688524590164,
+  "source_center_band_m": 0.05,
+  "robot_run_audits": [
+    {
+      "path": "skill_eval/v3/nash_vs_random_10000/decisions.csv",
+      "metadata": {
+        "model": "models/v3/q_preposition_onehot_50k_aggressive.pth",
+        "ppo": "logs/best_model_tracker1/best_model",
+        "potential_model": "models/v3/potential_50k_aggressive.pth",
+        "p1_policy": "nash_q",
+        "p2_policy": "random",
+        "episodes_requested": 10000,
+        "steps_per_episode": 1000,
+        "seed": 0,
+        "skill_profile": "aggressive",
+        "planner": "legacy",
+        "q_input_dim": 82,
+        "q_state_dim": 74,
+        "q_state_encoder": "v3_role_symmetric_canonical_state74_v2",
+        "q_model_input_schema": "v3_state74_action_onehot_v1",
+        "q_action_shape": [
+          5,
+          3
+        ],
+        "contact_metric_status": "inferred_from_crossings_and_termination_reasons",
+        "landing_data_status": "not_recorded_by_random_v3_collection",
+        "fixed_player_ids": [],
+        "fixed_player": "",
+        "fixed_attack_skill": "",
+        "fixed_defender_position": "",
+        "p1_policy_name": "nash_q",
+        "p2_policy_name": "random",
+        "p1_attack_policy": "nash_q",
+        "p1_defense_policy": "nash_q",
+        "p2_attack_policy": "random",
+        "p2_defense_policy": "random",
+        "p1_fixed_attack_skill": "",
+        "p1_fixed_defender_position": "",
+        "p2_fixed_attack_skill": "",
+        "p2_fixed_defender_position": ""
+      },
+      "episode_count": 10000,
+      "raw_policy_counts": {
+        "nash_q": 12203,
+        "random_p2_vs_nash_q": 14702
+      },
+      "excluded_contexts": 0,
+      "snapshot_checks": 26905,
+      "maximum_snapshot_error": 2.977504269807696e-07,
+      "uniform_vectors_verified": 14702,
+      "previous_comparison_check": "all episode/context/action counts match"
+    },
+    {
+      "path": "skill_eval/v3/potential_max_vs_random/decisions.csv",
+      "metadata": {
+        "model": "models/v3/q_preposition_onehot_50k_aggressive.pth",
+        "ppo": "logs/best_model_tracker1/best_model",
+        "potential_model": "models/v3/potential_50k_aggressive.pth",
+        "realized_landings_logged": false,
+        "p1_policy": "potential_max",
+        "p2_policy": "random",
+        "episodes_requested": 5000,
+        "steps_per_episode": 1000,
+        "seed": 0,
+        "skill_profile": "aggressive",
+        "planner": "legacy",
+        "q_input_dim": 82,
+        "q_state_dim": 74,
+        "q_state_encoder": "v3_role_symmetric_canonical_state74_v2",
+        "q_model_input_schema": "v3_state74_action_onehot_v1",
+        "q_action_shape": [
+          5,
+          3
+        ],
+        "contact_metric_status": "inferred_from_crossings_and_termination_reasons",
+        "landing_data_status": "not_recorded_by_random_v3_collection",
+        "fixed_player_ids": [],
+        "fixed_player": "",
+        "fixed_attack_skill": "",
+        "fixed_defender_position": "",
+        "p1_policy_name": "potential_max",
+        "p2_policy_name": "random",
+        "p1_attack_policy": "potential_max",
+        "p1_defense_policy": "potential_max",
+        "p2_attack_policy": "random",
+        "p2_defense_policy": "random",
+        "p1_fixed_attack_skill": "",
+        "p1_fixed_defender_position": "",
+        "p2_fixed_attack_skill": "",
+        "p2_fixed_defender_position": ""
+      },
+      "episode_count": 5000,
+      "raw_policy_counts": {
+        "potential_max": 5881,
+        "random_p2_vs_potential_max": 7251
+      },
+      "excluded_contexts": 0,
+      "snapshot_checks": 13132,
+      "maximum_snapshot_error": 2.9370975784814846e-07,
+      "uniform_vectors_verified": 7251,
+      "previous_comparison_check": "new policy: no historical comparison rows; source snapshots and random vectors validated"
+    }
+  ],
+  "bootstrap_replicates": 2000,
+  "seed": 42,
+  "sources": [
+    {
+      "path": "v3/human_comparison/reports/opponent_position_comparison_10k_both/audit.json",
+      "sha256": "7eafc80ee408a8ed54364120ce473d087ff87f510bdab85dc902b206115e8b00"
+    },
+    {
+      "path": "v3/human_comparison/reports/opponent_position_comparison_10k_both/analysis_observations.csv",
+      "sha256": "76db6ee145993dff9f92ee2159f2c6ad7d544a4654799c4293b7a583d0217bf7"
+    },
+    {
+      "path": "v3/human_comparison/reports/opponent_position_comparison_10k_both/human_incoming_events.csv",
+      "sha256": "96f733cbd3c739d1cfe71ed4b995bcd6ddd6c15868af79a11e29cc40bfb7ded4"
+    },
+    {
+      "path": "skill_eval/v3/nash_vs_random_10000/decisions.csv",
+      "sha256": "a05f5ec679e1da643c4e7486175f17911f9f7e6a1f14059801fb2651b97f4894"
+    },
+    {
+      "path": "skill_eval/v3/potential_max_vs_random/decisions.csv",
+      "sha256": "791d8e548e3549964c444aa0a8d8b429e9bba037fe683e844b222d03eda02e57"
+    },
+    {
+      "path": "skill_eval/v3/nash_vs_random_10000/summary.json",
+      "sha256": "eb6606ce3759a67a04328a7ba3e2924297d831b06fbd3d0e638f2a154d53ded2"
+    },
+    {
+      "path": "skill_eval/v3/potential_max_vs_random/summary.json",
+      "sha256": "b134ad35c983e33890d18a449928623c793f8938304a25fb5e1aee1b8bb37b9a"
+    },
+    {
+      "path": "/mnt/e/cs290/ping-pong-game-290/v3/human_comparison/analyze_random_similarity.py",
+      "sha256": "cf49b5d324f2a6288dde1826a2ce8f45c2c606ec67d42135d32a02bf7e140911"
+    },
+    {
+      "path": "v3/human_comparison/analyze_opponent_position.py",
+      "sha256": "8f828dfb28b2b8e97990dfbdb4a84dbd543dcdc0a8af971b9e0c2e7d41b85d17"
+    }
+  ],
+  "learned_reference_check": "existing policies checked against saved episode/context/action counts; new policies validated from their own detailed logs",
+  "software": {
+    "numpy": "2.4.4",
+    "pandas": "3.0.2",
+    "matplotlib": "3.10.8"
+  }
+}

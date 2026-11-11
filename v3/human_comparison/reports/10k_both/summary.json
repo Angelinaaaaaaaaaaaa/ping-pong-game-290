@@ -1,0 +1,442 @@
+{
+  "total_sampled_rallies": 10000,
+  "successfully_loaded_rallies": 9980,
+  "dataset": {
+    "input_mode": "zip",
+    "catalogue_members": 214847,
+    "reconstruction_members": 23781,
+    "distinct_matches": 812,
+    "archive_bytes": 16832677841
+  },
+  "selected_player": "both",
+  "position_time": "crossing",
+  "config": {
+    "center_normalized": 0.06557377049180328,
+    "position_time": "crossing",
+    "landmark": "feet_midpoint",
+    "robot_profile": "aggressive",
+    "edge_margin_m": 0.005,
+    "min_net_clearance_m": 0.0,
+    "net_height_m": 0.1524
+  },
+  "all_players": {
+    "detected_racket_contacts": 49796,
+    "valid_net_crossings": 18662,
+    "valid_opponent_landings": 16352,
+    "classified_shots": 16352,
+    "excluded_by_reason": {
+      "missing_ball_at_contact": 19250,
+      "crossing_outside_net_span_or_below_net": 10947,
+      "contact_context_unavailable": 710,
+      "table_edge_potentially_clipped_by_reconstructor": 1926,
+      "no_vertical_bounce_reversal": 384,
+      "no_plausible_longitudinal_contact_reversal": 104,
+      "self_half_bounce_or_serve": 117,
+      "contact_on_wrong_table_side": 6
+    }
+  },
+  "selected_players": {
+    "detected_racket_contacts": 49796,
+    "valid_net_crossings": 18662,
+    "valid_opponent_landings": 16352,
+    "classified_shots": 16352,
+    "excluded_by_reason": {
+      "missing_ball_at_contact": 19250,
+      "crossing_outside_net_span_or_below_net": 10947,
+      "contact_context_unavailable": 710,
+      "table_edge_potentially_clipped_by_reconstructor": 1926,
+      "no_vertical_bounce_reversal": 384,
+      "no_plausible_longitudinal_contact_reversal": 104,
+      "self_half_bounce_or_serve": 117,
+      "contact_on_wrong_table_side": 6
+    }
+  },
+  "condition_vectors": [
+    {
+      "player": "P1",
+      "p1_position": "left",
+      "p2_position": "left",
+      "n": 5089,
+      "empirical_probability_vector": [
+        0.10846924739634506,
+        0.07879740617017096,
+        0.5753586166240912,
+        0.013165651404991157,
+        0.22420907840440166
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "left",
+      "p2_position": "center",
+      "n": 135,
+      "empirical_probability_vector": [
+        0.26666666666666666,
+        0.0962962962962963,
+        0.4740740740740741,
+        0.0,
+        0.16296296296296298
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "left",
+      "p2_position": "right",
+      "n": 619,
+      "empirical_probability_vector": [
+        0.2778675282714055,
+        0.07592891760904685,
+        0.5169628432956381,
+        0.027463651050080775,
+        0.10177705977382875
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "center",
+      "p2_position": "left",
+      "n": 364,
+      "empirical_probability_vector": [
+        0.14285714285714285,
+        0.1346153846153846,
+        0.5274725274725275,
+        0.008241758241758242,
+        0.18681318681318682
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "center",
+      "p2_position": "center",
+      "n": 22,
+      "empirical_probability_vector": [
+        0.3181818181818182,
+        0.13636363636363635,
+        0.5454545454545454,
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "center",
+      "p2_position": "right",
+      "n": 113,
+      "empirical_probability_vector": [
+        0.35398230088495575,
+        0.07964601769911504,
+        0.48672566371681414,
+        0.017699115044247787,
+        0.061946902654867256
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "right",
+      "p2_position": "left",
+      "n": 1527,
+      "empirical_probability_vector": [
+        0.1971185330713818,
+        0.11853307138179436,
+        0.4911591355599214,
+        0.014407334643091027,
+        0.1787819253438114
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "right",
+      "p2_position": "center",
+      "n": 97,
+      "empirical_probability_vector": [
+        0.3711340206185567,
+        0.061855670103092786,
+        0.41237113402061853,
+        0.010309278350515464,
+        0.14432989690721648
+      ]
+    },
+    {
+      "player": "P1",
+      "p1_position": "right",
+      "p2_position": "right",
+      "n": 544,
+      "empirical_probability_vector": [
+        0.4117647058823529,
+        0.0661764705882353,
+        0.4172794117647059,
+        0.04044117647058824,
+        0.06433823529411764
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "left",
+      "p2_position": "left",
+      "n": 4236,
+      "empirical_probability_vector": [
+        0.06940509915014165,
+        0.01392823418319169,
+        0.4169027384324835,
+        0.04603399433427762,
+        0.45372993389990557
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "left",
+      "p2_position": "center",
+      "n": 200,
+      "empirical_probability_vector": [
+        0.105,
+        0.03,
+        0.455,
+        0.07,
+        0.34
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "left",
+      "p2_position": "right",
+      "n": 765,
+      "empirical_probability_vector": [
+        0.1084967320261438,
+        0.023529411764705882,
+        0.515032679738562,
+        0.05359477124183006,
+        0.29934640522875816
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "center",
+      "p2_position": "left",
+      "n": 294,
+      "empirical_probability_vector": [
+        0.09523809523809523,
+        0.023809523809523808,
+        0.5,
+        0.030612244897959183,
+        0.35034013605442177
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "center",
+      "p2_position": "center",
+      "n": 21,
+      "empirical_probability_vector": [
+        0.09523809523809523,
+        0.0,
+        0.42857142857142855,
+        0.09523809523809523,
+        0.38095238095238093
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "center",
+      "p2_position": "right",
+      "n": 119,
+      "empirical_probability_vector": [
+        0.11764705882352941,
+        0.03361344537815126,
+        0.47058823529411764,
+        0.01680672268907563,
+        0.36134453781512604
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "right",
+      "p2_position": "left",
+      "n": 1352,
+      "empirical_probability_vector": [
+        0.17085798816568049,
+        0.011834319526627219,
+        0.5096153846153846,
+        0.08136094674556213,
+        0.22633136094674555
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "right",
+      "p2_position": "center",
+      "n": 135,
+      "empirical_probability_vector": [
+        0.16296296296296298,
+        0.0,
+        0.5555555555555556,
+        0.05925925925925926,
+        0.2222222222222222
+      ]
+    },
+    {
+      "player": "P2",
+      "p1_position": "right",
+      "p2_position": "right",
+      "n": 720,
+      "empirical_probability_vector": [
+        0.17083333333333334,
+        0.0125,
+        0.5541666666666667,
+        0.04027777777777778,
+        0.2222222222222222
+      ]
+    }
+  ],
+  "robot_comparison_sources": [
+    {
+      "policy": "nash_q",
+      "player": "P1",
+      "file": "reports/v3/conditional_skill_selection_nash/joint_position_skill_summary.csv",
+      "analysis_run": "nash_vs_random_10000_10a705f4"
+    },
+    {
+      "policy": "potential_ibr",
+      "player": "P1",
+      "file": "reports/v3/conditional_skill_selection_potential_ibr/joint_position_skill_summary.csv",
+      "analysis_run": "potential_ibr_vs_random_10000_64900e08"
+    }
+  ],
+  "video_checks": [
+    {
+      "video": "release_data/match171/match171_26/match171_26.mp4",
+      "video_frames": 291,
+      "video_fps": 30.0,
+      "inspected_frames": [
+        24,
+        33,
+        37
+      ]
+    },
+    {
+      "video": "release_data/match366/match366_63/match366_63.mp4",
+      "video_frames": 124,
+      "video_fps": 30.0,
+      "inspected_frames": [
+        22,
+        29,
+        33
+      ]
+    },
+    {
+      "video": "release_data/match915/match915_27/match915_27.mp4",
+      "video_frames": 80,
+      "video_fps": 30.0,
+      "inspected_frames": [
+        19,
+        23,
+        36
+      ]
+    }
+  ],
+  "load_failures": [
+    {
+      "rally_id": "match332_36",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match670_11",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match854_10",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match500_42",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match176_86",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match837_5",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match448_58",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match675_11",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match30_47",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match695_32",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match864_50",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match505_60",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match499_38",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match874_23",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match834_24",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match451_22",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match515_22",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match684_59",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match505_79",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    },
+    {
+      "rally_id": "match809_28",
+      "error": "Player side/pose inconsistent with official P1-negative-x/P2-positive-x frame"
+    }
+  ],
+  "classification": "provisional_nearest_v3_target",
+  "reference_commit": "bcada1f744af3e1c39fd5adb5ee5bb534f0d1ba2",
+  "target_prototypes_normalized": {
+    "left": [
+      0.7299270072992701,
+      0.8472131147540984
+    ],
+    "left_short": [
+      0.29197080291970795,
+      0.8472131147540984
+    ],
+    "center_safe": [
+      0.36496350364963503,
+      0.0
+    ],
+    "right_short": [
+      0.29197080291970795,
+      -0.8472131147540984
+    ],
+    "right": [
+      0.7299270072992701,
+      -0.8472131147540984
+    ]
+  }
+}

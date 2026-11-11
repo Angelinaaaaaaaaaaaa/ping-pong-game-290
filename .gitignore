@@ -39,5 +39,7 @@ skill_eval/*.log
 
 # LATTE-MV archive/extractions and generated human-comparison outputs
 /v3/LATTE-MV/
-/v3/human_comparison/reports/
+/v3/human_comparison/reports/*
+!/v3/human_comparison/reports/10k_both/
+!/v3/human_comparison/reports/potential_max_vs_human_center_0p25/
 /v3/human_comparison/__pycache__/
