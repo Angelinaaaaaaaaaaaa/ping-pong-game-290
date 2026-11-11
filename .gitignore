@@ -36,3 +36,8 @@ skill_eval/*.log
 
 # macOS
 .DS_Store
+
+# LATTE-MV archive/extractions and generated human-comparison outputs
+/v3/LATTE-MV/
+/v3/human_comparison/reports/
+/v3/human_comparison/__pycache__/
