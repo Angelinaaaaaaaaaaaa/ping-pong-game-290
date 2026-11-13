@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 import tempfile
 from pathlib import Path
 import numpy as np
@@ -13,6 +14,24 @@ from v3.human_comparison.events import HALF_WIDTH
 
 
 class OpponentPositionTests(unittest.TestCase):
+    def test_spearman_accepts_read_only_pandas_rank_arrays(self):
+        p = np.array([[.4,.3,.2,.1,0.], [1.,0.,0.,0.,0.], [np.nan]*5])
+        q = np.array([[0.,.1,.2,.3,.4], [.2]*5, [.2]*5])
+        before_p = p.copy(); before_q = q.copy()
+        p.setflags(write=False); q.setflags(write=False)
+        original = pd.DataFrame.to_numpy
+        def read_only(frame, *args, **kwargs):
+            result = original(frame, *args, **kwargs)
+            result.setflags(write=False)
+            return result
+        with patch.object(pd.DataFrame, 'to_numpy', new=read_only):
+            result = similarity(p, q)
+        self.assertAlmostEqual(result['spearman_rho'][0], -1.)
+        self.assertTrue(np.isnan(result['spearman_rho'][1]))
+        for metric in result.values(): self.assertTrue(np.isnan(metric[2]))
+        np.testing.assert_array_equal(p, before_p)
+        np.testing.assert_array_equal(q, before_q)
+
     def test_incoming_alignment_for_each_human_player(self):
         rows = []
         for index, player in enumerate([1, 2, 1, 2]):

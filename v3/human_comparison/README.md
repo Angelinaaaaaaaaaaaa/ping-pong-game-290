@@ -172,3 +172,28 @@ disable these with `--video-examples 0` if unavailable.
 MPLCONFIGDIR=/tmp/latte_pilot_matplotlib python3 -m unittest discover \
   -s tests -p test_v3_human_comparison.py
 ```
+
+## Potential Max and the latest human-only/side-by-side bar charts
+
+For a detailed Potential Max P1 versus Random P2 log:
+
+```bash
+OPENBLAS_NUM_THREADS=1 python3 v3/human_comparison/analyze_random_similarity.py \
+  --potential-policy potential_max \
+  --potential-decisions skill_eval/v3/potential_max_vs_random/decisions.csv \
+  --center-band 0.25 --bootstrap 2000 --seed 42 \
+  --output-dir v3/human_comparison/reports/potential_max_vs_human_center_0p25
+
+python3 v3/human_comparison/plot_human_rectangular_skill_bars.py
+python3 v3/human_comparison/plot_human_robot_skill_bars.py
+```
+
+The first plotting script generates human-only bars for all nine physical
+pairs, recomputing the four-block + Center Safe labels from coordinates.
+The second aligns those human bars with Nash-Q and Potential Max selected
+skills, both in a grouped 3x3 chart and nine individual three-panel figures.
+The latest graphs explicitly name the rectangular classifier; the original
+nearest-target extraction figures remain preserved as a separate baseline.
+
+Detailed Potential Max runtime and evaluator documentation is in
+[../POTENTIAL_MAX.md](../POTENTIAL_MAX.md).

@@ -36,6 +36,20 @@ SCOPES = ('joint_physical', 'opponent_only', 'joint_role_relative')
 METRICS = ('js_divergence_bits', 'total_variation', 'spearman_rho', 'pearson_r')
 
 
+def configure_potential_policy(policy='potential_ibr'):
+    """Keep actual policy identifiers in tables when comparing a new run."""
+    global LEARNED, RANDOM, MODELS, NAMES
+    if policy not in ('potential_ibr', 'potential_max'):
+        raise ValueError('Unsupported potential-policy comparison')
+    LEARNED = ('nash_q', policy)
+    RANDOM = ('random_p2_vs_nash_q', 'random_p2_vs_'+policy)
+    MODELS = (*LEARNED, *RANDOM, UNIFORM)
+    label = 'Potential Max' if policy == 'potential_max' else 'Potential IBR'
+    NAMES = {'nash_q':'Nash-Q P1', policy:label+' P1',
+        RANDOM[0]:'Random P2\nvs Nash-Q', RANDOM[1]:'Random P2\nvs '+label,
+        UNIFORM:'Exact uniform\nrandom'}
+
+
 def all_metrics(p, q):
     result = similarity(p, q)
     p, q = np.broadcast_arrays(np.asarray(p, float), np.asarray(q, float))
@@ -103,6 +117,8 @@ def load_run(file, learned, random_name, meta):
     raw = pd.read_csv(file)
     f = raw[((raw.attacker_id == 1) & (raw.attacker_policy == learned)) |
             ((raw.attacker_id == 2) & (raw.attacker_policy == 'random'))].copy()
+    if not ((f.attacker_id==1)&(f.attacker_policy==learned)).any():
+        raise ValueError(f'{file} contains no P1 attacker decisions for {learned}')
     worlds = [reconstruct_gantries(json.loads(r.state_json), int(r.attacker_id), int(r.defender_id)) for r in f.itertuples()]
     errors = []
     for row, world in zip(f.itertuples(), worlds):
@@ -113,6 +129,7 @@ def load_run(file, learned, random_name, meta):
             errors.append(float(np.max(np.abs(observed-world[int(row.defender_id)]))))
     if not errors or max(errors) > 1e-5: raise ValueError('Cannot verify mirrored state/defender coordinates')
     random_rows = f[f.attacker_policy == 'random']
+    if random_rows.empty:raise ValueError(f'{file} contains no logged Random P2 attacks')
     vectors = [probabilities(v) for v in random_rows.attacker_policy_probabilities_json]
     if any(v is None or not np.allclose(v, np.full(5, .2), rtol=0, atol=1e-12) for v in vectors):
         raise ValueError('Logged random policy is not uniform over five actions')
@@ -142,6 +159,7 @@ def verify_learned_source(actual, previous, model):
 
 
 def prepare_inputs(args):
+    configure_potential_policy(getattr(args,'potential_policy','potential_ibr'))
     audit = json.loads((args.input_dir/'audit.json').read_text()); meta = audit['metadata']
     if meta['human_region']['name'] != 'four_quadrants_center_override': raise ValueError('Wrong human classifier')
     previous = pd.read_csv(args.input_dir/'analysis_observations.csv', dtype={'cluster': str})
@@ -161,7 +179,11 @@ def prepare_inputs(args):
     observations = [human]; runs = []
     for file, learned, random_name in zip([args.nash_decisions, args.ibr_decisions], LEARNED, RANDOM):
         frame, run_audit = load_run(file, learned, random_name, meta)
-        verify_learned_source(frame, previous, learned)
+        if learned in set(previous.dataset):
+            verify_learned_source(frame, previous, learned)
+            run_audit['previous_comparison_check'] = 'all episode/context/action counts match'
+        else:
+            run_audit['previous_comparison_check'] = 'new policy: no historical comparison rows; source snapshots and random vectors validated'
         observations.append(frame); runs.append(run_audit)
     all_obs = pd.concat(observations, ignore_index=True)
     return all_obs, meta, runs
@@ -280,7 +302,7 @@ def run(args, prepared=None):
     summary = dict(human_dataset=human_name, human_region=meta['human_region'], totals=all_obs.groupby('dataset').size().to_dict(),
         center_band_m=band, normalized_center_half_band=band/.7625, source_center_band_m=source_band,
         robot_run_audits=runs, bootstrap_replicates=args.bootstrap, seed=args.seed, sources=provenance,
-        learned_reference_check='all episode/physical-context/skill counts match preserved comparison',
+        learned_reference_check='existing policies checked against saved episode/context/action counts; new policies validated from their own detailed logs',
         software=dict(numpy=np.__version__,pandas=pd.__version__,matplotlib=matplotlib.__version__))
     (out/'audit.json').write_text(json.dumps(summary,indent=2))
     write_report(args,summary,metric_table,improvements)
@@ -311,7 +333,7 @@ def write_report(args,audit,metrics,improvements):
         'All values compare human **realized landing proxies** (four_quadrants_center_override) with robot **selected high-level skills**. Lower JS/TV means a closer category distribution, not better playing strength, win rate, or equivalent intentions. No simulations, reconstruction or model training were run.',
         '## Inputs and baseline definitions',
         'The saved incoming-aligned both-player human cohort is unchanged. Each learned policy remains P1. Random attackers are P2 in the existing runs, not a new P1 random evaluation. The two empirical random baselines are kept separate because they faced different learned opponents and visited different states. The exact uniform baseline is the existing random policy’s 20%-per-skill action distribution, verified against every logged random probability vector; it is not an observed landing distribution. Its sample count is blank rather than invented.',
-        'Observation totals: `'+json.dumps(audit['totals'],sort_keys=True)+'`. Source snapshots validate inversion of the P2 canonical frame, and learned per-episode/physical-context/action counts match the preserved comparison exactly.',
+        'Observation totals: `'+json.dumps(audit['totals'],sort_keys=True)+'`. Source snapshots validate inversion of the P2 canonical frame. Policies present in the earlier comparison must match its per-episode/physical-context/action counts; a newly selected policy is validated from its own detailed log and retains its actual name and sample size.',
         '## Coordinate and conditioning conventions',
         f"Position center half-band = {audit['center_band_m']:g} m at robot scale, normalized by 0.7625 for both humans and robots. It applies to both players’ own-side positions. Source verification was performed at the original {audit['source_center_band_m']:g} m band before rebinning. Landing categories and the eligible shot cohort remain fixed; wider center bins redistribute observations rather than create shots.",
         'Each player’s Left means their own left: P1 +world-y, P2 −world-y. joint_physical preserves the previous (physical P1,physical P2) ordering. Since learned attacks are P1 and logged random attacks P2, these physical-pair comparisons are not role-matched controls. The additional joint_role_relative view uses (hitter position,defender position), swapping the two bins for human or robot P2 attacks. opponent_only always uses the actual defender’s own-side position. All views pool raw counts and then normalize. Unequal visitation and sample counts remain explicit in the CSVs.',
@@ -332,7 +354,7 @@ def write_report(args,audit,metrics,improvements):
     rows[-1]+='\n'+'\n'.join(summary)
     rows += ['Inspect the improvement intervals before interpreting a point ordering. State visitation, physical role, and the human-successful-landing versus robot-all-selections distinction remain possible confounds. Exact-uniform and empirical-random results are labeled separately.',
         '## Reproduce',
-        '```bash\nOPENBLAS_NUM_THREADS=1 python3 v3/human_comparison/analyze_random_similarity.py --center-band '+str(audit['center_band_m'])+' --bootstrap '+str(args.bootstrap)+' --seed '+str(args.seed)+' --output-dir '+str(args.output_dir)+'\n```',
+        '```bash\nOPENBLAS_NUM_THREADS=1 python3 v3/human_comparison/analyze_random_similarity.py --input-dir '+str(args.input_dir)+' --nash-decisions '+str(args.nash_decisions)+' --potential-policy '+LEARNED[1]+' --potential-decisions '+str(args.ibr_decisions)+' --center-band '+str(audit['center_band_m'])+' --bootstrap '+str(args.bootstrap)+' --seed '+str(args.seed)+' --output-dir '+str(args.output_dir)+'\n```',
         'Previous reports are unchanged. Inputs, metadata, validation counts and hashes are recorded in audit.json.',
         '![JS comparisons](js_divergence_bits_comparisons.png)',
         '![Correlation comparisons](spearman_rho_comparisons.png)']
@@ -353,16 +375,22 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--input-dir',type=Path,default=Path('v3/human_comparison/reports/opponent_position_comparison_10k_both'))
     p.add_argument('--nash-decisions',type=Path,default=Path('skill_eval/v3/nash_vs_random_10000/decisions.csv'))
-    p.add_argument('--ibr-decisions',type=Path,default=Path('skill_eval/v3/potential_ibr_vs_random_10000/decisions.csv'))
+    p.add_argument('--potential-policy',choices=['potential_ibr','potential_max'],default='potential_ibr')
+    p.add_argument('--potential-decisions','--ibr-decisions',dest='ibr_decisions',type=Path,
+                   help='Detailed decisions.csv for the selected potential policy; --ibr-decisions remains an alias')
     p.add_argument('--output-dir',type=Path)
     p.add_argument('--center-band',type=float,help='Position center half-band in robot meters; normalized identically for human/robot. Does not alter landing regions.')
     p.add_argument('--bootstrap',type=int,default=2000)
     p.add_argument('--seed',type=int,default=42)
     args=p.parse_args()
+    if args.ibr_decisions is None:
+        folder='potential_max_vs_random' if args.potential_policy=='potential_max' else 'potential_ibr_vs_random_10000'
+        args.ibr_decisions=Path('skill_eval/v3')/folder/'decisions.csv'
     if args.bootstrap<100:p.error('--bootstrap must be at least 100')
     if args.center_band is not None and not 0<=args.center_band<=.7625:p.error('--center-band must be between 0 and 0.7625')
     if args.output_dir is None:
-        suffix='' if args.center_band is None else '_center_'+f'{args.center_band:g}'.replace('.','p')
+        suffix='' if args.potential_policy=='potential_ibr' else '_'+args.potential_policy
+        suffix += '' if args.center_band is None else '_center_'+f'{args.center_band:g}'.replace('.','p')
         args.output_dir=Path('v3/human_comparison/reports/similarity_with_random_10k_both'+suffix)
     run(args)
 

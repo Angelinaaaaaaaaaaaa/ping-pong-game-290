@@ -52,13 +52,19 @@ from v3.potential_policy import (  # noqa: E402
     potential_ibr,
     potential_matrix,
     potential_minimax_action,
+    potential_max_distributions,
+    potential_max_q_regrets,
     record_joint_actions,
+)
+from v3.potential_max_diagnostics import (
+    DEFAULT_REGRET_THRESHOLD, potential_max_regret_rows,
+    validate_regret_threshold, write_regret_diagnostics,
 )
 
 
 POLICY_NAMES = (
     "nash_q", "greedy_q", "br_q", "potential_br", "potential_ibr",
-    "potential_adaptive_rally", "potential_adaptive_match", "potential_minimax",
+    "potential_adaptive_rally", "potential_adaptive_match", "potential_minimax", "potential_max",
     "random", "fixed",
 )
 
@@ -340,10 +346,20 @@ def run_episode(
             base_state = state_for_attacker(obs, info, attacker_id)
             matrix = q_matrix(model, base_state, attacker_id, device=device)
             phi = potential_matrix(potential_model, base_state, device=device)
-            nash_solution = solve_zero_sum_matrix(matrix)
-
             attacker_policy = policies[attacker_id]["attack"]
             defender_policy = policies[defender_id]["defense"]
+            role_policies = (attacker_policy, defender_policy)
+            # Keep legacy diagnostics unchanged for all existing matchups.
+            # Max itself needs no Nash solve; only compute one if its opponent
+            # uses Nash-Q or BR-Q (which can require the Nash fallback).
+            needs_nash = "potential_max" not in role_policies or any(
+                policy in ("nash_q", "br_q") for policy in role_policies
+            )
+            nash_solution = solve_zero_sum_matrix(matrix) if needs_nash else None
+            max_info = None
+            if "potential_max" in role_policies:
+                max_attack, max_defense, pair = potential_max_distributions(phi)
+                max_info = {**pair, **potential_max_q_regrets(matrix, pair["attack_index"], pair["defense_index"])}
             center_attack = len(SKILL_NAMES) // 2
             center_defense = len(DEFENSE_POSITIONS) // 2
             previous_attack = last_attack_skill[attacker_id]
@@ -354,7 +370,10 @@ def run_episode(
                 initial_defense = DEFENSE_POSITIONS.index(previous_defense) if previous_attack is not None and previous_defense is not None else center_defense
                 ibr_info = potential_ibr(phi, initial_attack, initial_defense)
 
-            if attacker_policy == "br_q":
+            if attacker_policy == "potential_max":
+                attacker_probs = max_attack.copy()
+                attacker_br = {**max_info, "selected_action": max_info["attack"]}
+            elif attacker_policy == "br_q":
                 attacker_probs, attacker_br = _br_q_distribution(
                     role="attacker",
                     matrix=matrix,
@@ -401,7 +420,10 @@ def run_episode(
                     greedy_iterations=greedy_iterations,
                 )
                 attacker_br = None
-            if defender_policy == "br_q":
+            if defender_policy == "potential_max":
+                defender_probs = max_defense.copy()
+                defender_br = {**max_info, "selected_action": max_info["defense"]}
+            elif defender_policy == "br_q":
                 defender_probs, defender_br = _br_q_distribution(
                     role="defender",
                     matrix=matrix,
@@ -494,10 +516,10 @@ def run_episode(
                 "potential_matrix": phi.astype(float).tolist(),
                 "attacker_policy_probabilities": attacker_probs.astype(float).tolist(),
                 "defender_policy_probabilities": defender_probs.astype(float).tolist(),
-                "nash_attacker_probabilities": nash_solution.attacker_probs.astype(float).tolist(),
-                "nash_defender_probabilities": nash_solution.defender_probs.astype(float).tolist(),
-                "nash_value": nash_solution.value,
-                "nash_solver_status": nash_solution.status,
+                "nash_attacker_probabilities": nash_solution.attacker_probs.astype(float).tolist() if nash_solution else [],
+                "nash_defender_probabilities": nash_solution.defender_probs.astype(float).tolist() if nash_solution else [],
+                "nash_value": nash_solution.value if nash_solution else None,
+                "nash_solver_status": nash_solution.status if nash_solution else "not_computed",
                 "attacker_policy": attacker_policy,
                 "defender_policy": defender_policy,
                 "potential_ibr_initial_joint_action": "" if ibr_info is None else ibr_info["initial_joint_action"],
@@ -662,10 +684,11 @@ def build_summary(
     }
     outcome_rates = {name: _rate(decisions, field) for name, field in outcome_fields.items()}
 
-    nash_attacker = np.asarray([row["nash_attacker_probabilities"] for row in decisions], dtype=float)
-    nash_defender = np.asarray([row["nash_defender_probabilities"] for row in decisions], dtype=float)
-    avg_nash_attacker = np.mean(nash_attacker, axis=0).tolist() if len(decisions) else []
-    avg_nash_defender = np.mean(nash_defender, axis=0).tolist() if len(decisions) else []
+    nash_rows = [row for row in decisions if row["nash_attacker_probabilities"]]
+    nash_attacker = np.asarray([row["nash_attacker_probabilities"] for row in nash_rows], dtype=float)
+    nash_defender = np.asarray([row["nash_defender_probabilities"] for row in nash_rows], dtype=float)
+    avg_nash_attacker = np.mean(nash_attacker, axis=0).tolist() if nash_rows else []
+    avg_nash_defender = np.mean(nash_defender, axis=0).tolist() if nash_rows else []
 
     ibr_decisions = [row for row in decisions if row.get("potential_ibr_status")]
     iteration_distribution = dict(sorted(Counter(
@@ -818,6 +841,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--greedy-iterations", type=int, default=4)
+    parser.add_argument("--potential-max-regret-threshold", type=float, default=DEFAULT_REGRET_THRESHOLD,
+                        help="Report frequency with both original-Q regrets strictly below this threshold (default: 0.05).")
     parser.add_argument("--examples", type=int, default=5)
     parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
     parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="aggressive")
@@ -841,6 +866,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.episodes < 1 or args.steps < 1:
         raise ValueError("--episodes and --steps must be positive")
+    validate_regret_threshold(args.potential_max_regret_threshold)
 
     from stable_baselines3 import PPO
     from v3.env_wrapper import V3PrePositionEnv
@@ -936,6 +962,12 @@ def main(argv: list[str] | None = None) -> int:
     _write_csv(output_dir / "summary.csv", summary_rows)
     _write_json(output_dir / "summary.json", summary)
     _write_csv(output_dir / "q_matrix_examples.csv", example_rows)
+    if any("potential_max" in role_policies.values() for role_policies in policies.values()):
+        diagnostics = write_regret_diagnostics(
+            output_dir, potential_max_regret_rows(decisions, args.potential_max_regret_threshold),
+            args.potential_max_regret_threshold,
+        )
+        print("Potential-max Q regrets: " + json.dumps(diagnostics))
 
     print(f"Saved evaluation outputs under: {output_dir}")
     print(json.dumps({

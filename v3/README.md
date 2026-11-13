@@ -616,3 +616,9 @@ it still requires the shared repository files and external artifacts listed in
 the commands above. The V3 commit does not include datasets, trained models,
 logs, or generated `skill_eval/` outputs unless those paths are staged
 separately.
+
+## Potential Max comparison
+
+For the global-potential-maximizing policy, detailed and fixed-grid evaluator
+commands, Q-regret sidecars, and saved-log human comparisons, see
+[POTENTIAL_MAX.md](POTENTIAL_MAX.md).

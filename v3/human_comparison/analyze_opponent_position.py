@@ -56,7 +56,10 @@ def similarity(p, q):
     # Average ranks handle ties; correlation is undefined for constant vectors.
     rp = pd.DataFrame(p.reshape(-1, p.shape[-1])).rank(axis=1).to_numpy()
     rq = pd.DataFrame(q.reshape(-1, q.shape[-1])).rank(axis=1).to_numpy()
-    rp -= rp.mean(axis=1, keepdims=True); rq -= rq.mean(axis=1, keepdims=True)
+    # pandas Copy-on-Write can expose read-only NumPy views. Center into new
+    # arrays rather than modifying pandas-owned rank arrays in place.
+    rp = rp - rp.mean(axis=1, keepdims=True)
+    rq = rq - rq.mean(axis=1, keepdims=True)
     scale = np.sqrt((rp * rp).sum(axis=1) * (rq * rq).sum(axis=1))
     rho = np.divide((rp * rq).sum(axis=1), scale, out=np.full(len(scale), np.nan), where=scale > 0)
     rho = rho.reshape(p.shape[:-1])

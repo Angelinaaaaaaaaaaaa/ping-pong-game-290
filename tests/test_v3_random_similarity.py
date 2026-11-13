@@ -1,6 +1,7 @@
 import unittest
 import numpy as np
 import pandas as pd
+from v3.human_comparison import analyze_random_similarity as comparison
 
 from v3.human_comparison.analyze_random_similarity import (
     all_metrics, context_indices, count_clusters, paired_bootstrap, rebin_positions,
@@ -8,6 +9,16 @@ from v3.human_comparison.analyze_random_similarity import (
 
 
 class RandomSimilarityTests(unittest.TestCase):
+    def test_potential_max_retains_actual_model_names(self):
+        try:
+            comparison.configure_potential_policy('potential_max')
+            self.assertEqual(comparison.LEARNED,('nash_q','potential_max'))
+            self.assertIn('random_p2_vs_potential_max',comparison.MODELS)
+            self.assertNotIn('potential_ibr',comparison.MODELS)
+            self.assertEqual(comparison.NAMES['potential_max'],'Potential Max P1')
+        finally:
+            comparison.configure_potential_policy('potential_ibr')
+
     def test_wider_position_band_retains_actions_and_frame(self):
         f = pd.DataFrame(dict(attacker_id=[1,2,1,2],
             p1_own_lateral=np.array([.04,.10,.20,.30])/.7625,

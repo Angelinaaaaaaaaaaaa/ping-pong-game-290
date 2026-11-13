@@ -31,6 +31,10 @@ from v3.eval_q_policy import (  # noqa: E402
 from v3.potential_policy import new_action_counts  # noqa: E402
 from v3.q_policy import load_q_model  # noqa: E402
 from v3.potential_policy import load_potential_model  # noqa: E402
+from v3.potential_max_diagnostics import (  # noqa: E402
+    DEFAULT_REGRET_THRESHOLD, potential_max_regret_rows,
+    validate_regret_threshold, write_regret_diagnostics,
+)
 
 
 DEFAULT_POLICIES = (
@@ -42,6 +46,7 @@ DEFAULT_POLICIES = (
     "potential_adaptive_rally",
     "potential_adaptive_match",
     "potential_minimax",
+    "potential_max",
     "random",
     "fixed",
 )
@@ -55,6 +60,7 @@ DISPLAY_NAMES = {
     "potential_adaptive_rally": "Potential Adaptive Rally",
     "potential_adaptive_match": "Potential Adaptive Match",
     "potential_minimax": "Potential Minimax",
+    "potential_max": "Potential Max",
     "random": "Random",
     "fixed": "Fixed",
 }
@@ -264,6 +270,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tested-fixed-defense", choices=DEFENSE_POSITIONS, default="center")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--greedy-iterations", type=int, default=4)
+    parser.add_argument("--potential-max-regret-threshold", type=float, default=DEFAULT_REGRET_THRESHOLD)
     parser.add_argument("--reset-mode", choices=["clean", "ready", "carryover"], default="ready")
     parser.add_argument("--skill-profile", choices=SKILL_PROFILE_NAMES, default="aggressive")
     parser.add_argument("--gantry-speed-scale", type=float, default=1.0)
@@ -276,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.episodes < 1 or args.steps < 1:
         raise ValueError("--episodes and --steps must be positive")
+    validate_regret_threshold(args.potential_max_regret_threshold)
     if not args.seeds or any(seed < 0 for seed in args.seeds):
         raise ValueError("--seeds must contain one or more nonnegative integers")
     tested_policies = args.policies if args.policies is not None else list(DEFAULT_POLICIES)
@@ -310,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     total_runs = len(tested_policies) * len(opponent_specs) * len(args.seeds) * len(assignments)
     run_number = 0
     raw_rows: list[dict[str, Any]] = []
+    max_regret_rows: list[dict[str, Any]] = []
 
     try:
         for tested_policy in tested_policies:
@@ -362,6 +371,12 @@ def main(argv: list[str] | None = None) -> int:
                             )
                             run_episodes.append(episode)
                             run_decisions.extend(decisions)
+                            max_regret_rows.extend(potential_max_regret_rows(
+                                decisions, args.potential_max_regret_threshold,
+                                tested_policy=tested_policy, opponent_type=opponent_type,
+                                opponent_policy=opponent_policy, fixed_attack_skill=fixed_attack,
+                                fixed_defense_position=fixed_defense, seed=seed, side_assignment=side_label,
+                            ))
                         raw_rows.append(_raw_record(
                             tested_policy=tested_policy,
                             opponent_type=opponent_type,
@@ -402,6 +417,9 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(summary_payload, handle, indent=2)
 
     _print_table(summary_rows)
+    if "potential_max" in tested_policies or args.other_opponent == "potential_max":
+        diagnostics = write_regret_diagnostics(output_dir, max_regret_rows, args.potential_max_regret_threshold)
+        print("Potential-max Q regrets: " + json.dumps({k: v for k, v in diagnostics.items() if k != "matchups"}))
     print(f"Saved batch evaluation outputs under: {output_dir}")
     return 0
 

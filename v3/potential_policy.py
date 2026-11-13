@@ -11,6 +11,7 @@ from model_arch import SimpleModel
 from nash_skills.skills import SKILL_NAMES
 from v3.constants import DEFENSE_POSITIONS
 from v3.q_policy import encode_action_input
+from v3.q_policy import one_hot_distribution
 from v3.model_input import MODEL_INPUT_DIM
 from v3.state_encoder import STATE_DIM
 from v3.train_q_preposition_onehot import HIDDEN, INPUT_DIM, safe_load_state_dict
@@ -92,6 +93,39 @@ def potential_minimax_action(phi: np.ndarray, role: str) -> tuple[int, dict[str,
             name: float(value) for name, value in zip(names, values)
         },
         "selected_action": names[selected],
+    }
+
+
+def potential_max_distributions(phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Select the global maximum in attack-major, defense-minor order.
+
+    NumPy's first flat argmax implements deterministic first-index ties.
+    Each role executes only its own component of this proposed joint action.
+    """
+    potential = _validated_potential(phi)
+    attack, defense = map(int, np.unravel_index(np.argmax(potential), potential.shape))
+    return (
+        one_hot_distribution(len(SKILL_NAMES), attack),
+        one_hot_distribution(len(DEFENSE_POSITIONS), defense),
+        {
+            "attack_index": attack,
+            "defense_index": defense,
+            "attack": SKILL_NAMES[attack],
+            "defense": DEFENSE_POSITIONS[defense],
+            "maximum_potential": float(potential[attack, defense]),
+        },
+    )
+
+
+def potential_max_q_regrets(q: np.ndarray, attack: int, defense: int) -> dict[str, float]:
+    """Unilateral regrets in original attacker-payoff Q units, not Phi units."""
+    payoff = _validated_potential(q)
+    if not 0 <= attack < len(SKILL_NAMES) or not 0 <= defense < len(DEFENSE_POSITIONS):
+        raise ValueError("Joint-action index outside the 5x3 game")
+    value = payoff[attack, defense]
+    return {
+        "attacker_regret": float(np.max(payoff[:, defense]) - value),
+        "defender_regret": float(value - np.min(payoff[attack, :])),
     }
 
 
